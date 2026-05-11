@@ -1,26 +1,209 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --color-bg: 255 255 255;
+  --color-fg: 17 17 17;
+  --color-muted: 115 115 115;
+  --color-border: 229 229 229;
+  --color-card: 255 255 255;
+  --color-glass: 255 255 255;
+  --accent: 59 130 246;
+  --accent-foreground: 255 255 255;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+.dark {
+  --color-bg: 8 8 8;
+  --color-fg: 245 245 245;
+  --color-muted: 163 163 163;
+  --color-border: 38 38 38;
+  --color-card: 23 23 23;
+  --color-glass: 23 23 23;
+  --accent: 96 165 250;
+  --accent-foreground: 8 8 8;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply scroll-smooth antialiased;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  ::selection {
+    @apply bg-blue-500/20 text-blue-600 dark:text-blue-400;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-neutral-300 dark:bg-neutral-700 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-neutral-400 dark:bg-neutral-600;
   }
 }
 
-body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+  .glass {
+    @apply backdrop-blur-xl border border-black/5 dark:border-white/10;
+    background-color: rgb(var(--color-glass) / 0.72);
+  }
+
+  .glass-card {
+    @apply glass rounded-3xl;
+    transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  }
+
+  .glass-card:hover {
+    @apply shadow-lg shadow-black/5 dark:shadow-white/5;
+  }
+
+  .gradient-text {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-500 via-blue-400 to-cyan-400;
+  }
+
+  .section-padding {
+    @apply py-24 md:py-32 px-6 md:px-8;
+  }
+
+  .content-container {
+    @apply max-w-6xl mx-auto;
+  }
+
+  .article-prose {
+    @apply text-lg leading-relaxed text-foreground;
+  }
+
+  .article-prose h2 {
+    @apply text-2xl font-semibold mt-12 mb-5 tracking-tight;
+  }
+
+  .article-prose h3 {
+    @apply text-xl font-medium mt-8 mb-4 tracking-tight;
+  }
+
+  .article-prose p {
+    @apply mb-6 text-muted leading-relaxed;
+  }
+
+  .article-prose a {
+    @apply text-blue-500 hover:text-blue-600 underline underline-offset-4 decoration-blue-500/30 hover:decoration-blue-500 transition-colors;
+  }
+
+  .article-prose strong {
+    @apply text-foreground font-semibold;
+  }
+
+  .article-prose ul,
+  .article-prose ol {
+    @apply mb-6 pl-6 space-y-2;
+  }
+
+  .article-prose ul {
+    @apply list-disc;
+  }
+
+  .article-prose ol {
+    @apply list-decimal;
+  }
+
+  .article-prose li {
+    @apply text-muted;
+  }
+
+  .article-prose blockquote {
+    @apply border-l-2 border-blue-500/50 pl-5 py-1 my-6 italic text-muted;
+  }
+
+  .article-prose hr {
+    @apply my-12 border-border;
+  }
+
+  .article-prose img {
+    @apply rounded-2xl my-8 w-full;
+  }
+
+  .article-prose code {
+    @apply font-mono text-sm bg-black/5 dark:bg-white/10 rounded-md px-1.5 py-0.5;
+  }
+
+  .article-prose pre {
+    @apply my-8 rounded-2xl border border-border overflow-hidden;
+  }
+
+  .article-prose pre > code {
+    @apply bg-transparent p-0;
+  }
+
+  .article-prose table {
+    @apply w-full my-8 border-collapse;
+  }
+
+  .article-prose th {
+    @apply text-left font-semibold p-3 border-b border-border bg-black/5 dark:bg-white/5;
+  }
+
+  .article-prose td {
+    @apply p-3 border-b border-border;
+  }
+
+  /* rehype-pretty-code styles */
+  pre[data-theme] {
+    @apply p-0;
+  }
+
+  pre[data-theme] code {
+    @apply grid;
+  }
+
+  pre[data-theme] code span[data-line] {
+    @apply px-4 py-0.5 border-l-2 border-transparent;
+  }
+
+  pre[data-theme] code span[data-highlighted-line] {
+    @apply border-l-2 border-blue-500/50 bg-blue-500/5;
+  }
+
+  code[data-line-numbers] {
+    counter-reset: line;
+  }
+
+  code[data-line-numbers] > span[data-line]::before {
+    counter-increment: line;
+    content: counter(line);
+    @apply inline-block w-8 mr-4 text-right text-muted/50 text-xs;
+  }
 }
 
 @layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
   .text-balance {
     text-wrap: balance;
   }

@@ -1,0 +1,126 @@
+---
+title: 'Kubernetes 生产实践：从部署到监控的全链路指南'
+description: '从零开始将一个微服务部署到 K8s 集群，涵盖 Deployment、Service、Ingress、HPA、以及 Prometheus 监控的完整配置。'
+date: '2026-03-20'
+category: 'Kubernetes'
+tags: ['kubernetes', '云原生', '部署', '监控', 'HPA']
+featured: false
+---
+
+## 从一个简单的 Deployment 开始
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+    spec:
+      containers:
+      - name: api-server
+        image: registry.example.com/api-server:v1.2.0
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+```
+
+## 资源限制的最佳实践
+
+资源请求（requests）和限制（limits）的配置直接影响调度和稳定性：
+
+- **requests** 是调度器使用的保证量，应设为稳态运行所需
+- **limits** 是允许使用的上限，CPU limits 会导致 throttling
+- 生产环境**不要省略** resource 配置
+
+```yaml
+resources:
+  requests:
+    cpu: "250m"        # 0.25 核保证
+    memory: "256Mi"    # 256MB 保证
+  limits:
+    cpu: "1000m"       # 最多 1 核
+    memory: "512Mi"    # 最多 512MB（超过会 OOMKill）
+```
+
+## HPA 自动伸缩
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-server-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-server
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+```
+
+## Service 与 Ingress
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+spec:
+  selector:
+    app: api-server
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+```
+
+## 监控体系
+
+生产环境至少需要以下监控维度：
+
+1. **基础设施层**：Node exporter → Prometheus → Grafana
+2. **应用层**：自定义 metrics（请求延迟、错误率、QPS）
+3. **K8s 内部**：kube-state-metrics、API Server 指标
+
+一个有效的监控体系需要覆盖 **RED 指标**（Rate, Errors, Duration）和 **USE 指标**（Utilization, Saturation, Errors）。
+
+> 运维的最高境界不是不出现问题，而是出现问题后能在分钟级别定位和恢复。

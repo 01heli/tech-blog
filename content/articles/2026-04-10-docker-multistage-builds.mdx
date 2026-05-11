@@ -1,0 +1,86 @@
+---
+title: 'Docker 多阶段构建：让镜像体积缩小 90%'
+description: '通过多阶段构建、层缓存优化和基础镜像选择，将 Docker 镜像体积从 1.2GB 缩减至 80MB，构建速度提升 5 倍。'
+date: '2026-04-10'
+category: 'Docker'
+tags: ['docker', '容器化', '多阶段构建', '镜像优化']
+featured: true
+---
+
+## 从一个真实案例说起
+
+一个 Go 微服务的 Docker 镜像，初始构建大小为 **1.2GB**。经过优化后，最终镜像体积缩减至 **80MB**，缩小了整整 15 倍。
+
+## 多阶段构建的核心思想
+
+在一个 Dockerfile 中使用多个 `FROM` 语句，每个阶段可以使用不同的基础镜像。最终镜像只包含运行时所需的文件。
+
+```dockerfile
+# Stage 1: 编译阶段
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/server .
+
+# Stage 2: 运行阶段
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /app
+
+COPY --from=builder /app/server .
+COPY --from=builder /app/config ./config
+
+EXPOSE 8080
+ENTRYPOINT ["./server"]
+```
+
+## 构建缓存优化
+
+Docker 构建按层缓存，每一条指令生成一层。关键是**让变化频率最低的内容先被复制**：
+
+```dockerfile
+# ✅ 好的顺序：依赖文件变动不频繁，先 COPY
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# ❌ 差的顺序：源代码每次变动都会导致依赖重新下载
+COPY . .
+RUN go mod download
+```
+
+## 基础镜像的选择
+
+| 基础镜像 | 大小 | 适用场景 |
+|----------|------|----------|
+| `scratch` | 0B | 纯二进制文件，无 shell |
+| `alpine:3.19` | ~7MB | 需要 shell 和基础工具 |
+| `distroless` | ~15MB | 安全性要求高的生产环境 |
+| `ubuntu:22.04` | ~77MB | 需要完整系统环境 |
+
+对于 Go 应用，`FROM scratch` 是最极致的方案：
+
+```dockerfile
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/server /server
+ENTRYPOINT ["/server"]
+```
+
+> **注意**：使用 scratch 时，应用不能依赖任何系统库。Go 的 `CGO_ENABLED=0` 是必须的。
+
+## 总结：镜像优化检查清单
+
+1. 使用多阶段构建，分离编译和运行环境
+2. 选择最小化的基础镜像 (alpine, distroless)
+3. 合理利用构建缓存，先 COPY 依赖文件
+4. 去除编译产物中的调试信息 (`-ldflags="-w -s"`)
+5. 使用 `.dockerignore` 排除不必要的文件
+6. 合并 RUN 指令减少层数
+
+优化后的镜像不仅节省了存储和带宽，更重要的是缩短了部署和扩容时间——这在生产环境中至关重要。

@@ -1,0 +1,99 @@
+---
+title: 'Linux 性能调优：从 CPU 到网络的全面排查指南'
+description: '掌握 top、perf、strace、tcpdump 等工具的组合使用，建立一套系统性的 Linux 性能问题排查方法论。'
+date: '2026-04-05'
+category: 'Linux'
+tags: ['linux', '性能调优', 'perf', '排查']
+featured: false
+---
+
+## 性能问题的层次化思维
+
+Linux 性能问题排查需要从宏观到微观，逐层深入。借用 Brendan Gregg 的 USE 方法论（Utilization, Saturation, Errors），我们可以建立一套完整的排查路径。
+
+## CPU 层面
+
+```bash
+# 实时查看 CPU 使用率和负载
+top -c
+
+# 查看每个 CPU 核心的状态
+mpstat -P ALL 1
+
+# 查找 CPU 密集型进程
+ps aux --sort=-%cpu | head -10
+```
+
+`perf` 是 CPU 性能分析最强大的工具：
+
+```bash
+# 采样 CPU 函数调用（99Hz 采样避免与系统定时器撞频）
+perf record -F 99 -p <pid> -g -- sleep 30
+perf report
+```
+
+火焰图（Flame Graph）将 perf 输出可视化，一眼就能找到 CPU 热点函数。
+
+## 内存层面
+
+```bash
+# 查看内存使用概览
+free -h
+
+# 查看进程内存详情
+cat /proc/<pid>/status | grep -i mem
+
+# 大页内存统计
+cat /proc/meminfo | grep -i huge
+```
+
+```bash
+# 使用 valgrind 检测内存泄漏
+valgrind --leak-check=full --show-leak-kinds=all ./your_app
+```
+
+## 磁盘 I/O
+
+```bash
+# 查看磁盘 I/O 延迟
+iostat -x 1
+
+# 追踪进程的 I/O 操作
+strace -e trace=read,write,openat -p <pid>
+
+# 查看哪个进程在大量 I/O
+iotop -o
+```
+
+## 网络排查
+
+```bash
+# 查看网络连接状态
+ss -s
+
+# 查看 TCP 连接详情
+ss -tlnp
+
+# 抓包分析
+tcpdump -i eth0 -n -c 100 "port 8080"
+```
+
+## 系统调用追踪
+
+`strace` 是排查应用瓶颈的利器：
+
+```bash
+# 追踪进程的系统调用，显示耗时
+strace -p <pid> -T -c -f
+
+# 仅追踪网络相关的调用
+strace -e trace=network -p <pid>
+```
+
+### 实战案例
+
+曾经遇到一个服务 CPU 占用 100% 但吞吐量极低。`perf top` 发现大量时间消耗在 `pthread_spin_lock`，定位到一个自旋锁竞争。`strace` 确认线程在 `futex` 调用上阻塞。最终通过 CAS 无锁算法替换自旋锁，CPU 降至 20%，吞吐量提升 3 倍。
+
+## 总结
+
+性能优化的关键不是工具，而是**方法论**——从上到下建立模型，用数据验证假设，而不是凭直觉猜测。

@@ -1,0 +1,71 @@
+---
+title: 'MySQL 查询优化：索引策略深度解析'
+description: '深入理解 B+Tree 索引原理，掌握覆盖索引、联合索引最左前缀法则，以及如何通过 EXPLAIN 分析慢查询。'
+date: '2026-04-20'
+category: 'MySQL'
+tags: ['mysql', '索引', '查询优化', 'B+Tree']
+featured: true
+---
+
+## 为什么你的查询这么慢？
+
+慢查询是每个后端工程师的噩梦。当数据量从百万增长到千万级别时，原本正常运行的 SQL 可能突然成为系统瓶颈。
+
+```sql
+EXPLAIN SELECT * FROM orders
+WHERE user_id = 10086
+AND status = 'paid'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+使用 `EXPLAIN` 分析执行计划是第一步。关注这些关键字段：
+
+- **type**: 访问类型，从最优到最差依次为 `system > const > eq_ref > ref > range > index > ALL`
+- **key**: 实际使用的索引
+- **rows**: 预估扫描行数
+- **Extra**: 额外信息，`Using filesort` 和 `Using temporary` 是危险的信号
+
+## B+Tree 索引的本质
+
+MySQL InnoDB 引擎使用 B+Tree 作为索引数据结构。理解它的特性是写出高效查询的基础：
+
+1. **所有数据存储在叶子节点**，非叶子节点仅存储索引键值
+2. **叶子节点之间通过双向链表连接**，支持高效的范围查询
+3. **聚簇索引**的叶子节点直接存储整行数据，**二级索引**的叶子节点存储主键值
+
+### 覆盖索引 (Covering Index)
+
+当一个查询的所有列都包含在索引中时，MySQL 可以直接从索引获取数据，无需回表。这是最极致的优化手段。
+
+```sql
+-- 假设存在联合索引 idx_user_status_time(user_id, status, created_at)
+SELECT user_id, status, created_at FROM orders
+WHERE user_id = 10086 AND status = 'paid';
+-- Extra: Using index (覆盖索引，无需回表)
+```
+
+### 最左前缀法则
+
+联合索引遵循最左前缀匹配规则。对于索引 `(a, b, c)`，以下查询可以使用索引：
+
+```
+✅ WHERE a = 1
+✅ WHERE a = 1 AND b = 2
+✅ WHERE a = 1 AND b = 2 AND c = 3
+✅ WHERE a = 1 AND c = 3  -- 仅 a 生效
+❌ WHERE b = 2            -- 无法使用索引
+❌ WHERE c = 3            -- 无法使用索引
+```
+
+## 实战优化清单
+
+每次面对慢查询，按以下步骤排查：
+
+1. **检查索引使用情况** — `EXPLAIN` 看 type 是否为 ALL
+2. **消除 SELECT \*** — 只查需要的列，利于覆盖索引
+3. **避免函数操作索引列** — `WHERE DATE(created_at) = '2026-01-01'` 会导致索引失效
+4. **大分页优化** — 使用游标分页替代 OFFSET
+5. **合理使用 JOIN** — 确保 JOIN 列都有索引
+
+优化是一条没有终点的路，但掌握了原理，你就能在正确的方向上不断精进。

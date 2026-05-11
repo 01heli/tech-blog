@@ -1,0 +1,87 @@
+---
+title: 'Redis 缓存设计模式：从基本用法到高级架构'
+description: '掌握 Redis 在真实业务中的设计模式：缓存穿透、击穿、雪崩的防护策略，以及 Cache-Aside、Write-Through 等模式的应用。'
+date: '2026-04-15'
+category: 'Redis'
+tags: ['redis', '缓存', '设计模式', '高并发']
+featured: true
+---
+
+## 缓存的本质
+
+缓存是计算机科学中最伟大的发明之一。用空间换时间，将计算结果的引用存储起来，下次直接返回——这就是缓存的本质。
+
+Redis 作为最流行的分布式缓存，在实际应用中需要面对三个经典问题：
+
+## 缓存穿透
+
+当查询一个**不存在**的数据时，缓存和数据库都不会命中。如果大量并发请求这样的数据，所有请求都会穿透到数据库。
+
+**解决方案：布隆过滤器**
+
+```python
+from bloomfilter import BloomFilter
+
+bf = BloomFilter(capacity=1000000, error_rate=0.001)
+
+def get_user(user_id):
+    if not bf.contains(user_id):
+        return None  # 一定不存在
+
+    user = cache.get(user_id)
+    if user is None:
+        user = db.query(user_id)
+        if user:
+            cache.set(user_id, user, ttl=3600)
+    return user
+```
+
+还可以对空值也进行缓存，设置较短的过期时间（如5分钟），防止恶意攻击遍历 ID。
+
+## 缓存击穿
+
+某个**热点 Key** 在过期瞬间，大量并发请求同时打到数据库。这是高并发场景下最危险的时刻。
+
+**解决方案：互斥锁 + 逻辑过期**
+
+```python
+import threading
+
+def get_hot_data(key):
+    data = cache.get(key)
+    if data is None:
+        # 仅一个线程去查数据库
+        lock = cache.lock(f"lock:{key}", timeout=5)
+        if lock.acquire():
+            try:
+                data = db.query(...)
+                cache.set(key, data, ttl=60)
+            finally:
+                lock.release()
+        else:
+            time.sleep(0.1)
+            return get_hot_data(key)  # 重试
+    return data
+```
+
+对于高并发场景，更推荐使用"逻辑过期"——key 永久有效，value 中包含过期时间戳，后台异步更新。
+
+## 缓存雪崩
+
+大量 Key **同时过期**，或 Redis 节点宕机，导致所有请求直达数据库。
+
+解决方案：
+- **过期时间加随机偏移**：`ttl = 3600 + random(0, 600)`
+- **多级缓存架构**：本地缓存 (Caffeine) → Redis → 数据库
+- **Redis Cluster / Sentinel** 保证高可用
+
+## 设计模式选择
+
+| 模式 | 读策略 | 写策略 | 适用场景 |
+|------|--------|--------|----------|
+| Cache-Aside | 读缓存→miss→读库→写缓存 | 写库→删缓存 | 读多写少 |
+| Read-Through | 缓存层自动回源 | — | 读密集型 |
+| Write-Through | — | 同步写缓存+写库 | 数据一致性要求高 |
+| Write-Behind | — | 异步写库 | 写密集型，可容忍少量数据丢失 |
+
+选择合适的设计模式，比你想象中更重要。
