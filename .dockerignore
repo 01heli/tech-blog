@@ -1,0 +1,8 @@
+node_modules
+.git
+.next
+.vercel
+nginx/certs
+*.md
+.env*
+!.env.example
