@@ -6,47 +6,26 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-
-      - name: Build Docker image
-        run: docker build -t tech-blog:latest .
-
-      - name: Save and compress image
-        run: docker save tech-blog:latest | gzip > tech-blog.tar.gz
-
-      - name: Deploy to server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          source: "tech-blog.tar.gz,docker-compose.yml,nginx/nginx.conf"
-          target: "/root/tech_blog/tech-blog/"
-
-      - name: Restart service
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
+            set -e
             cd /root/tech_blog/tech-blog
-            docker load < tech-blog.tar.gz
-            docker compose up -d --force-recreate
-            rm -f tech-blog.tar.gz
+
+            echo ">>> 拉取最新代码..."
+            git pull origin master
+
+            echo ">>> 构建并重启..."
+            docker compose up -d --build --force-recreate
+
+            echo ">>> 清理旧镜像..."
             docker image prune -f
+
+            echo ">>> 部署完成!"
