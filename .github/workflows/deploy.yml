@@ -20,7 +20,8 @@ jobs:
             cd /root/tech_blog/tech-blog
 
             echo ">>> 拉取最新代码..."
-            git pull origin master
+            git fetch origin master
+            git reset --hard origin/master
 
             echo ">>> 构建并重启..."
             docker compose up -d --build --force-recreate
