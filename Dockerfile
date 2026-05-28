@@ -33,6 +33,7 @@ COPY --from=builder /app/prisma ./prisma
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 
 RUN mkdir -p /app/prisma/data && chown -R blog:blog /app/prisma/data
+RUN chown -R blog:blog /app/node_modules/@prisma /app/node_modules/.prisma /app/node_modules/prisma /app/prisma
 RUN chmod +x /app/docker-entrypoint.sh
 
 USER blog
