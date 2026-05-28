@@ -46,12 +46,17 @@ export function LoginModal({ open, onClose }: LoginModalProps) {
     }
     setError('')
     setLoading(true)
-    const res = await sendCode(trimmed)
-    setLoading(false)
-    if (res.success) {
-      setCountdown(60)
-    } else {
-      setError(res.error || '发送失败')
+    try {
+      const res = await sendCode(trimmed)
+      if (res.success) {
+        setCountdown(60)
+      } else {
+        setError(res.error || '发送失败')
+      }
+    } catch {
+      setError('网络错误，请稍后重试')
+    } finally {
+      setLoading(false)
     }
   }, [phone, sendCode])
 
@@ -62,15 +67,20 @@ export function LoginModal({ open, onClose }: LoginModalProps) {
     }
     setError('')
     setLoading(true)
-    const res = await login(phone, code)
-    setLoading(false)
-    if (res.success) {
-      onClose()
-      if (res.redirectTo) {
-        router.push(res.redirectTo)
+    try {
+      const res = await login(phone, code)
+      if (res.success) {
+        onClose()
+        if (res.redirectTo) {
+          router.push(res.redirectTo)
+        }
+      } else {
+        setError(res.error || '登录失败')
       }
-    } else {
-      setError(res.error || '登录失败')
+    } catch {
+      setError('网络错误，请稍后重试')
+    } finally {
+      setLoading(false)
     }
   }, [phone, code, login, onClose, router])
 

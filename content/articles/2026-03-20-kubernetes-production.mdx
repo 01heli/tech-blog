@@ -7,15 +7,25 @@ tags: ['kubernetes', '云原生', '部署', '监控', 'HPA']
 featured: false
 ---
 
-## 从一个简单的 Deployment 开始
+## 从一个生产级的 Deployment 开始
+
+一个"能用"的 Deployment 和一个"生产级"的 Deployment 之间的差距，往往就藏在资源配置、健康检查、安全上下文这些细节里。
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: api-server
+  labels:
+    app: api-server
 spec:
   replicas: 3
+  revisionHistoryLimit: 5   # 保留最近 5 个版本用于回滚
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1           # 滚动更新时最多超出 1 个 Pod
+      maxUnavailable: 0     # 滚动更新时不允许不可用 Pod
   selector:
     matchLabels:
       app: api-server
@@ -23,12 +33,23 @@ spec:
     metadata:
       labels:
         app: api-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
       containers:
       - name: api-server
         image: registry.example.com/api-server:v1.2.0
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080
+          protocol: TCP
         resources:
           requests:
             cpu: "250m"
@@ -42,33 +63,115 @@ spec:
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 10
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /health
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 20
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 0
+          periodSeconds: 5
+          failureThreshold: 30   # 最多等 150 秒给应用启动
+        env:
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: api-server-secrets
+              key: db-host
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: api-server
+              topologyKey: kubernetes.io/hostname
 ```
 
-## 资源限制的最佳实践
+### 关键细节解读
 
-资源请求（requests）和限制（limits）的配置直接影响调度和稳定性：
+**资源配置** 是生产环境最不可省略的部分：
 
-- **requests** 是调度器使用的保证量，应设为稳态运行所需
-- **limits** 是允许使用的上限，CPU limits 会导致 throttling
-- 生产环境**不要省略** resource 配置
+- `requests` 是调度器用来决定 Pod 放在哪个节点上的保证量，也是 HPA 计算利用率的基准
+- `limits` 是 Pod 能使用的上限。**CPU limits 会导致 throttling**——进程看着有多余 CPU 但内核强制限速，这是常见的性能陷阱
+- 内存 `limits` 超了会直接 OOMKill，Pod 重启
+
+**三种探针各有用途：**
+
+| 探针 | 作用 | 失败后果 | 建议配置 |
+|------|------|----------|----------|
+| `startupProbe` | 检测应用是否启动完成 | 重启容器 | 给足时间（如 30 次 × 5s = 150s） |
+| `readinessProbe` | 检测应用是否可接收流量 | 从 Service 摘除 | 快速检测（10s 间隔） |
+| `livenessProbe` | 检测应用是否还活着 | 重启容器 | 比 readiness 更宽松 |
+
+有个常见误区：readiness 和 liveness 用同一个健康检查端点。如果 liveness 太敏感，可能会在服务只是暂时响应慢时重启 Pod。
+
+**Pod 反亲和性** 确保多副本尽量分散在不同节点上，避免单节点故障导致服务完全不可用。
+
+## 服务暴露与流量入口
+
+### Service：稳定的网络标识
 
 ```yaml
-resources:
-  requests:
-    cpu: "250m"        # 0.25 核保证
-    memory: "256Mi"    # 256MB 保证
-  limits:
-    cpu: "1000m"       # 最多 1 核
-    memory: "512Mi"    # 最多 512MB（超过会 OOMKill）
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+spec:
+  selector:
+    app: api-server
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+  sessionAffinity: None
 ```
 
-## HPA 自动伸缩
+`ClusterIP` 类型在集群内部提供一个稳定的虚拟 IP 和服务发现名称（`api-server.<namespace>.svc.cluster.local`）。CoreDNS 会将它解析到后端 Pod 的 IP 列表。
+
+### Ingress：外部流量的入口
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-server
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-server
+            port:
+              number: 80
+```
+
+## HPA：不只是 CPU
+
+基于 CPU 和内存的自动伸缩是最基本的配置。真正的生产环境应该基于**业务信号**来扩缩容。
+
+### 基础 HPA（CPU + 内存）
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -81,7 +184,7 @@ spec:
     kind: Deployment
     name: api-server
   minReplicas: 3
-  maxReplicas: 20
+  maxReplicas: 50
   metrics:
   - type: Resource
     resource:
@@ -95,32 +198,153 @@ spec:
       target:
         type: Utilization
         averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30     # 30 秒内取最大值
+      policies:
+      - type: Percent
+        value: 200
+        periodSeconds: 60               # 每分钟最多翻倍
+      - type: Pods
+        value: 10
+        periodSeconds: 60
+      selectPolicy: Max                  # 取两条策略中扩容更多的那条
+    scaleDown:
+      stabilizationWindowSeconds: 300    # 5 分钟内取最大值
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60               # 每分钟最多缩 10%
+      selectPolicy: Min                  # 取两条策略中缩容更少的那条
 ```
 
-## Service 与 Ingress
+行为调优的核心原则：**快速扩容，缓慢缩容。** 扩容慢会导致流量洪峰时服务过载；缩容快会导致指标短暂下降后被错误缩容，然后流量反弹时又要扩容（震荡）。
+
+### 基于自定义指标的高级 HPA
+
+CPU 和内存不一定是你的服务的瓶颈。更有效的伸缩信号：
+
+| 指标 | 适用场景 |
+|------|----------|
+| `http_requests_per_second` | Web 服务、API 网关 |
+| `http_request_duration_p99` | 延迟敏感的服务 |
+| `rabbitmq_queue_messages` | 异步任务消费者 |
+| `websocket_active_connections` | 长连接推送服务 |
+| `http_5xx_rate` | 可靠性驱动的扩容 |
+
+通过 Prometheus Adapter 将 Prometheus 指标暴露为 K8s 自定义指标：
 
 ```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: api-server
-spec:
-  selector:
-    app: api-server
-  ports:
-  - port: 80
-    targetPort: 8080
-  type: ClusterIP
+# prometheus-adapter 规则配置
+rules:
+  custom:
+  - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
+    resources:
+      overrides:
+        namespace: {resource: "namespace"}
+        pod: {resource: "pod"}
+    name:
+      matches: "http_requests_total"
+      as: "http_requests_per_second"
+    metricsQuery: |
+      sum(rate(http_requests_total{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)
 ```
 
-## 监控体系
+然后在 HPA 中引用：
 
-生产环境至少需要以下监控维度：
+```yaml
+metrics:
+- type: Pods
+  pods:
+    metric:
+      name: http_requests_per_second
+    target:
+      type: AverageValue
+      averageValue: "1000"    # 每 Pod 每秒 1000 请求触发扩容
+```
 
-1. **基础设施层**：Node exporter → Prometheus → Grafana
-2. **应用层**：自定义 metrics（请求延迟、错误率、QPS）
-3. **K8s 内部**：kube-state-metrics、API Server 指标
+## Prometheus 监控体系
 
-一个有效的监控体系需要覆盖 **RED 指标**（Rate, Errors, Duration）和 **USE 指标**（Utilization, Saturation, Errors）。
+完整的监控栈应覆盖三层：
 
-> 运维的最高境界不是不出现问题，而是出现问题后能在分钟级别定位和恢复。
+### 基础设施层
+
+Node Exporter 采集节点级指标（CPU、内存、磁盘、网络）。Prometheus 每 15 秒抓取一次。核心告警规则：
+
+```yaml
+groups:
+- name: node
+  rules:
+  - alert: NodeCPUHigh
+    expr: 100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Node CPU > 80% for 10 minutes"
+
+  - alert: NodeMemoryLow
+    expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.1
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Node memory available < 10%"
+```
+
+### 应用层
+
+关注 **RED 指标**（Rate, Errors, Duration）：
+
+```promql
+# Rate: 每秒请求数
+rate(http_requests_total[1m])
+
+# Errors: 5xx 错误率
+rate(http_requests_total{status=~"5.."}[1m]) / rate(http_requests_total[1m])
+
+# Duration: P99 延迟
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+```
+
+### Kubernetes 内部
+
+kube-state-metrics 提供了 K8s 对象的指标（Pod 状态、Deployment 副本数等），配合 K8s API Server 的自身指标，可以全面掌握集群状态。
+
+## 滚动更新策略
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 30  # Pod 就绪后至少等 30 秒才视为可用
+```
+
+`maxUnavailable: 0` 确保更新过程中不会有 Pod 不可用——先起一个新的，等它健康检查通过，再停一个旧的。
+
+## 安全加固清单
+
+1. **使用非 root 用户** — `securityContext.runAsNonRoot: true`
+2. **只读文件系统** — `securityContext.readOnlyRootFilesystem: true`
+3. **使用 NetworkPolicy** — 限制 Pod 之间的网络通信
+4. **Secret 加密** — 使用 Sealed Secrets 或外部密钥管理（Vault）
+5. **镜像扫描** — CI 中集成 Trivy/Snyk，阻截高危镜像
+6. **RBAC 最小权限** — 每个 ServiceAccount 只授予必需的权限
+7. **Pod Security Standards** — 至少使用 `baseline` 级别
+
+## 总结
+
+生产环境的 Kubernetes 不是一个部署工具——它是一个**控制循环系统**。你声明期望状态（3 个副本、CPU < 70%、滚动更新），控制循环持续比较期望和实际，驱动集群向期望状态收敛。
+
+关键原则：
+
+1. **永远设置 resource requests 和 limits** — 没有资源的 Pod 就像没有重量的船，风一吹就翻
+2. **配置三种探针** — startup 给足时间，readiness 控制流量，liveness 兜底恢复
+3. **快速扩容，缓慢缩容** — 宁可多跑几个 Pod，也不要因为缩容太快造成服务抖动
+4. **基于业务指标伸缩** — CPU 是滞后信号，QPS 和 P99 延迟才是用户真正感受到的
+5. **监控 RED + USE 两套指标体系** — 覆盖应用和基础设施
+
+Kubernetes 并不简单，但它把分布式系统的复杂性打包成了可复用的抽象。理解了这些抽象背后的设计意图，就能在生产中游刃有余。

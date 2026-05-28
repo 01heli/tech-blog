@@ -8,6 +8,7 @@ import { ArticleSidebar } from '@/components/article/ArticleSidebar';
 import { ArticleNavigation } from '@/components/article/ArticleNavigation';
 import { ReadingProgress } from '@/components/layout/ReadingProgress';
 import { Container } from '@/components/layout/Container';
+import { AdminEditButton } from '@/components/admin/AdminEditButton';
 
 interface PageProps {
   params: { slug: string };
@@ -59,6 +60,7 @@ export default async function ArticlePage({ params }: PageProps) {
 
         <ArticleNavigation prev={prev} next={next} />
       </article>
+      <AdminEditButton slug={params.slug} />
     </>
   );
 }

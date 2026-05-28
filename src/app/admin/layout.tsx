@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation'
 import { getCurrentUser } from '@/lib/auth/session'
+import { AdminNav } from '@/components/admin/AdminNav'
 
 export default async function AdminLayout({
   children,
@@ -21,5 +22,12 @@ export default async function AdminLayout({
     )
   }
 
-  return <>{children}</>
+  return (
+    <div className="min-h-screen flex">
+      <AdminNav />
+      <main className="flex-1 ml-64 p-8">
+        <div className="max-w-6xl mx-auto">{children}</div>
+      </main>
+    </div>
+  )
 }

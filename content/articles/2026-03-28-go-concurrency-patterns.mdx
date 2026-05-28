@@ -9,65 +9,234 @@ featured: true
 
 ## Go 的并发哲学
 
-"Do not communicate by sharing memory; instead, share memory by communicating."
+> "Do not communicate by sharing memory; instead, share memory by communicating."
 
-Rob Pike 的这句话定义了 Go 的并发编程范式。Goroutine 和 Channel 是实现这一范式的两大基石。
+Rob Pike 的这句名言定义了 Go 的并发编程范式。它不是在玩文字游戏——这句话揭示了一个根本性的设计抉择：**用 channel 在 goroutine 之间传递数据的所有权，而不是用锁来保护共享内存。**
 
-## GMP 调度模型
+这个范式的强大之处在于，它把并发的复杂性从"如何保护数据"转移到了"如何设计数据流"。当你通过 channel 传递数据时，数据在同一时刻只被一个 goroutine 持有——不需要锁，因为不存在共享。
 
-Go 运行时使用 GMP 模型来管理 goroutine 的调度：
+## GMP 调度模型详解
 
-- **G (Goroutine)**：用户态的轻量级线程，初始栈大小仅 2KB
-- **M (Machine)**：操作系统线程，G 需要运行在 M 上
-- **P (Processor)**：调度上下文，包含可运行的 G 队列，数量由 `GOMAXPROCS` 决定
+GMP 是 Go runtime 调度器的核心模型，理解它有助于写出高效的并发代码。
+
+### 三元组
 
 ```
-┌──────────────────────────────────┐
-│          Go Runtime              │
-│  ┌────┐ ┌────┐ ┌────┐           │
-│  │ G  │ │ G  │ │ G  │  (Local Q)│
-│  └────┘ └────┘ └────┘           │
-│       ↓     ↓     ↓             │
-│  ┌─────────────────┐            │
-│  │        P        │            │
-│  └────────┬────────┘            │
-│           │                     │
-│  ┌────────┴────────┐            │
-│  │        M        │            │
-│  └─────────────────┘            │
-└──────────────────────────────────┘
+G (Goroutine)  — 用户态轻量级"线程"，初始栈仅 2KB，可扩展至 1GB
+M (Machine)    — 操作系统线程，G 需要绑定到 M 上才能执行
+P (Processor)  — 调度上下文，持有本地运行队列 + 内存缓存(mcache)
+                 数量 = GOMAXPROCS（默认等于 CPU 核数）
 ```
 
-## Channel 使用模式
+GMP 工作机制：
+
+```
+┌─────────────────────────────────────────┐
+│              Go Runtime                 │
+│                                         │
+│  ┌──────┐ ┌──────┐ ┌──────┐            │
+│  │  G   │ │  G   │ │  G   │  ← 本地队列 │
+│  └──┬───┘ └──┬───┘ └──┬───┘            │
+│     │        │        │                 │
+│     └────────┼────────┘                 │
+│              ▼                          │
+│        ┌──────────┐                     │
+│        │    P     │  ← 调度上下文        │
+│        └────┬─────┘                     │
+│             │                           │
+│        ┌────┴─────┐                     │
+│        │    M     │  ← OS 线程           │
+│        └──────────┘                     │
+└─────────────────────────────────────────┘
+```
+
+每个 P 有自己的本地 goroutine 队列。调度时优先从本地队列取 G，本地空就去全局队列或从其他 P "偷"一半任务（work stealing）。
+
+### GOMAXPROCS 的调优
+
+```bash
+# 查看当前设置
+go env GOMAXPROCS
+
+# 运行时设置
+runtime.GOMAXPROCS(8)
+
+# 查看调度器行为（每秒输出一次调度器快照）
+GODEBUG=schedtrace=1000 ./myapp
+```
+
+一般原则：
+- **CPU 密集型**：`GOMAXPROCS = CPU 核数`（默认即可）
+- **I/O 密集型**：`GOMAXPROCS = CPU 核数 × 1.5~2`，因为 goroutine 经常在等待 I/O
+- 监控 `GODEBUG=schedtrace` 的输出，关注 `idleprocs`（空闲 P）和 `runqueue` 长度
+
+## Goroutine 的最佳实践
+
+### 永远确保 goroutine 可以退出
+
+goroutine 泄漏是 Go 程序中最常见的内存泄漏形式。一个被遗忘的 goroutine 可能永久占用内存而不会被 GC 回收。
+
+```go
+// ❌ 危险：ch 没有发送者，goroutine 永久阻塞
+func leak() {
+    ch := make(chan int)
+    go func() {
+        val := <-ch  // 永远等不到数据
+        fmt.Println(val)
+    }()
+    // ch 没有发送者，goroutine 泄漏
+}
+
+// ✅ 正确：使用 context 控制 goroutine 生命周期
+func noleak(ctx context.Context) {
+    go func() {
+        select {
+        case <-ctx.Done():
+            return  // 收到取消信号，干净退出
+        case val := <-workCh:
+            process(val)
+        }
+    }()
+}
+```
+
+### 控制 goroutine 数量
+
+goroutine 再轻量也不是免费的。在高并发场景下，应该通过 worker pool 限制并发数量：
+
+```go
+type WorkerPool struct {
+    tasks   chan func()
+    ctx     context.Context
+    cancel  context.CancelFunc
+}
+
+func NewWorkerPool(workers int) *WorkerPool {
+    ctx, cancel := context.WithCancel(context.Background())
+    pool := &WorkerPool{
+        tasks:  make(chan func(), 1000),
+        ctx:    ctx,
+        cancel: cancel,
+    }
+    for i := 0; i < workers; i++ {
+        go pool.worker()
+    }
+    return pool
+}
+
+func (p *WorkerPool) worker() {
+    for {
+        select {
+        case <-p.ctx.Done():
+            return
+        case task := <-p.tasks:
+            task()
+        }
+    }
+}
+
+func (p *WorkerPool) Submit(task func()) {
+    select {
+    case p.tasks <- task:
+    case <-p.ctx.Done():
+    }
+}
+```
+
+### CPU 密集型任务的协作式调度
+
+Go 1.14 之前，纯计算循环会导致 goroutine 无法被抢占。1.14 引入了基于信号的异步抢占，但显式让出 CPU 依然是好的实践：
+
+```go
+for i := 0; i < len(data); i++ {
+    process(data[i])
+    if i%128 == 0 {
+        runtime.Gosched()  // 主动让出时间片
+    }
+}
+```
+
+## Channel 的使用模式
+
+### 谁创建，谁关闭
+
+这是最重要的 channel 规则：**永远由发送方关闭 channel，且只关闭一次。**
+
+```go
+// ✅ 正确：发送方负责关闭
+func producer(ch chan<- int) {
+    defer close(ch)  // 发送方关闭，只执行一次
+    for i := 0; i < 10; i++ {
+        ch <- i
+    }
+}
+
+// ❌ 错误：接收方关闭 channel
+func consumer(ch <-chan int) {
+    close(ch)  // panic! 不应该由接收方关闭
+}
+```
+
+关闭已关闭的 channel 会 panic，向已关闭的 channel 发送数据也会 panic。一个简单的安全保障：
+
+```go
+type SafeChan struct {
+    ch     chan int
+    closed atomic.Bool
+}
+
+func (sc *SafeChan) Close() {
+    if sc.closed.CompareAndSwap(false, true) {
+        close(sc.ch)
+    }
+}
+```
 
 ### Fan-Out / Fan-In
 
-```go
-func fanOut() {
-    jobs := make(chan int, 100)
-    results := make(chan int, 100)
+将任务分发给多个 worker 并发执行，然后汇总结果：
 
-    // Fan-out: 启动多个 worker
-    for w := 0; w < 10; w++ {
-        go worker(jobs, results)
+```go
+func fanOutFanIn(jobs []Job, workerCount int) []Result {
+    jobCh := make(chan Job, len(jobs))
+    resultCh := make(chan Result, len(jobs))
+
+    // Fan-out: 启动 workers
+    var wg sync.WaitGroup
+    for w := 0; w < workerCount; w++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for job := range jobCh {
+                resultCh <- process(job)
+            }
+        }()
     }
 
     // 分发任务
-    for i := 0; i < 100; i++ {
-        jobs <- i
+    for _, job := range jobs {
+        jobCh <- job
     }
-    close(jobs)
+    close(jobCh)  // 发送完任务，关闭让 workers 退出
+
+    // 等待所有 workers 完成后关闭结果 channel
+    go func() {
+        wg.Wait()
+        close(resultCh)
+    }()
 
     // Fan-in: 收集结果
-    for i := 0; i < 100; i++ {
-        <-results
+    var results []Result
+    for r := range resultCh {
+        results = append(results, r)
     }
+    return results
 }
 ```
 
 ### Or-Done Pattern
 
-当需要同时监听多个 channel 的消息时：
+当需要同时监听取消信号和一个或多个数据 channel 时，Or-Done 模式可以减少 select 的嵌套：
 
 ```go
 func orDone(done <-chan struct{}, c <-chan interface{}) <-chan interface{} {
@@ -85,78 +254,224 @@ func orDone(done <-chan struct{}, c <-chan interface{}) <-chan interface{} {
                 select {
                 case valStream <- v:
                 case <-done:
+                    return
                 }
             }
         }
     }()
     return valStream
 }
+
+// 使用：干净的 for-range
+for val := range orDone(done, myChan) {
+    process(val)
+}
 ```
 
 ### Pipeline Pattern
 
-通过 channel 连接多个处理阶段，每个阶段可以独立扩展：
+通过 channel 将处理流程串联起来，每个阶段独立可扩展：
 
 ```go
-func pipeline() {
-    // Stage 1: 生成数字
-    gen := func(nums ...int) <-chan int {
-        out := make(chan int)
-        go func() {
-            for _, n := range nums {
-                out <- n
+// Stage 1: 生成数字
+func gen(ctx context.Context, nums ...int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for _, n := range nums {
+            select {
+            case <-ctx.Done():
+                return
+            case out <- n:
             }
-            close(out)
-        }()
-        return out
-    }
+        }
+    }()
+    return out
+}
 
-    // Stage 2: 平方
-    sq := func(in <-chan int) <-chan int {
-        out := make(chan int)
-        go func() {
-            for n := range in {
-                out <- n * n
+// Stage 2: 平方
+func sq(ctx context.Context, in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range in {
+            select {
+            case <-ctx.Done():
+                return
+            case out <- n * n:
             }
-            close(out)
-        }()
-        return out
-    }
+        }
+    }()
+    return out
+}
 
-    // 组合 pipeline
-    for n := range sq(sq(gen(2, 3))) {
-        fmt.Println(n) // 16, 81
-    }
+// 组合
+ctx := context.Background()
+for n := range sq(ctx, sq(ctx, gen(ctx, 2, 3))) {
+    fmt.Println(n) // 16, 81
 }
 ```
 
-## Context 传递与取消
+Pipeline 模式的美妙之处在于：每个阶段都是独立的函数，可以单独测试、单独扩展（比如某个阶段加更多的 goroutine）。
+
+### nil channel 的妙用
+
+nil channel 上的读写操作会永久阻塞。利用这个特性可以动态禁用 select 中的某个分支：
 
 ```go
-func callService(ctx context.Context) error {
-    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-    defer cancel()
+// 实现"重试最多 3 次"
+var timeoutCh <-chan time.Time  // nil，默认禁用
 
-    req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return fmt.Errorf("request failed: %w", err)
+for retries := 0; retries < 3; retries++ {
+    select {
+    case result := <-workCh:
+        return result, nil
+    case <-timeoutCh:
+        // 第一次不会走这里，因为 timeoutCh 是 nil
     }
-    defer resp.Body.Close()
-    // ...
+    timeoutCh = time.After(time.Second)  // 激活超时分支
 }
 ```
+
+## Context 的正确使用
+
+Context 是 Go 中传递取消信号、超时、请求级数据的标准方式。
 
 ### 关键原则
 
-1. **Context 是请求范围的，不要存储在结构体中**
-2. **总是 defer cancel()**
-3. **不要传递 nil context，用 `context.TODO()` 代替**
+```go
+// 1. Context 作为函数的第一个参数
+func doSomething(ctx context.Context, arg string) error { ... }
 
-## 常见的并发陷阱
+// 2. 总是 defer cancel()
+func callWithTimeout(ctx context.Context) error {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()  // 确保资源释放
+    return doSomething(ctx, "hello")
+}
 
-> ⚠️ **Goroutine 泄漏**：永远确保 goroutine 可以退出。使用 `context` 或 `done` channel 传递取消信号。
+// 3. 不要将 context 存储在结构体中
+type Server struct {
+    ctx context.Context  // ❌ 不要这么做
+}
+// context 是请求范围的，不是服务级别的
+// 服务级别应该用生命周期的 done channel
+```
 
-> ⚠️ **资源竞争**：用 `go run -race` 检测数据竞争。这是 Go 编译器自带的竞态检测器，遇到竞争时会在 stderr 输出详细报告。
+### 使用 context 进行超时控制
 
-记住：并发不是并行。并发是结构，并行是执行。
+```go
+func callRemoteService(ctx context.Context) error {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(ctx, "GET", "https://api.example.com/data", nil)
+    if err != nil {
+        return err
+    }
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        // 如果超时，err 会是 context.DeadlineExceeded
+        return fmt.Errorf("request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    // 处理响应...
+    return nil
+}
+```
+
+## 常见并发陷阱
+
+### 循环变量捕获
+
+Go 1.22 之前最经典的 bug：
+
+```go
+// ❌ Go 1.21 及之前：所有 goroutine 共享同一个 v 变量
+for _, v := range items {
+    go func() {
+        process(v)  // 可能全部处理的是最后一个 item
+    }()
+}
+
+// ✅ 修复：通过参数传递
+for _, v := range items {
+    go func(item Item) {
+        process(item)
+    }(v)
+}
+```
+
+Go 1.22+ 修复了这个问题，循环变量每次迭代都会重新创建。但为了向后兼容，显式传参仍然是最好的习惯。
+
+### sync.WaitGroup 的错误用法
+
+```go
+// ❌ 错误：Add 在 go 语句里面
+for i := 0; i < 10; i++ {
+    go func() {
+        wg.Add(1)   // 可能 wg.Wait() 已经返回了才 Add
+        defer wg.Done()
+        work()
+    }()
+}
+
+// ✅ 正确：Add 必须在 go 语句之前
+for i := 0; i < 10; i++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        work()
+    }()
+}
+```
+
+### 竞态检测
+
+Go 自带了强大的竞态检测器，应该在测试中始终启用：
+
+```bash
+go test -race ./...
+go run -race main.go
+go build -race -o myapp
+```
+
+竞态检测器的性能损耗约 5-10 倍，适合测试和预发布环境，不要在生产环境使用。
+
+## 生产级可观测性
+
+```go
+import _ "net/http/pprof"
+
+// 在服务中启动 pprof
+go func() {
+    http.ListenAndServe("localhost:6060", nil)
+}()
+```
+
+关键诊断命令：
+
+```bash
+# 查看所有 goroutine 栈
+curl "http://localhost:6060/debug/pprof/goroutine?debug=2"
+
+# 分析锁竞争
+go tool pprof http://localhost:6060/debug/pprof/mutex
+
+# 可视化 goroutine 的执行轨迹
+curl localhost:6060/debug/pprof/trace?seconds=30 > trace.out
+go tool trace trace.out
+```
+
+## 总结
+
+Go 的并发模型之所以强大，不是因为它提供了多少种并发原语——恰恰相反，Go 只提供了 goroutine、channel、select、sync 这几个简单的原语。真正重要的是**设计哲学**：
+
+1. **用 channel 传递数据所有权**，而不是用锁保护共享内存
+2. **用 context 传递取消信号**，让 goroutine 能够干净地退出
+3. **用 select 处理多路就绪**，配合超时实现健壮的控制流
+4. **用 worker pool 限制并发**，goroutine 也需要管理
+
+记住：**并发不是并行。并发是关于结构的——如何组织代码来处理多个同时发生的事件。并行是关于执行的——如何利用多核来加速计算。** Go 给了你优秀的并发工具，但正确的结构仍然需要你来设计。
