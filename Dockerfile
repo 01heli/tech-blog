@@ -30,10 +30,12 @@ COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=builder /app/prisma ./prisma
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
 
 RUN mkdir -p /app/prisma/data && chown -R blog:blog /app/prisma/data
+RUN chmod +x /app/docker-entrypoint.sh
 
 USER blog
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma db push && node server.js"]
+ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
