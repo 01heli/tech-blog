@@ -1,0 +1,583 @@
+---
+title: 数据库事务隔离级别深度解析：从 SQL 标准到 InnoDB/PostgreSQL 源码实现
+description: 深入剖析 ANSI SQL-92 四种隔离级别、脏读/不可重复读/幻读三大现象，以及 MySQL InnoDB MVCC/间隙锁和 PostgreSQL xmin-xmax/SSI 的底层实现原理。
+date: '2026-05-28'
+category: Database
+tags:
+  - database
+  - 事务
+  - 隔离级别
+  - MySQL
+  - PostgreSQL
+  - MVCC
+  - InnoDB
+featured: true
+---
+
+## 从银行转账说起
+
+想象你正在给朋友转账 1000 元。背后数据库要做两件事：
+
+```sql
+-- 你的账户扣款
+UPDATE accounts SET balance = balance - 1000 WHERE user_id = 1;
+-- 朋友的账户入账
+UPDATE accounts SET balance = balance + 1000 WHERE user_id = 2;
+```
+
+这两条 SQL 必须**要么全部生效，要么全部不生效**。如果第一条执行完，第二条执行时数据库崩了，你的 1000 块就凭空消失了——没人能接受这种事情。
+
+数据库通过**事务**来解决这类问题。ACID 中的 I——**Isolation（隔离性）**——定义了当多个事务同时运行时，它们之间能看到对方的多少行为。这直接决定了你的应用在高并发场景下会不会出现数据错乱。
+
+本文将从 ANSI SQL-92 标准出发，深入到 MySQL InnoDB 和 PostgreSQL 两大数据引擎的源码层面，把事务隔离这件事彻底讲清楚。
+
+## 先看一眼定义
+
+ANSI SQL-92 标准定义了四种隔离级别，每种级别规定了三个"并发现象"是否被允许发生：
+
+| 隔离级别 | 脏读 (Dirty Read) | 不可重复读 (NON-Repeatable Read) | 幻读 (Phantom Read) |
+|----------|:---:|:---:|:---:|
+| **READ UNCOMMITTED**（读未提交） | 可能 | 可能 | 可能 |
+| **READ COMMITTED**（读已提交） | 不会 | 可能 | 可能 |
+| **REPEATABLE READ**（可重复读） | 不会 | 不会 | 可能* |
+| **SERIALIZABLE**（可串行化） | 不会 | 不会 | 不会 |
+
+> *注：MySQL InnoDB 在 RR 级别通过间隙锁（Gap Lock）也阻止了幻读，这点后面会详细展开。
+
+注意这张表是**下限约束**——标准说某个级别"不会"发生的现象，各家数据库必须做到；但没有禁止数据库提供更强的保护。
+
+在逐一展开每个级别之前，先理解这三个现象究竟长什么样。
+
+## 三大并发现象，手把手推理
+
+### 脏读：读到了回滚前的中间状态
+
+```sql
+-- 初始状态: accounts.user_1.balance = 1000
+
+--  事务A                          事务B
+BEGIN;                           BEGIN;
+UPDATE accounts                  SELECT balance
+SET balance = 500                FROM accounts
+WHERE user_id = 1;               WHERE user_id = 1;
+-- 此时 balance = 500             -- 读到 balance = 500  ← 脏读！
+
+ROLLBACK;                        -- 事务A回滚了!
+-- balance 实际还是 1000          COMMIT;
+```
+
+事务 B 读到的 500 是一个从未在语义上"存在"过的值——事务 A 最后回滚了，这个中间状态不应该被任何外部事务看到。INCE 现象就是**脏读**。
+
+**现实中有什么危害？**
+
+假设电商系统扣库存的逻辑是：先减少库存、调用第三方支付、支付失败则回滚。如果一个用户并发查询库存时读到"已扣减但未支付"的值，他可能看到错误的库存数量而放弃购买。
+
+**READ COMMITTED 及以上级别禁止脏读。**
+
+### 不可重复读：同一个事务，同一行数据，两次读到不同值
+
+```sql
+-- 初始状态: products.id_42.stock = 10
+
+-- 事务A                            事务B
+BEGIN;                             BEGIN;
+SELECT stock FROM products         UPDATE products
+WHERE id = 42;                     SET stock = 8
+-- 返回: 10                        WHERE id = 42;
+                                   COMMIT;
+SELECT stock FROM products
+WHERE id = 42;
+-- 返回: 8  ← 和第一次不一样！
+COMMIT;
+```
+
+事务 A 在同一事务内两次读取同一行，返回值不一致——因为事务 B 在中间提交了更新。这就是**不可重复读**。
+
+**现实中有什么危害？**
+
+财务对账：事务 A 依次读取 30 个账户余额做汇总，前 16 个账户用的是 B 修改前的快照数据，后 14 个是修改后的——最终总额既不代表更新前，也不代表更新后，逻辑上是错的。
+
+**REPEATABLE READ 及以上级别禁止不可重复读。**
+
+### 幻读：同一个查询条件，两次执行返回不同数量的行
+
+这个和不可重复读容易混淆。关键区别是：
+
+- **不可重复读**聚焦于**同一行**的值被改了
+- **幻读**聚焦于**同一条件**的行**多了或少了**——新插入的行（"幻行"）加入了结果集
+
+```sql
+-- 事务A                              事务B
+BEGIN;                               BEGIN;
+SELECT * FROM orders                 INSERT INTO orders(id, amount)
+WHERE amount > 1000;                 VALUES(999, 1500);
+-- 返回: 5 行                        COMMIT;
+
+SELECT * FROM orders
+WHERE amount > 1000;
+-- 返回: 6 行  ← 多了一个"幻行"！
+COMMIT;
+```
+
+**SERIALIZABLE 级别禁止幻读。**
+
+理解了三个现象之后，我们来逐一深入看四种隔离级别到底在做什么。
+
+## 四种隔离级别，逐一深究
+
+### READ UNCOMMITTED（读未提交）
+
+这是最弱的级别。读写都不加共享锁（SELECT 不加读锁），只要求写操作加长时写锁以防止脏写（两个事务同时写同一数据项）。
+
+**几乎没人会用这个级别**。实际上 MySQL InnoDB 中即使设为 READ UNCOMMITTED，SELECT 也不会真的读到未提交数据——InnoDB 的 MVCC 机制天然拒绝脏数据，所以 RC 和 RU 在 InnoDB 下行为基本一致。SQL Server 中即便设置 RU，也需要显式使用 `NOLOCK` 表提示才会读到未提交数据。
+
+### READ COMMITTED（读已提交）
+
+PostgreSQL 和 Oracle 的**默认级别**，也是绝大多数 OLTP 应用的默认选择。
+
+**核心语义**：一个事务中的每条 SQL 看到的都是该 SQL 开始执行那一刻已经提交了的数据。每次 `SELECT` 获取一个新的数据快照。
+
+```sql
+BEGIN;              -- 事务开始
+SELECT ...;         -- 快照 s1（看到 t0 及之前提交的数据）
+-- ...同时其他事务提交了更新...
+SELECT ...;         -- 快照 s2（能看到 s1 到 s2 之间提交的数据）
+COMMIT;
+```
+
+这是 RC 级别"不可重复读"的根源：两次 SELECT 获取了两个不同的快照，中间其他事务的提交对后一次 SELECT 可见。
+
+**RC 的实现策略在 MySQL 和 PostgreSQL 中差异非常大，后面源码部分会详细对比。**
+
+### REPEATABLE READ（可重复读）
+
+MySQL InnoDB 的**默认级别**。
+
+**核心语义**：在事务的**第一条 SQL 执行时**获取一个快照，整个事务期间复用这个快照。因此无论其他事务提交了什么，本事务内多次读取同一行结果一致。
+
+```sql
+BEGIN;              -- 事务开始
+SELECT ...;         -- 快照 s1（本次事务的唯一快照）
+-- ...同时其他事务提交了更新...
+SELECT ...;         -- 仍然使用快照 s1，看不到中间提交的更新
+COMMIT;
+```
+
+**在标准 ANSI SQL 中，RR 仍然允许幻读。** 但 MySQL InnoDB 是个例外——它通过 Next-Key Lock（行锁 + 间隙锁的组合）阻止了幻读，使 RR 在实际行为上非常接近 Serializable。这一点后面源码部分会详细拆解。
+
+PostgreSQL 的 REPEATABLE READ 则使用 Snapshot Isolation 实现，可以阻止幻读但会出现写偏斜（Write Skew），见后文"超越 ANSI 标准的异常"一节。
+
+### SERIALIZABLE（可串行化）
+
+最高隔离级别，保证并发事务的执行效果等同于某种串行顺序。
+
+**不同数据库的实现策略天差地别：**
+
+| 数据库 | Serializable 实现方式 |
+|--------|----------------------|
+| MySQL InnoDB | 自动将普通 SELECT 转为 `SELECT ... FOR SHARE`，退化到基于锁的并发控制 |
+| PostgreSQL 9.1+ | **Serializable Snapshot Isolation (SSI)**，在 SI 基础上检测"危险结构" |
+| Oracle | 不支持真正的 Serializable（尽管语法上接受） |
+| SQL Server | 基于锁的严格两阶段锁定（S2PL） |
+
+PostgreSQL 的 SSI 方案是学术研究成功落地的标志性案例，后面会重点拆解。
+
+## MySQL InnoDB：MVCC、ReadView 和 Next-Key Lock
+
+MySQL InnoDB 的隔离机制建立在三个支柱之上：**MVCC 多版本并发控制**、**ReadView 可见性判断**、**Next-Key Lock 锁算法**。
+
+### 第一支柱：Undo Log 版本链
+
+InnoDB 每行数据在磁盘上有三个隐藏字段：
+
+| 隐藏字段 | 长度 | 含义 |
+|----------|------|------|
+| `DB_TRX_ID` | 6 字节 | 最近一次修改这行数据的事务 ID |
+| `DB_ROLL_PTR` | 7 字节 | 回滚指针，指向 undo log 中该行的上一版本 |
+| `DB_ROW_ID` | 6 字节 | 无主键时自动生成的隐藏主键 |
+
+**每次 UPDATE 或 DELETE 操作会：**
+
+1. 在内存缓冲池中将当前行标记为修改
+2. 修改前的旧值写入 **undo log**
+3. 新版本行的 `DB_TRX_ID` 更新为当前事务 ID
+4. 新版本行的 `DB_ROLL_PTR` 指向 undo log 中刚写入的旧版本
+
+这样就形成了一条**单向版本链**——链头是最新版本，链尾是最早版本：
+
+```
+当前版本 (trx_id=90) → 上一版本 (trx_id=78) → 更早版本 (trx_id=65) → 最早版本 (trx_id=50)
+  roll_ptr → 78          roll_ptr → 65          roll_ptr → 50          roll_ptr → NULL
+```
+
+undo log 分两种类型：
+- **INSERT undo log**：事务提交后即可删除（插入的数据只有本事务能看到，回滚前对其他事务不可见）
+- **UPDATE undo log**：必须保留到没有任何活跃事务需要这个历史版本为止。后台 **purge 线程** 会异步清理不再被任何 ReadView 引用的更新 undo log
+
+这直接引出了一个问题：MVCC 怎么判断该用版本链上的哪个版本？
+
+### 第二支柱：ReadView 可见性判断
+
+ReadView 是一个对当前数据库中活跃事务状态的"快照"。它包含四个关键字段：
+
+| 字段 | 含义 |
+|------|------|
+| `m_ids` | 创建 ReadView 时，系统中所有活跃（未提交）事务的 ID 列表 |
+| `min_trx_id` | `m_ids` 中的最小值 |
+| `max_trx_id` | 下一个将要分配的事务 ID（即系统中出现过的最大的事务 ID 加一） |
+| `creator_trx_id` | 创建该 ReadView 的事务自己的 ID |
+
+对版本链上的每个版本（已知其 `trx_id`），可见性判断逻辑是：
+
+```
+1. trx_id == creator_trx_id       → 可见（自己修改的当然可见）
+2. trx_id < min_trx_id            → 可见（ReadView 创建前已提交）
+3. trx_id >= max_trx_id           → 不可见（ReadView 创建后才启动的事务）
+4. trx_id 在 m_ids 中            → 不可见（事务未提交）
+5. trx_id 不在 m_ids 中          → 可见（事务已提交）
+```
+
+如果当前版本不可见，沿着 `DB_ROLL_PTR` 链往上找上一版本，重复判断，直到找到可见版本为止。
+
+**这就是 RC 与 RR 的唯一代码层面差异——ReadView 的生成时机：**
+
+| | READ COMMITTED | REPEATABLE READ |
+|---|---|---|
+| **ReadView 生成时机** | 每次 `SELECT` 都重新生成 | 事务中第一次 `SELECT` 时生成一次，之后复用 |
+| **不可重复读** | 存在（两次 SELECT 拿到不同快照） | 被阻止（同一快照确保结果一致） |
+
+用代码来理解可能更直观：
+
+```
+# RC 模式下：
+事务A 第一次 SELECT → 创建 ReadView1 (m_ids = [A, B])
+    事务B 修改数据并 COMMIT
+事务A 第二次 SELECT → 创建 ReadView2 (m_ids = [A]  # B已提交，不在活跃列表)
+    → 能看到 B 的修改 → 不可重复读
+
+# RR 模式下：
+事务A 第一次 SELECT → 创建 ReadView1 (m_ids = [A, B])
+    事务B 修改数据并 COMMIT
+事务A 第二次 SELECT → 复用 ReadView1 (m_ids 仍然是 [A, B])
+    → 看不到 B 的修改 → 保证可重复读
+```
+
+理解了这个机制，就会发现一个重要的副作用：**长事务会严重危害系统**。一个运行了数小时的事务，它的 ReadView 始终持有那个时刻的 `m_ids`，导致 undo log 中对应事务之前的大量历史版本不能被 purge 线程回收——版本链越来越长、磁盘膨胀、查询性能持续下降。线上排查发现 undo log 疯狂增长，第一反应就是去查是否有人 `BEGIN` 之后忘了 `COMMIT`。
+
+### 快照读 vs 当前读（一个重要区分）
+
+MVCC 加 lock 的组合拳里，有一个容易忽略但至关重要的概念区分：
+
+| 操作类型 | SQL 示例 | 读取机制 |
+|----------|---------|----------|
+| **快照读** | 普通 `SELECT` | 走 MVCC，读历史版本，**不加锁** |
+| **当前读** | `SELECT ... FOR UPDATE` / `SELECT ... LOCK IN SHARE MODE` / `UPDATE` / `DELETE` / `INSERT` | 读最新已提交版本，**加行锁** |
+
+这意味着：
+
+```sql
+-- 在 RR 级别下
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;  -- 快照读，balance = 1000
+
+-- 另一个事务: UPDATE accounts SET balance = 800 WHERE id = 1; COMMIT;
+
+SELECT balance FROM accounts WHERE id = 1;  -- 快照读，仍然是 1000（RR 保证）
+
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+-- 问题：这里被减的是 1000 还是 800？
+-- 答案：800。UPDATE 是当前读，读到的是最新 committed 版本，
+-- 然后在这个最新版本上做修改。RR 的快照读不会保护你免受当前读的影响。
+```
+
+这也是为什么很多"明明设了 RR 为什么还会出问题"的线上事故的根因——混淆了快照读和当前读的行为。
+
+### 第三支柱：Record Lock、Gap Lock 和 Next-Key Lock
+
+在隔离级别的语境下，锁机制主要解决两类问题：**阻止修改已有行**，以及**阻止在间隙中插入新行**。InnoDB 为此设计了三种行级锁：
+
+| 锁类型 | 锁定的对象 | 可视的类比 |
+|--------|-----------|-----------|
+| **Record Lock**（记录锁） | 单条索引记录 | 这间房已住人 |
+| **Gap Lock**（间隙锁） | 索引记录之间的空隙 | 这个空位被预订了 |
+| **Next-Key Lock**（临键锁） | 一条记录 + 该记录前面的间隙 | 房 + 前面的空位一起锁 |
+
+**Next-Key Lock = Record Lock + Gap Lock**。这是 InnoDB 在 RR 级别下默认的锁行为。
+
+假设表中有索引值 `10, 20, 30`，那么可能的 Next-Key Lock 区间是这样分布的（`(`/`)` 是开区间，`[`/`]` 是闭区间）：
+
+```
+(-∞, 10]
+(10, 20]
+(20, 30]
+(30, +∞)     ← 最后一段锁到 supremum 伪记录
+```
+
+当执行 `SELECT * FROM t WHERE id > 15 FOR UPDATE` 时，InnoDB 扫描索引，遇到 id=20 的记录，设置 Next-Key Lock 在 `(10, 20]`；遇到 id=30，设置 `(20, 30]`；同时锁定 `(30, +∞)` 防止最大值后插入。此时任何事务想在 id=18 的位置 INSERT 都会阻塞。
+
+**两个重要的例外：**
+
+1. **唯一索引 + 等值查询 → Next-Key Lock 降级为 Record Lock**
+   ```sql
+   -- id 是唯一索引
+   SELECT * FROM t WHERE id = 20 FOR UPDATE;
+   -- 锁定区间: 仅 [20]，不锁间隙。因为没有必要——唯一索引不可能重复插入。
+   ```
+
+2. **等值查询未命中 → Gap Lock**
+   ```sql
+   -- 表中没有 id = 25 的行
+   SELECT * FROM t WHERE id = 25 FOR UPDATE;
+   -- 在 (20, 30) 之间放置 Gap Lock，阻止其他事务插入 id=25
+   ```
+
+注意一点：**Gap Lock 之间不互斥**。两个事务可以在同一间隙上各持有一个 Gap Lock——它们锁的是"不许别人插入"这件事，而不是排他性地持有间隙本身。真正互斥的冲突发生在：一个人持有 Gap Lock 时，另一个人想往这个间隙 **INSERT**。
+
+**Gap Lock 可以通过两种方式关闭：**
+- 降级到 `READ COMMITTED`
+- 设置 `innodb_locks_unsafe_for_binlog = 1`（旧版本参数）
+
+关闭后仅在外键约束检查和唯一性检查时保留间隙锁，其余场景只使用 Record Lock——幻读又回来了，但并发性能更优。
+
+## PostgreSQL：xmin-xmax 体系和 SSI 串行化
+
+PostgreSQL 走了一条和 MySQL 完全不同的路。它的 MVCC 不依赖 undo log 和回滚段，而是在数据页面中直接保留多版本行——没有"回滚"这个概念，旧版本就躺在表里面。
+
+### Tuple 可见性：xmin、xmax 和 CLOG
+
+PostgreSQL 中每一行数据（称为 **tuple**）的头部都有这两个关键的隐藏字段：
+
+| 字段 | 含义 |
+|------|------|
+| **xmin** | 创建这个 tuple 的事务 ID（INSERT 或 UPDATE 的"新"端） |
+| **xmax** | 删除/淘汰这个 tuple 的事务 ID（DELETE 或 UPDATE 的"旧"端）。为 0 表示这行还活着 |
+
+一句话概括：**一个 tuple 的生命周期就是 [xmin, xmax)。**
+
+```
+INSERT → xmin=X, xmax=0              (活着)
+UPDATE → 旧 tuple: xmax=Y            (被淘汰)
+         新 tuple: xmin=Y, xmax=0     (活着)
+DELETE → xmax=Z                      (被删除)
+```
+
+但这只解决了"被谁创建、被谁删除"的问题，还需要知道"这个事务到底提交了没有"。PostgreSQL 用了 **CLOG**（提交日志，物理存储在 `pg_xact/` 目录）——一个位图结构，每个事务占 2 位来记录状态：
+
+| CLOG 值 | 含义 |
+|---------|------|
+| `00` | TRANSACTION_STATUS_IN_PROGRESS |
+| `01` | TRANSACTION_STATUS_COMMITTED |
+| `10` | TRANSACTION_STATUS_ABORTED |
+| `11` | TRANSACTION_STATUS_SUB_COMMITTED |
+
+但每次都去查 CLOG 太慢了。于是 PostgreSQL 设计了 **Hint Bits（提示位）**——第一次检查完某个事务的提交状态后，把结果直接写回 tuple 的 `t_infomask` 中：
+
+- `HEAP_XMIN_COMMITTED` — 创建者已提交
+- `HEAP_XMIN_ABORTED` — 创建者已中止
+- `HEAP_XMAX_COMMITTED` — 删除者已提交
+- `HEAP_XMAX_ABORTED` — 删除者已中止
+
+**Hint Bits 的副作用**：设置它们是一次写操作。这意味着一条纯读的 `SELECT` 可能因为需要标记 Hint Bits 而触发意外的写 I/O。PostgreSQL 称这个现象为"first touch write"——第一次触碰一个 tuple 时最慢，因为要去 CLOG 求证并写入 Hint Bits。
+
+### Snapshot 结构
+
+PostgreSQL 的 Snapshot 由三个数定义：
+
+```
+snapshot = [xmin : xmax : xip_list]
+```
+
+| 组件 | 含义 |
+|------|------|
+| `snapshot.xmin` | 最老的仍在活跃中的事务 ID——小于此值的事务全部已结束 |
+| `snapshot.xmax` | 下一个将要分配的事务 ID——大于等于此值的事务尚未开始 |
+| `snapshot.xip` | 快照时刻正在活跃中的事务 ID 列表 |
+
+可见性判断逻辑的核心思想：
+
+```
+一个 tuple 对某 snapshot 可见 ⟺
+  创建它的事务（xmin）在 snapshot 中已提交
+  AND
+  删除它的事务（xmax）在 snapshot 中未提交或不存在
+```
+
+有趣的是，当 xmin 创建者和 xmax 删除者都是同一个子事务（subtransaction）时，PostgreSQL 有一套额外的处理逻辑来确保子事务回滚时 CLOG 状态正确终止，避免出现"创建者已提交但删除者也已提交"的矛盾窗口。
+
+### snapshot.xmin 的决定性角色：VACUUM 的隐忧
+
+`snapshot.xmin` 被称为**事件视界**——所有 XID 小于它的老事务都已尘埃落定。
+
+- 一个长事务持有旧 snapshot → `snapshot.xmin` 无法推进 → 那些 `xmax < snapshot.xmin` 的 dead tuple 就不能被 VACUUM 物理回收 → **表膨胀（bloat）**
+- 这就是为什么线上数据库中频繁出现"表不大但占了惊人磁盘空间"的现象
+
+PostgreSQL 用 **可见性映射（Visibility Map）** 优化了这个问题：如果一个数据页上所有 tuple 对所有活跃事务都可见，就把该页标记为"全可见"。顺序扫描（Seq Scan）时可以直接跳过这些页上的逐行可见性检查，不必逐个 tuple 去做 Hint Bits 标记——显著减少 CPU 开销。
+
+### Serializable Snapshot Isolation（SSI）
+
+PostgreSQL 9.1 之前，`SERIALIZABLE` 模式实际上就是 Snapshot Isolation——它能阻止脏读、不可重复读和幻读，但挡不住**写偏斜（Write Skew）**。
+
+2011 年，PostgreSQL 9.1 引入了 **Serializable Snapshot Isolation（SSI）**，基于 Michael J. Cahill 等人的学术研究，首次在工业级数据库中提供了真正可串行化且不依赖锁的并发控制。
+
+SSI 的核心洞察是：**不需要检测事务依赖图中的全部环，只需要检测一种称为"危险结构"的模式就够了。**
+
+三个基本依赖关系：
+
+| 依赖类型 | 含义 |
+|----------|------|
+| **wr-dependency** | T₁ 写了、T₂ 读了 → T₁ 必须早于 T₂ |
+| **ww-dependency** | T₁ 写了、T₂ 覆盖了 → T₁ 必须早于 T₂ |
+| **rw-antidependency** | T₁ 读了旧版本、T₂ 写了新版本 → T₁ 必须早于 T₂ |
+
+**危险结构**的定义是两个连续的 rw-反依赖：
+
+```
+T_in  ──rw──▶  T_pivot  ──rw──▶  T_out
+```
+
+假如依赖图中存在一个环，它就必然包含这样一个危险结构。SSI 的策略是：监控所有 rw-反依赖，一旦发现危险结构就中止其中一个事务（通常选 T_pivot，即中间节点，因为它与两方都冲突）。
+
+PostgreSQL 通过两种方式检测 rw-冲突：
+
+1. **写在前、读在后**：通过 MVCC 可见性检查发现——读取时发现某个 tuple 在 snapshot 中不可见，说明有未提交的写事务已经动了它
+2. **读在前、写在后**：通过 **SIREAD 谓词锁** 来追踪哪能事务读过哪些数据。写事务执行写入时，检查是否存在与之冲突的 SIREAD 锁
+
+SIREAD 锁有几个关键设计：
+- **不阻塞任何操作**（和传统的 S2PL 共事锁完全不同）
+- 在 tuple → 页 → 表三个粒度上支持**粒度升级**（granularity promotion），内存不会失控
+- **在事务提交后仍保留**，直到所有并发事务结束
+
+SSI 的代价是**误杀**——少数情况下它会在不会发生异常时也中止事务。但实际测试表明性能开销非常低（在 TPC-C 类 workload 上约 5%-7%），远优于传统两阶段锁定方案。
+
+## 两个 ANSI 之外的真实异常
+
+ANSI SQL-92 的三个标准现象远不够描述现实世界的并发问题。下面两个是实际中最常出事的。
+
+### 丢失更新（Lost Update）
+
+两个事务几乎同时读取同一行，基于读到的值做计算，再写回去。后提交的那个完全覆盖掉了先提交者的更新。
+
+```sql
+-- 初始值: counter = 100
+
+-- 事务A                   -- 事务B
+BEGIN;                     BEGIN;
+SELECT val FROM counter    SELECT val FROM counter
+WHERE id = 1;              WHERE id = 1;
+-- 读到 100                -- 读到 100
+
+UPDATE counter             UPDATE counter
+SET val = 100 + 20         SET val = 100 + 10
+WHERE id = 1;              WHERE id = 1;
+
+COMMIT;                    COMMIT;
+-- 最终结果: val = 110（期望 130）
+-- 事务A 的 +20 被 B 覆盖了！
+```
+
+**各数据库的应对：**
+- PostgreSQL 和 SQL Server 在 RR 级别**能检测**丢失更新
+- MySQL InnoDB 的 RR **不能**——需要手动 `SELECT ... FOR UPDATE` 锁定目标行
+
+修复方式：
+
+```sql
+-- 正确写法：用 SELECT ... FOR UPDATE 悲观锁
+BEGIN;
+SELECT val FROM counter WHERE id = 1 FOR UPDATE;  -- 锁住这一行
+-- 计算新值...
+UPDATE counter SET val = 130 WHERE id = 1;
+COMMIT;
+```
+
+### 写偏斜（Write Skew）
+
+比丢失更新更隐蔽。两个事务**读的是不同行**，但根据读到的东西做了相反的决策，各自写回了不同行，两者之间没有直接的写冲突。
+
+**经典案例：值班医生**
+
+约束：任何时候至少有一个医生在值班。
+
+```sql
+-- 初始状态: Alice(on_call=true), Bob(on_call=true), Charlie(on_call=false)
+
+-- Alice 请假                        -- Bob 请假
+BEGIN;                               BEGIN;
+SELECT COUNT(*) FROM doctors         SELECT COUNT(*) FROM doctors
+WHERE on_call = true;                WHERE on_call = true;
+-- 返回: 2                           -- 返回: 2
+
+-- 应用逻辑: 2 >= 2 所以允许请假    -- 应用逻辑: 2 >= 2 所以允许请假
+
+UPDATE doctors                       UPDATE doctors
+SET on_call = false                  SET on_call = false
+WHERE name = 'Alice';                WHERE name = 'Bob';
+
+COMMIT;                              COMMIT;
+
+-- 最终结果: 0 个医生在值班！！！（约束被打破）
+```
+
+这就是写偏斜：两个事务读的是重叠的数据集合（但 Alice 和 Bob 是不同的行），各自基于快照做了合法决策，写的是不同的行，数据库完全检测不到冲突——除非你用 Serializable。
+
+**三种修复方式：**
+
+1. **悲观锁**：`SELECT * FROM doctors WHERE on_call = true FOR UPDATE;` — 锁住所有在值班的医生行
+2. **Serializable 隔离级别**：让数据库引擎检测冲突，其中一个事务会自动中止
+3. **物化冲突（Materialize Conflicts）**：新建一张 `on_call_slots` 表，只有两行代表两个值班槽位。请假时锁定对应槽位
+
+## 不同数据库的实际行为速查表
+
+| 现象 / 异常 | MySQL InnoDB RC | MySQL InnoDB RR | PostgreSQL RC | PostgreSQL RR | PostgreSQL Serializable |
+|-------------|:---:|:---:|:---:|:---:|:---:|
+| 脏读 | ❌ | ❌ | ❌ | ❌ | ❌ |
+| 不可重复读 | ✅ | ❌ | ✅ | ❌ | ❌ |
+| 幻读 | ✅ | ❌* | ✅ | ❌ | ❌ |
+| 丢失更新 | ✅ | ✅** | ✅ | ❌ | ❌ |
+| 写偏斜 | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+> *MySQL RR 通过 Next-Key Lock 阻止幻读  
+> **MySQL RR 需要 `SELECT ... FOR UPDATE` 才能阻止丢失更新
+
+## 实践中怎么选隔离级别
+
+### 别全局统一，按场景选用
+
+不同的业务场景需要不同强度的隔离保证。钱包扣款和浏览列表显然不应该用同一个级别。
+
+### 几个经验法则
+
+**READ COMMITTED 够用的场景：**
+- 列表查询，每条 SQL 独立且结果不要求逻辑一致性
+- 短事务、高并发 OLTP（电商浏览、社交媒体流）
+- 大部分 CRUD API
+
+**REPEATABLE READ 需要的场景：**
+- 一笔业务操作内需要多次读取同一行并保证值不变（如库存核验）
+- 报表查询（统计多个表的数据要求基于同一时间点快照）
+- MySQL 推荐的默认级别，有 Next-Key Lock 保护
+
+**SERIALIZABLE 必须的场景：**
+- 转账、扣款等金融操作
+- 多行之间的业务约束需要严格保证（值班医生问题）
+- 库存扣减中任何错误都无法接受
+
+### 几个核心实践建议
+
+1. **找到业务中的不变量（invariant）**——哪些逻辑约束绝对不能被打破？只对涉及这些约束的事务提高隔离级别
+2. **事务越短越好**——长事务是所有 MVCC 系统的大敌，它会阻止 undo log / dead tuple 被清理
+3. **并发测试不是可选的**——隔离级别的 Bug 在压测下才暴露，单元测试测不出来
+4. **了解你用的数据库**——同样叫 REPEATABLE READ，MySQL 和 PostgreSQL 的实际表现差很远
+5. **MySQL 用户注意更新丢失**——RR 不能防止丢失更新，需要显式 `SELECT ... FOR UPDATE`
+6. **PostgreSQL 用户优先选用 Serializable**——SSI 的性能损耗极低，如果你的业务逻辑对正确性有要求，直接上 Serializable 比事后排查数据异常经济得多
+
+## 总结
+
+这篇文章覆盖了四个层次的知识：
+
+1. **标准层面**——ANSI SQL-92 定义的四种隔离级别和三种并发现象，以及为什么这个标准已经不够用
+2. **实现层面**——MySQL InnoDB 通过 undo log + ReadView + Next-Key Lock 三支柱实现并发控制；PostgreSQL 通过 xmin/xmax tuple 元组 + CLOG + Hint Bits 的多版本链实现 MVCC
+3. **学术工业交界**——PostgreSQL SSI 如何通过检测"危险结构"（连续两次 rw-反依赖）实现真正的可串行化
+4. **实践层面**——丢失更新和写偏斜两个超越 ANSI 级别的真实陷阱，以及何时该选什么隔离级别
+
+理解事务隔离，就是在理解并发控制的源代码如何保护你的数据尊严。

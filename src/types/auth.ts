@@ -1,20 +1,33 @@
 export interface SessionData {
-  userId: string
-  phone: string
-  role: string
+  userId: string;
+  phone: string;
+  role: 'READER' | 'ADMIN';
 }
 
 export interface SendCodeRequest {
-  phone: string
+  phone: string;
+}
+
+export interface SendCodeResponse {
+  success: boolean;
+  message: string;
 }
 
 export interface VerifyCodeRequest {
-  phone: string
-  code: string
+  phone: string;
+  code: string;
 }
 
-export interface ApiResponse<T = void> {
-  success: boolean
-  data?: T
-  error?: string
+export interface VerifyCodeResponse {
+  success: boolean;
+  message: string;
+  redirectTo?: string;
+}
+
+export interface MeResponse {
+  loggedIn: boolean;
+  user?: {
+    phone: string;
+    role: string;
+  };
 }

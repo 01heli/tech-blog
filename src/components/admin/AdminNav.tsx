@@ -1,14 +1,20 @@
 'use client'
 
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
+import { usePathname, useRouter } from 'next/navigation'
 import { FileText, Plus, LogOut, Home } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/components/auth/AuthProvider'
 
 export function AdminNav() {
   const pathname = usePathname()
+  const router = useRouter()
   const { logout } = useAuth()
+
+  const handleLogout = async () => {
+    await logout();
+    router.push('/');
+  };
 
   const links = [
     { href: '/admin', label: '文章管理', icon: FileText },
@@ -53,7 +59,7 @@ export function AdminNav() {
           返回首页
         </Link>
         <button
-          onClick={() => logout()}
+          onClick={handleLogout}
           className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-muted hover:bg-black/5 dark:hover:bg-white/5 transition-colors w-full text-left"
         >
           <LogOut className="w-4 h-4" />

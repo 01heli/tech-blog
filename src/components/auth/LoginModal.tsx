@@ -1,168 +1,226 @@
-'use client'
+'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react'
-import { useRouter } from 'next/navigation'
-import { X } from 'lucide-react'
-import { useAuth } from './AuthProvider'
-import { cn } from '@/lib/utils'
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { X, Loader2 } from 'lucide-react';
+import { useAuth } from './AuthProvider';
+import { cn } from '@/lib/utils';
 
 interface LoginModalProps {
-  open: boolean
-  onClose: () => void
+  open: boolean;
+  onClose: () => void;
 }
 
+type Step = 'phone' | 'code';
+
 export function LoginModal({ open, onClose }: LoginModalProps) {
-  const { login, sendCode } = useAuth()
-  const router = useRouter()
+  const { sendCode, login } = useAuth();
+  const [step, setStep] = useState<Step>('phone');
+  const [phone, setPhone] = useState('');
+  const [code, setCode] = useState('');
+  const [error, setError] = useState('');
+  const [countdown, setCountdown] = useState(0);
+  const [sending, setSending] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setInterval>>();
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const [phone, setPhone] = useState('')
-  const [code, setCode] = useState('')
-  const [countdown, setCountdown] = useState(0)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
+  const reset = useCallback(() => {
+    setStep('phone');
+    setPhone('');
+    setCode('');
+    setError('');
+    setCountdown(0);
+    setSending(false);
+    setVerifying(false);
+  }, []);
 
   useEffect(() => {
-    if (open) {
-      setPhone('')
-      setCode('')
-      setCountdown(0)
-      setError('')
-      setTimeout(() => inputRef.current?.focus(), 100)
-    }
-  }, [open])
+    if (open) reset();
+  }, [open, reset]);
 
   useEffect(() => {
-    if (countdown <= 0) return
-    const timer = setInterval(() => setCountdown((c) => c - 1), 1000)
-    return () => clearInterval(timer)
-  }, [countdown])
+    if (open && inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [open, step]);
 
-  const handleSendCode = useCallback(async () => {
-    const trimmed = phone.replace(/\s/g, '')
-    if (!/^(\+86)?1[3-9]\d{9}$/.test(trimmed)) {
-      setError('请输入正确的手机号')
-      return
-    }
-    setError('')
-    setLoading(true)
-    try {
-      const res = await sendCode(trimmed)
-      if (res.success) {
-        setCountdown(60)
-      } else {
-        setError(res.error || '发送失败')
-      }
-    } catch {
-      setError('网络错误，请稍后重试')
-    } finally {
-      setLoading(false)
-    }
-  }, [phone, sendCode])
+  useEffect(() => {
+    if (countdown === 0) return;
+    timerRef.current = setInterval(() => {
+      setCountdown((n) => {
+        if (n <= 1) { clearInterval(timerRef.current); return 0; }
+        return n - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerRef.current);
+  }, [countdown]);
 
-  const handleSubmit = useCallback(async () => {
-    if (code.length !== 6) {
-      setError('请输入6位验证码')
-      return
+  const handleSendCode = async () => {
+    if (!/^1\d{10}$/.test(phone)) {
+      setError('请输入有效的11位手机号码');
+      return;
     }
-    setError('')
-    setLoading(true)
-    try {
-      const res = await login(phone, code)
-      if (res.success) {
-        onClose()
-        if (res.redirectTo) {
-          router.push(res.redirectTo)
-        }
-      } else {
-        setError(res.error || '登录失败')
-      }
-    } catch {
-      setError('网络错误，请稍后重试')
-    } finally {
-      setLoading(false)
+    setError('');
+    setSending(true);
+    const res = await sendCode(phone);
+    setSending(false);
+    if (res.success) {
+      setStep('code');
+      setCountdown(60);
+    } else {
+      setError(res.message);
     }
-  }, [phone, code, login, onClose, router])
+  };
 
-  if (!open) return null
+  const handleVerify = async () => {
+    if (!code || code.length !== 6) {
+      setError('请输入6位验证码');
+      return;
+    }
+    setError('');
+    setVerifying(true);
+    const res = await login(phone, code);
+    setVerifying(false);
+    if (res.success) {
+      onClose();
+      window.location.href = res.redirectTo || '/';
+    } else {
+      setError(res.message);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      if (step === 'phone') handleSendCode();
+      else handleVerify();
+    }
+  };
+
+  if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-      {/* Backdrop */}
+    <>
       <div
-        className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+        className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm"
         onClick={onClose}
       />
-
-      {/* Modal */}
-      <div className="relative w-full max-w-sm bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border border-black/5 dark:border-white/10 p-6">
-        {/* Close button */}
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors text-muted"
+      <div className="fixed inset-0 z-[101] flex items-center justify-center p-4 pointer-events-none">
+        <div
+          className="pointer-events-auto w-full max-w-sm bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 p-6"
+          onClick={(e) => e.stopPropagation()}
         >
-          <X className="w-4 h-4" />
-        </button>
-
-        <h2 className="text-lg font-semibold mb-6">登录 / 注册</h2>
-
-        {/* Phone input */}
-        <label className="block text-sm font-medium text-muted mb-1.5">
-          手机号
-        </label>
-        <input
-          ref={inputRef}
-          type="tel"
-          value={phone}
-          onChange={(e) => setPhone(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSendCode()}
-          placeholder="请输入手机号"
-          className="w-full h-11 px-4 rounded-xl bg-black/5 dark:bg-white/5 border border-transparent focus:border-blue-500 focus:bg-transparent outline-none text-sm transition-colors"
-        />
-
-        {/* Send code button */}
-        <button
-          onClick={handleSendCode}
-          disabled={countdown > 0 || loading}
-          className={cn(
-            'mt-3 w-full h-11 rounded-xl text-sm font-medium transition-colors',
-            countdown > 0
-              ? 'bg-black/5 dark:bg-white/5 text-muted cursor-default'
-              : 'bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50'
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-lg font-semibold">
+              {step === 'phone' ? '手机号登录' : '输入验证码'}
+            </h2>
+            <button
+              onClick={onClose}
+              className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          {step === 'phone' && (
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-zinc-600 dark:text-zinc-400 mb-1.5">
+                  手机号码
+                </label>
+                <input
+                  ref={inputRef}
+                  type="tel"
+                  maxLength={11}
+                  value={phone}
+                  onChange={(e) => { setPhone(e.target.value); setError(''); }}
+                  onKeyDown={handleKeyDown}
+                  placeholder="请输入11位手机号码"
+                  className="w-full h-11 px-4 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+                />
+              </div>
+              {error && <p className="text-sm text-red-500">{error}</p>}
+              <button
+                disabled={sending || phone.length !== 11}
+                onClick={handleSendCode}
+                className={cn(
+                  'w-full h-11 rounded-xl text-sm font-medium transition-all',
+                  'bg-blue-600 text-white hover:bg-blue-700',
+                  'disabled:opacity-40 disabled:cursor-not-allowed'
+                )}
+              >
+                {sending ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" /> 发送中...
+                  </span>
+                ) : (
+                  '获取验证码'
+                )}
+              </button>
+              <p className="text-xs text-zinc-400 text-center">
+                未注册的手机号验证后将自动创建账号
+              </p>
+            </div>
           )}
-        >
-          {loading ? '发送中...' : countdown > 0 ? `${countdown}秒后可重发` : '发送验证码'}
-        </button>
-
-        {/* Code input */}
-        <label className="block text-sm font-medium text-muted mt-4 mb-1.5">
-          验证码
-        </label>
-        <input
-          type="text"
-          inputMode="numeric"
-          maxLength={6}
-          value={code}
-          onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
-          onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-          placeholder="请输入6位验证码"
-          className="w-full h-11 px-4 rounded-xl bg-black/5 dark:bg-white/5 border border-transparent focus:border-blue-500 focus:bg-transparent outline-none text-sm tracking-[0.25em] text-center transition-colors"
-        />
-
-        {/* Submit */}
-        <button
-          onClick={handleSubmit}
-          disabled={loading || code.length !== 6}
-          className="mt-4 w-full h-11 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
-        >
-          {loading ? '验证中...' : '登录'}
-        </button>
-
-        {/* Error */}
-        {error && (
-          <p className="mt-3 text-sm text-red-500 text-center">{error}</p>
-        )}
+          {step === 'code' && (
+            <div className="space-y-4">
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">
+                验证码已发送至{' '}
+                <span className="font-medium text-zinc-800 dark:text-zinc-200">{phone}</span>
+              </p>
+              <div>
+                <label className="block text-sm font-medium text-zinc-600 dark:text-zinc-400 mb-1.5">
+                  验证码
+                </label>
+                <input
+                  ref={inputRef}
+                  type="text"
+                  maxLength={6}
+                  value={code}
+                  onChange={(e) => { setCode(e.target.value.replace(/\D/g, '')); setError(''); }}
+                  onKeyDown={handleKeyDown}
+                  placeholder="请输入6位验证码"
+                  className="w-full h-11 px-4 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm tracking-[0.3em] text-center outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+                />
+              </div>
+              {error && <p className="text-sm text-red-500">{error}</p>}
+              <button
+                disabled={verifying || code.length !== 6}
+                onClick={handleVerify}
+                className={cn(
+                  'w-full h-11 rounded-xl text-sm font-medium transition-all',
+                  'bg-blue-600 text-white hover:bg-blue-700',
+                  'disabled:opacity-40 disabled:cursor-not-allowed'
+                )}
+              >
+                {verifying ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" /> 验证中...
+                  </span>
+                ) : (
+                  '登录'
+                )}
+              </button>
+              <div className="flex items-center justify-between text-sm">
+                <button
+                  onClick={() => setStep('phone')}
+                  className="text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors"
+                >
+                  更换手机号
+                </button>
+                <button
+                  disabled={countdown > 0}
+                  onClick={handleSendCode}
+                  className={cn(
+                    'text-blue-600 hover:text-blue-700 transition-colors',
+                    'disabled:text-zinc-400 disabled:cursor-not-allowed'
+                  )}
+                >
+                  {countdown > 0 ? `${countdown}s 后重发` : '重新发送'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
-    </div>
-  )
+    </>
+  );
 }

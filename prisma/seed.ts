@@ -1,29 +1,29 @@
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient } from '@prisma/client';
 
-const prisma = new PrismaClient()
+const prisma = new PrismaClient();
 
 async function main() {
-  const adminPhone = process.env.ADMIN_PHONE
+  const adminPhone = process.env.ADMIN_PHONE;
   if (!adminPhone) {
-    console.warn('ADMIN_PHONE not set, skipping admin seed')
-    return
+    console.log('No ADMIN_PHONE set, skipping admin seed.');
+    return;
   }
 
-  const admin = await prisma.user.upsert({
-    where: { phone: adminPhone },
-    update: { role: 'ADMIN' },
-    create: {
-      phone: adminPhone,
-      role: 'ADMIN',
-    },
-  })
+  const existing = await prisma.user.findUnique({ where: { phone: adminPhone } });
+  if (existing) {
+    console.log(`Admin user ${adminPhone} already exists (role: ${existing.role}).`);
+    return;
+  }
 
-  console.log(`Admin user seeded: ${admin.phone} (${admin.id})`)
+  await prisma.user.create({
+    data: { phone: adminPhone, role: 'ADMIN' },
+  });
+  console.log(`Admin user created: ${adminPhone}`);
 }
 
 main()
   .catch((e) => {
-    console.error(e)
-    process.exit(1)
+    console.error(e);
+    process.exit(1);
   })
-  .finally(() => prisma.$disconnect())
+  .finally(() => prisma.$disconnect());

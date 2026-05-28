@@ -10,9 +10,14 @@ datasource db {
 model User {
   id        String   @id @default(cuid())
   phone     String   @unique
-  role      String   @default("READER")
+  role      Role     @default(READER)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+enum Role {
+  READER
+  ADMIN
 }
 
 model SmsCode {

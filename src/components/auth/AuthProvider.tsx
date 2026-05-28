@@ -1,72 +1,77 @@
-'use client'
+'use client';
 
-import { createContext, useContext, useState, useEffect, useCallback } from 'react'
-import type { SessionData } from '@/types/auth'
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 
-interface AuthContextType {
-  user: SessionData | null
-  isLoading: boolean
-  login: (phone: string, code: string) => Promise<{ success: boolean; redirectTo?: string; error?: string }>
-  logout: () => Promise<void>
-  sendCode: (phone: string) => Promise<{ success: boolean; error?: string }>
+interface User {
+  phone: string;
+  role: string;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined)
+interface AuthContextValue {
+  user: User | null;
+  loading: boolean;
+  login: (phone: string, code: string) => Promise<{ success: boolean; message: string; redirectTo?: string }>;
+  logout: () => Promise<void>;
+  sendCode: (phone: string) => Promise<{ success: boolean; message: string }>;
+  refresh: () => Promise<void>;
+}
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<SessionData | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used within AuthProvider');
+  return ctx;
+}
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch('/api/auth/me');
+      const data = await res.json();
+      setUser(data.loggedIn ? data.user : null);
+    } catch {
+      setUser(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    fetch('/api/auth/me')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.success) setUser(data.data)
-      })
-      .catch(() => {})
-      .finally(() => setIsLoading(false))
-  }, [])
+    refresh();
+  }, [refresh]);
 
-  const sendCode = useCallback(async (phone: string) => {
+  const sendCode = async (phone: string) => {
     const res = await fetch('/api/auth/send-code', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phone }),
-    })
-    return res.json()
-  }, [])
+    });
+    return res.json();
+  };
 
-  const login = useCallback(async (phone: string, code: string) => {
+  const login = async (phone: string, code: string) => {
     const res = await fetch('/api/auth/verify-code', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phone, code }),
-    })
-    const data = await res.json()
-    if (data.success) {
-      setUser({
-        userId: data.data.userId,
-        phone: data.data.phone,
-        role: data.data.role,
-      })
-    }
-    return data
-  }, [])
+    });
+    const data = await res.json();
+    if (data.success) await refresh();
+    return data;
+  };
 
-  const logout = useCallback(async () => {
-    await fetch('/api/auth/logout', { method: 'POST' })
-    setUser(null)
-  }, [])
+  const logout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    setUser(null);
+  };
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, login, logout, sendCode }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, sendCode, refresh }}>
       {children}
     </AuthContext.Provider>
-  )
-}
-
-export function useAuth() {
-  const context = useContext(AuthContext)
-  if (!context) throw new Error('useAuth must be used within AuthProvider')
-  return context
+  );
 }

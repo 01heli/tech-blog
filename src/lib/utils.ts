@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import GithubSlugger from 'github-slugger';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -22,13 +23,6 @@ export function calculateReadingTime(content: string): number {
   return Math.max(1, Math.ceil(totalWords / wordsPerMinute));
 }
 
-export function slugify(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/\s+/g, '-')
-    .replace(/[^\w-]+/g, '');
-}
-
 export function normalizeCategorySlug(category: string): string {
   return category.toLowerCase().replace(/\s+/g, '-');
 }
@@ -36,13 +30,14 @@ export function normalizeCategorySlug(category: string): string {
 export function extractHeadings(content: string) {
   const headingRegex = /^(#{2,3})\s+(.+)$/gm;
   const headings: { level: number; text: string; id: string }[] = [];
+  const slugger = new GithubSlugger();
   let match;
   while ((match = headingRegex.exec(content)) !== null) {
     const text = match[2].trim();
     headings.push({
       level: match[1].length,
       text,
-      id: slugify(text),
+      id: slugger.slug(text),
     });
   }
   return headings;

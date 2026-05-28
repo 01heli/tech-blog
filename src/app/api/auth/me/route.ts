@@ -1,10 +1,16 @@
-import { NextResponse } from 'next/server'
-import { getCurrentUser } from '@/lib/auth/session'
+import { NextResponse } from 'next/server';
+import { getSession } from '@/lib/auth/session';
+import type { MeResponse } from '@/types/auth';
 
 export async function GET() {
-  const user = await getCurrentUser()
-  if (!user) {
-    return NextResponse.json({ success: false, error: '未登录' }, { status: 401 })
+  const session = await getSession();
+
+  if (!session.userId) {
+    return NextResponse.json<MeResponse>({ loggedIn: false });
   }
-  return NextResponse.json({ success: true, data: user })
+
+  return NextResponse.json<MeResponse>({
+    loggedIn: true,
+    user: { phone: session.phone!, role: session.role! },
+  });
 }

@@ -1,24 +1,20 @@
-import { NextResponse } from 'next/server'
-import type { NextRequest } from 'next/server'
-
-const PROTECTED_PATHS = ['/admin']
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 
 export function middleware(request: NextRequest) {
-  const { pathname } = request.nextUrl
-  const isProtected = PROTECTED_PATHS.some((p) => pathname.startsWith(p))
+  const session = request.cookies.get('tech-blog-session');
+  const { pathname } = request.nextUrl;
 
-  if (isProtected) {
-    const sessionCookie = request.cookies.get('tech-blog-session')
-    if (!sessionCookie) {
-      const loginUrl = new URL('/', request.url)
-      loginUrl.searchParams.set('login', 'true')
-      return NextResponse.redirect(loginUrl)
+  // Admin routes: if no session cookie, redirect to home with login modal
+  if (pathname.startsWith('/admin')) {
+    if (!session?.value) {
+      return NextResponse.redirect(new URL('/?login=true', request.url));
     }
   }
 
-  return NextResponse.next()
+  return NextResponse.next();
 }
 
 export const config = {
   matcher: ['/admin/:path*'],
-}
+};

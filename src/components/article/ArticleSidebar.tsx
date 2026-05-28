@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useTableOfContents } from '@/hooks/useTableOfContents';
 import { cn } from '@/lib/utils';
 import type { Heading } from '@/types/post';
@@ -10,12 +11,21 @@ interface ArticleSidebarProps {
 
 export function ArticleSidebar({ headings }: ArticleSidebarProps) {
   const activeId = useTableOfContents(headings);
+  const navRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (!activeId || !navRef.current) return;
+    const link = navRef.current.querySelector<HTMLAnchorElement>(`a[href="#${CSS.escape(activeId)}"]`);
+    if (link) {
+      link.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }, [activeId]);
 
   if (headings.length === 0) return null;
 
   return (
     <aside className="hidden lg:block w-56 flex-shrink-0">
-      <nav className="sticky top-24">
+      <nav ref={navRef} className="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto">
         <h4 className="text-xs font-semibold tracking-widest uppercase text-muted/50 mb-4">
           目录
         </h4>
