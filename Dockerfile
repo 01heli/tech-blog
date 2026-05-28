@@ -5,9 +5,9 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY prisma ./prisma
 RUN npm ci --frozen-lockfile
 
-COPY prisma ./prisma
 COPY . .
 
 RUN npx prisma generate
