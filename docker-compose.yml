@@ -6,6 +6,17 @@ services:
     container_name: tech-blog-app
     expose:
       - "3000"
+    volumes:
+      - blog-data:/app/prisma/data
+    environment:
+      - DATABASE_URL=file:./data/blog.db
+      - SESSION_SECRET=${SESSION_SECRET}
+      - ALIBABA_ACCESS_KEY_ID=${ALIBABA_ACCESS_KEY_ID}
+      - ALIBABA_ACCESS_KEY_SECRET=${ALIBABA_ACCESS_KEY_SECRET}
+      - ALIBABA_SMS_SIGN_NAME=${ALIBABA_SMS_SIGN_NAME}
+      - ALIBABA_SMS_TEMPLATE_CODE=${ALIBABA_SMS_TEMPLATE_CODE}
+      - ADMIN_PHONE=${ADMIN_PHONE}
+      - SMS_MOCK=${SMS_MOCK:-true}
     restart: unless-stopped
     networks:
       - blog-network
@@ -24,6 +35,9 @@ services:
     restart: unless-stopped
     networks:
       - blog-network
+
+volumes:
+  blog-data:
 
 networks:
   blog-network:

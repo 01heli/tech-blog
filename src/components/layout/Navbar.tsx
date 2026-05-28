@@ -2,17 +2,27 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
 import { Search, Menu } from 'lucide-react';
 import { ThemeToggle } from '@/components/shared/ThemeToggle';
 import { MobileNav } from './MobileNav';
+import { UserMenu } from '@/components/auth/UserMenu';
+import { LoginModal } from '@/components/auth/LoginModal';
 import { SITE } from '@/constants/site';
 import { cn } from '@/lib/utils';
 
 export function Navbar() {
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [scrolled, setScrolled] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+
+  useEffect(() => {
+    if (searchParams.get('login') === 'true') {
+      setLoginOpen(true);
+    }
+  }, [searchParams]);
 
   useEffect(() => {
     function check() {
@@ -73,6 +83,7 @@ export function Navbar() {
               <Search className="w-4 h-4" />
             </Link>
             <ThemeToggle />
+            <UserMenu onLoginClick={() => setLoginOpen(true)} />
             <button
               onClick={() => setMobileOpen(true)}
               className="ml-1 md:hidden w-8 h-8 flex items-center justify-center rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
@@ -85,6 +96,7 @@ export function Navbar() {
       </header>
 
       <MobileNav open={mobileOpen} onClose={() => setMobileOpen(false)} />
+      <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
     </>
   );
 }

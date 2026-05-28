@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import { Navbar } from '@/components/layout/Navbar';
 import { Footer } from '@/components/layout/Footer';
 import { ScrollToTop } from '@/components/shared/ScrollToTop';
@@ -15,7 +16,9 @@ export default function BlogLayout({
 
   return (
     <>
-      <Navbar />
+      <Suspense fallback={<div className="h-16" />}>
+        <Navbar />
+      </Suspense>
       <main className="min-h-screen pt-16">{children}</main>
       <Footer />
       <ScrollToTop />
