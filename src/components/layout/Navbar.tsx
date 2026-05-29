@@ -86,10 +86,10 @@ export function Navbar() {
             <UserMenu onLoginClick={() => setLoginOpen(true)} />
             <button
               onClick={() => setMobileOpen(true)}
-              className="ml-1 md:hidden w-8 h-8 flex items-center justify-center rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+              className="ml-1 md:hidden w-11 h-11 flex items-center justify-center rounded-full hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
               aria-label="菜单"
             >
-              <Menu className="w-4 h-4" />
+              <Menu className="w-5 h-5" />
             </button>
           </div>
         </nav>

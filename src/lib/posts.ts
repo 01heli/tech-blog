@@ -75,6 +75,10 @@ export function getAdjacentPosts(slug: string): {
   };
 }
 
+export function getPostsByTag(tag: string): Post[] {
+  return getAllPosts().filter((p) => p.frontmatter.tags?.includes(tag));
+}
+
 export function getAllTags(): Map<string, number> {
   const tagMap = new Map<string, number>();
   getAllPosts().forEach((post) => {

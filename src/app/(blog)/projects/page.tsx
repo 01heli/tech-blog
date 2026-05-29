@@ -22,13 +22,24 @@ const statusStyles: Record<ProjectStatus, string> = {
 
 function ProjectCard({ project, index }: { project: Project; index: number }) {
   const latestDate = project.timeline[0]?.date || project.frontmatter.date;
+  const hasCover = !!project.frontmatter.coverImage;
 
   return (
     <AnimatedSection delay={index * 0.08}>
       <Link
         href={`/projects/${project.slug}`}
-        className="block h-full rounded-xl border border-border bg-card p-6 hover:shadow-lg hover:border-primary/50 transition-all duration-300"
+        className="block h-full rounded-xl border border-border bg-card overflow-hidden hover:shadow-lg hover:border-primary/50 transition-all duration-300"
       >
+        {hasCover && (
+          <div className="aspect-video overflow-hidden">
+            <img
+              src={project.frontmatter.coverImage}
+              alt={project.frontmatter.title}
+              className="w-full h-full object-cover"
+            />
+          </div>
+        )}
+        <div className="p-6">
         <div className="flex items-start justify-between mb-3">
           <h2 className="text-lg font-semibold leading-tight">
             {project.frontmatter.title}
@@ -62,6 +73,7 @@ function ProjectCard({ project, index }: { project: Project; index: number }) {
           <span className="text-primary">
             {project.timeline.length} 条记录 →
           </span>
+        </div>
         </div>
       </Link>
     </AnimatedSection>

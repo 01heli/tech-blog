@@ -1,4 +1,5 @@
 import { HeroSection } from '@/components/home/HeroSection';
+import { SiteStats } from '@/components/home/SiteStats';
 import { CategoryQuickLinks } from '@/components/home/CategoryQuickLinks';
 import { FeaturedArticle } from '@/components/home/FeaturedArticle';
 import { ArticleGrid } from '@/components/home/ArticleGrid';
@@ -18,7 +19,11 @@ export default function Home() {
       <section className="section-padding">
         <Container>
           <AnimatedSection>
-            <div className="mb-12">
+            <SiteStats />
+          </AnimatedSection>
+
+          <AnimatedSection>
+            <div className="mb-12 mt-16">
               <p className="text-xs font-medium tracking-widest uppercase text-muted/60 mb-3">
                 探索分类
               </p>
