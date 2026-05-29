@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 鹤唳 · Tech Blog
 
-## Getting Started
+个人技术博客，基于 Next.js 14 App Router 构建，MDX 驱动内容管理。
 
-First, run the development server:
+## 技术栈
+
+- **框架**: Next.js 14 (App Router)
+- **内容**: MDX + gray-matter + next-mdx-remote
+- **样式**: Tailwind CSS + Framer Motion
+- **认证**: 短信验证码登录
+- **数据库**: SQLite (Prisma ORM)
+- **部署**: Docker
+
+## 功能
+
+- MDX 文章 & 项目时间线
+- 标签系统 & 分类过滤
+- 全文搜索
+- 管理后台 (在线编辑 MDX)
+- 站点地图 & RSS
+- 友链页面
+- 深色模式
+
+## 本地开发
 
 ```bash
+npm install
+cp .env.example .env    # 编辑 .env 填写配置
+npx prisma db push
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+打开 http://localhost:3000 查看。
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Docker 部署
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+docker build -t tech-blog .
+docker run -p 3000:3000 --env-file .env tech-blog
+```
 
-## Learn More
+## 目录结构
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+content/          # MDX 文章和项目
+src/
+  app/            # Next.js App Router 页面
+  components/     # UI 组件
+  constants/      # 站点配置、友链
+  lib/            # 数据读取、工具函数
+  types/          # TypeScript 类型
+prisma/           # 数据库 Schema
+```
