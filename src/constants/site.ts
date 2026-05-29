@@ -18,6 +18,7 @@ export const SITE = {
   navLinks: [
     { label: '文章', href: '/articles' },
     { label: '分类', href: '/categories' },
+    { label: '项目', href: '/projects' },
     { label: '关于', href: '/about' },
     { label: '搜索', href: '/search' },
   ],

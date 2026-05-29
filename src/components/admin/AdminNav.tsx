@@ -19,6 +19,8 @@ export function AdminNav() {
   const links = [
     { href: '/admin', label: '文章管理', icon: FileText },
     { href: '/admin/articles/new', label: '新建文章', icon: Plus },
+    { href: '/admin/projects', label: '项目管理', icon: FileText },
+    { href: '/admin/projects/new', label: '新建项目', icon: Plus },
   ]
 
   return (

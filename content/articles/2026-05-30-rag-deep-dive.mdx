@@ -1,0 +1,993 @@
+---
+title: RAG 检索增强生成深度解析：从朴素管道到 Agentic 智能体的完整演进
+description: 深度剖析 RAG 的四大演进阶段、chunking 策略源码实现、HyDE/Self-RAG/CRAG 进阶技术、Ragas 评估体系，以及从原型到生产的全链路最佳实践。
+date: '2026-05-30'
+category: AI
+tags:
+  - RAG
+  - 检索增强生成
+  - LLM
+  - 向量数据库
+  - embedding
+  - chunking
+  - reranking
+  - Agentic RAG
+featured: true
+---
+## 从一个"看似聪明实则胡说"的 AI 开始
+
+2023 年初，某公司上线了一个 AI 客服机器人。老板兴冲冲地演示："我们公司去年营收多少？" 机器人自信满满地输出了一个数字——精确到小数点后两位。问题是，这个数字**完全是编的**。
+
+这不是个例。大语言模型有两个致命缺陷：
+
+1. **知识截止日期**：训练数据停在某个时间点，不知道之后发生的事
+2. **幻觉（Hallucination）**：对于不知道的事，它会编造一个听起来合理的答案，而且编得极其自信
+
+RAG（Retrieval-Augmented Generation，检索增强生成）就是解决这两个问题的核心方案。它的思想简单到一句话就能说完：**先查资料，再回答问题**。但把它做好、做精、做到生产级，涉及的技术深度远超大多数人的想象。
+
+先看一个最小化的 RAG 代码：
+
+```python
+# 最简 RAG：不到 30 行代码
+import numpy as np
+from openai import OpenAI
+
+client = OpenAI()
+documents = ["RAG 由 Meta AI 在 2020 年提出。",
+             "RAG 结合了检索系统和生成模型。",
+             "检索器通常使用稠密向量搜索。"]
+
+# 索引：计算文档向量（实际中会用 embedding 模型）
+doc_embeddings = [client.embeddings.create(
+    model="text-embedding-3-small", input=doc
+).data[0].embedding for doc in documents]
+
+def rag(query: str) -> str:
+    # 检索：找最相关的文档
+    query_emb = client.embeddings.create(
+        model="text-embedding-3-small", input=query
+    ).data[0].embedding
+    
+    similarities = [np.dot(query_emb, doc_emb) for doc_emb in doc_embeddings]
+    best_idx = np.argmax(similarities)
+    context = documents[best_idx]
+    
+    # 生成：基于检索结果回答
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": f"基于以下上下文回答问题：{context}"},
+            {"role": "user", "content": query}
+        ]
+    )
+    return response.choices[0].message.content
+
+print(rag("谁提出了 RAG？"))
+# 输出：RAG 由 Meta AI 在 2020 年提出。
+```
+
+这 30 行代码就是 RAG 的全部核心思想。但当你把它部署到生产环境，处理百万级文档、面对千奇百怪的提问时，每一个环节都会暴露出问题。本文将从源码层面，把 RAG 的每个关键环节彻底讲清楚。
+
+## RAG 核心架构：三阶段管道
+
+RAG 的标准流程可以分为三个核心阶段：
+
+```
+                    离线阶段（索引构建）
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│  原始文档  │ → │  文本分块  │ → │  向量嵌入  │ → │  向量存储  │
+│  (PDF/    │    │ (Chunking) │    │(Embedding)│    │ (Vector DB)│
+│   Markdown│    │            │    │           │    │           │
+│   /HTML)  │    │            │    │           │    │           │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+
+                    在线阶段（查询响应）
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│  用户问题  │ → │  问题向量化 │ → │  相似度检索 │ → │  LLM 生成 │
+│          │    │           │    │  (Top-K)   │    │  (Grounded)│
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+                                     │
+                               ┌──────────┐
+                               │   重排序   │ ← 可选
+                               │ (Reranker)│
+                               └──────────┘
+```
+
+在深入每个环节之前，需要先建立一个关键认知：**RAG 的质量取决于最薄弱的环节**。花大价钱优化 LLM 提示词，但如果分块策略把一句话从中间切断，检索到的上下文就会毫无意义。
+
+## 第一环节：文档加载与解析
+
+文档来源五花八门——PDF、Markdown、HTML、Word、Notion 页面。解析质量直接影响后续所有环节。
+
+### PDF 解析的三种路线
+
+```python
+# 路线一：PyPDFLoader — 简单文本提取
+from langchain.document_loaders import PyPDFLoader
+
+loader = PyPDFLoader("report.pdf")
+documents = loader.load()
+# 问题：无法处理表格、图片、复杂排版
+
+# 路线二：Unstructured — 智能版面分析
+from langchain.document_loaders import UnstructuredPDFLoader
+
+loader = UnstructuredPDFLoader(
+    "report.pdf",
+    strategy="hi_res",  # 高精度模式，调用 OCR
+    extract_images_in_pdf=True,
+)
+documents = loader.load()
+# 优势：保留表格结构、识别标题层级
+
+# 路线三：LlamaParse — LLM 驱动的语义解析
+from llama_parse import LlamaParse
+
+parser = LlamaParse(result_type="markdown")
+documents = parser.load_data("report.pdf")
+# 优势：LLM 理解文档语义，处理复杂排版最准确
+```
+
+**选型建议**：纯文本文档用 `PyPDFLoader`，含表格的正式文档用 `Unstructured`，法律合同/学术论文等复杂排版用 `LlamaParse`。解析阶段多花 1 分功夫，检索阶段少走 10 分弯路。
+
+## 第二环节：分块策略（Chunking）——最被低估的环节
+
+分块是 RAG 流水线中最不起眼但影响最深远的一步。一个糟糕的分块策略可以让后续所有优化的努力付诸东流。
+
+### 基础分块：固定大小切分
+
+```python
+def fixed_size_chunk(text: str, chunk_size: int = 256, overlap: int = 50) -> list[str]:
+    """最简单的固定大小分块"""
+    words = text.split()
+    chunks = []
+    step = chunk_size - overlap  # 步长 = 块大小 - 重叠量
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk)
+    return chunks
+```
+
+这段代码的问题很明显：
+- "合同第 3.2 条约定......第 3.3 条" 可能被切断在"第 3." 和 "2 条约定"之间
+- 段落语义被破坏，嵌入向量无法准确表示完整语义
+
+### 递归分块：尊重文档自然边界
+
+```python
+def recursive_chunk(text: str, max_size: int = 1000) -> list[str]:
+    """递归分块：优先按段落切，再按句子切，最后按词切"""
+    if len(text) <= max_size:
+        return [text.strip()] if text.strip() else []
+
+    separators = ["\n\n", "\n", "。", ". ", " "]
+    for sep in separators:
+        if sep in text:
+            parts = text.split(sep)
+            chunks = []
+            current = ""
+            for part in parts:
+                candidate = current + sep + part if current else part
+                if len(candidate) <= max_size:
+                    current = candidate
+                else:
+                    if current:
+                        chunks.append(current.strip())
+                    # 如果单个段落就超过 max_size，递归处理
+                    chunks.extend(
+                        recursive_chunk(part, max_size) if len(part) > max_size else [part.strip()]
+                    )
+                    current = ""
+            if current:
+                chunks.append(current.strip())
+            return [c for c in chunks if c]
+
+    # 最终兜底：硬切
+    return [text[i:i + max_size] for i in range(0, len(text), max_size)]
+
+
+text = """## 第一章 概述
+
+这是一段介绍性文字，包含了项目的基本信息和背景知识。
+
+### 1.1 技术选型
+
+我们选择了 Python 作为主要开发语言，使用 FastAPI 框架构建 RESTful API。"""
+
+chunks = recursive_chunk(text, max_size=200)
+for i, chunk in enumerate(chunks):
+    print(f"--- Chunk {i} ({len(chunk)} 字符) ---")
+    print(chunk)
+    print()
+```
+
+输出：
+
+```
+--- Chunk 0 (34 字符) ---
+## 第一章 概述
+
+--- Chunk 1 (31 字符) ---
+这是一段介绍性文字，包含了项目的基本信息和背景知识。
+
+--- Chunk 2 (77 字符) ---
+### 1.1 技术选型
+
+我们选择了 Python 作为主要开发语言，使用 FastAPI 框架构建 RESTful API。
+```
+
+递归分块通过逐级降级的分离器策略，尽可能保持文档的语义完整性。这是目前生产环境中使用最广泛的分块方式。
+
+### 语义分块：让 Embedding 模型来切分
+
+更进阶的做法是利用 embedding 模型本身判断句子间的语义边界：
+
+```python
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_openai import OpenAIEmbeddings
+
+# 基于百分位阈值：当相邻句子的余弦相似度低于第 95 百分位时切分
+semantic_splitter = SemanticChunker(
+    embeddings=OpenAIEmbeddings(),
+    breakpoint_threshold_type="percentile",
+    breakpoint_threshold_amount=95,
+)
+
+# 文档会被切分在语义转折点，而不是生硬的字符数边界
+chunks = semantic_splitter.create_documents([long_document])
+```
+
+语义分块的核心逻辑：
+
+```
+文本: 句子1 → 句子2 → 句子3 → 句子4 → 句子5 → 句子6
+       ↓        ↓        ↓        ↓        ↓        ↓
+向量:  v1       v2       v3       v4       v5       v6
+       ↓        ↓        ↓        ↓        ↓        ↓
+相似度:  sim(v1,v2)  sim(v2,v3)  sim(v3,v4)  sim(v4,v5)  sim(v5,v6)
+         0.92         0.88         0.45 ← 切分点  0.91         0.87
+                                        ↑
+                                  语义在这里发生了显著变化
+```
+
+### 2025-2026 前沿分块技术
+
+| 技术 | 原理 | 适用场景 | 效果 |
+|------|------|---------|------|
+| **Late Chunking** | 先对全文做 embedding，再在池化前切分。每个 chunk 的向量"见过"完整上下文 | 需要长距离语义关联的文档 | 显著优于先切后嵌入 |
+| **Contextual Retrieval** | 索引时为每个 chunk 附加 LLM 生成的文档上下文摘要。Anthropic 报告检索失败率降低 49% | 大型结构化文档 | 低中成本，高收益 |
+| **Proposition Chunking** | 将文本拆解为原子事实命题（"X 是 Y"），逐命题嵌入 | 高精度事实检索 | 精度极高，但索引成本高 |
+| **Query-Adaptive Semantic Chunking** | 根据用户查询动态调整切分策略，2026 年 4 月最新方法 | 多变的查询场景 | F1 达 0.85，提升 18-27% |
+| **RAPTOR** | 递归分块 + LLM 逐层摘要 = 摘要树。查询时匹配不同抽象层级 | 需要"宏观理解"的查询 | 高成本，适合高价值场景 |
+
+### 分块策略速查表
+
+```
+你要处理的文档类型是？
+        │
+   ┌────┼────────┬──────────┐
+   ▼    ▼        ▼          ▼
+ 纯文本  结构化   学术论文    代码
+ (文章) (Markdown (PDF)    (repo)
+        /HTML)
+   │    │        │          │
+   ▼    ▼        ▼          ▼
+ 递归  Markdown  LlamaParse  AST
+ 分块  分块器    语义分块    分块
+        │
+        ├─ 别忘了 chunk_overlap（推荐 chunk_size 的 10-20%）
+        ├─ 优先用 token 而非字符数做 chunk_size（LLM 的计价单位是 token）
+        └─ 不同文档类型可以混合使用不同的分块策略
+```
+
+## 第三环节：向量嵌入（Embedding）——让机器"理解"语义
+
+分块之后，需要将每个文本块转换为一个高维向量。这个过程叫做向量嵌入（embedding），本质上是将文本的语义信息压缩到一个固定的向量空间。
+
+### Embedding 模型的选型
+
+```python
+# OpenAI (API)
+from openai import OpenAI
+client = OpenAI()
+resp = client.embeddings.create(
+    model="text-embedding-3-small",  # 性价比之选
+    # model="text-embedding-3-large",  # 最高精度，维度更高
+    input=["RAG 是检索增强生成的缩写。", "今天天气很好。"],
+    dimensions=512,  # 可指定输出维度（仅 text-embedding-3 系列支持）
+)
+embeddings = [d.embedding for d in resp.data]
+
+# 开源自部署（HuggingFace）
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("BAAI/bge-large-zh-v1.5")  # BGE 中文模型
+embeddings = model.encode(["RAG 是检索增强生成的缩写。", "今天天气很好。"])
+# 输出: numpy array, shape=(2, 1024)
+
+# Cohere (API，针对多语言优化)
+import cohere
+co = cohere.Client("your-api-key")
+resp = co.embed(
+    texts=["RAG 是检索增强生成的缩写。"],
+    model="embed-multilingual-v3.0",
+    input_type="search_document",  # 区分文档和查询！
+)
+```
+
+### 一个关键陷阱：搜索文档 vs 搜索查询
+
+Cohere 和 Voyage 等新一代 embedding 模型支持区分 `input_type`：
+
+```python
+# 索引阶段：将文本作为"文档"嵌入
+doc_emb = co.embed(texts=chunks, model="embed-multilingual-v3.0",
+                    input_type="search_document")
+
+# 查询阶段：将问题作为"查询"嵌入（不同的向量空间！）
+query_emb = co.embed(texts=[query], model="embed-multilingual-v3.0",
+                      input_type="search_query")
+```
+
+**为什么这很重要？** 用户的提问语句（"怎么配置 Nginx 反向代理？"）和文档中的陈述句（"Nginx 反向代理通过在 server 块中配置 proxy_pass 指令实现"）在语言结构上完全不同。如果使用同一个向量空间，相似度会系统性偏低。现代 embedding 模型通过区分输入类型，在内部使用不同的编码策略来弥合这个差距。
+
+### Embedding 模型选型速查表
+
+| 模型 | 维度 | 中文支持 | 部署方式 | 适用场景 |
+|------|------|:---:|------|------|
+| OpenAI text-embedding-3-small | 512/1536 | 尚可 | API | 通用英文/多语言 |
+| OpenAI text-embedding-3-large | 256/3072 | 好 | API | 高精度需求 |
+| BAAI/bge-large-zh-v1.5 | 1024 | 优秀 | 本地 | 中文优先场景 |
+| Cohere embed-multilingual-v3.0 | 1024 | 好 | API | 多语言混合、区分 query/doc |
+| Voyage-2 | 1024 | 好 | API | 长文档检索 |
+| jina-embeddings-v3 | 1024 | 好 | API | 支持 Late Chunking |
+| BAAI/bge-m3 | 1024 | 优秀 | 本地 | 多语言、支持稀疏+稠密混合 |
+
+## 第四环节：向量存储与检索
+
+### 向量数据库的核心：ANN 近似最近邻
+
+在海量向量中精确找 Top-K 最近邻（暴力扫描）的复杂度是 O(N·D)，在百万级文档时不可接受。所有向量数据库都使用**近似最近邻（ANN）**算法。
+
+**HNSW（Hierarchical Navigable Small World）** 是目前最主流的 ANN 算法，理解它有助于理解检索性能瓶颈：
+
+```
+HNSW 数据结构（多层跳表式图结构）
+
+Layer 2 (最顶层，稀疏):   ○──────────────────○
+                          │                  │
+Layer 1 (中间层):         ○────────○─────────○────────○
+                          │        │         │        │
+Layer 0 (底层，稠密):     ○─○─○─○─○─○─○─○─○─○─○─○─○─○─○
+
+搜索过程：
+1. 从顶层随机入口点开始
+2. 贪心搜索：不断移动到离查询更近的邻居
+3. 到达局部最优后，下降到下一层
+4. 在底层做精细搜索，返回 Top-K
+```
+
+HNSW 的搜索复杂度是 O(log N)，代价是构建索引时内存开销较大（需要存储多层图结构）。
+
+### 向量数据库选型
+
+```python
+# ===== FAISS：Meta 出品，纯本地、高速度 =====
+import faiss
+import numpy as np
+
+dimension = 1024
+index = faiss.IndexHNSWFlat(dimension, 32)  # 32 个邻居连接
+index.add(embeddings)  # embeddings shape: (N, 1024)
+
+D, I = index.search(query_embedding.reshape(1, -1), k=5)
+# D: 距离, I: 索引
+
+# ===== Chroma：零配置本地运行，适合原型 =====
+import chromadb
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.create_collection(name="docs")
+collection.add(
+    documents=chunks,
+    embeddings=embeddings.tolist(),
+    ids=[f"doc_{i}" for i in range(len(chunks))]
+)
+results = collection.query(query_embeddings=[query_emb], n_results=5)
+
+# ===== pgvector：已有 PostgreSQL 的团队首选 =====
+# CREATE EXTENSION vector;
+# CREATE TABLE documents (id SERIAL, content TEXT, embedding vector(1024));
+# CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
+# SELECT * FROM documents ORDER BY embedding <=> query_vec LIMIT 5;
+```
+
+| 数据库 | 定位 | 推荐场景 |
+|--------|------|---------|
+| FAISS | 内存型向量索引库 | 离线实验、百万级以内 |
+| Chroma | 轻量数据库 | 原型验证、个人项目 |
+| Qdrant | 生产级向量数据库 | 高性能、丰富过滤、K8s 原生 |
+| Milvus | 分布式向量数据库 | 十亿级向量规模 |
+| pgvector | PostgreSQL 扩展 | 已有 PG 的团队，减少基础设施 |
+| Weaviate | 全功能向量数据库 | 内置 Reranker、Generative Search |
+
+### Hybrid Search：稠密 + 稀疏 = 全覆盖
+
+纯向量检索有一个短板——它对精确术语匹配不敏感。搜"AK-47 的发明者"可能返回描述枪械制造史的文章，但搜"零件编号 XJ-8821"时，向量检索可能完全找不到，而传统的 BM25 关键词匹配一击即中。
+
+生产级 RAG 的标准做法是 Hybrid Search：
+
+```python
+# 使用 BM25 做稀疏检索 + 向量做稠密检索，RRF 融合
+from rank_bm25 import BM25Okapi
+
+def hybrid_search(query: str, chunks: list[str], 
+                  dense_index, embedding_model, k: int = 10):
+    """混合检索：稠密向量 + 稀疏 BM25，使用 RRF 融合"""
+    
+    # 1. 稠密检索（语义匹配）
+    query_emb = embedding_model.encode([query])
+    dense_scores, dense_indices = dense_index.search(query_emb, k=k * 2)
+    
+    # 2. 稀疏检索（关键词匹配）
+    tokenized_chunks = [chunk.split() for chunk in chunks]
+    bm25 = BM25Okapi(tokenized_chunks)
+    sparse_scores = bm25.get_scores(query.split())
+    sparse_top_k = np.argsort(sparse_scores)[-k*2:][::-1]
+    
+    # 3. RRF (Reciprocal Rank Fusion) 融合
+    def rrf_score(rank, c=60):
+        return 1.0 / (c + rank)
+    
+    fused = {}
+    for rank, idx in enumerate(dense_indices[0]):
+        fused[idx] = fused.get(idx, 0) + rrf_score(rank)
+    for rank, idx in enumerate(sparse_top_k):
+        fused[idx] = fused.get(idx, 0) + rrf_score(rank)
+    
+    sorted_indices = sorted(fused.keys(), key=lambda x: fused[x], reverse=True)
+    return [chunks[i] for i in sorted_indices[:k]]
+```
+
+RRF（Reciprocal Rank Fusion）是目前工业界最主流的融合算法。它的优势在于**不需要归一化分数**——稠密检索的余弦相似度和 BM25 的 TF-IDF 得分尺度完全不同，直接加权平均需要校准。RRF 只关注排名，天然绕过了这个问题。
+
+## 第五环节：重排序（Reranking）——检索精度的最后一道关口
+
+向量检索召回 Top-20，然后用一个更强的模型精选 Top-3。这就是**两阶段检索**策略。
+
+**为什么需要 Reranker？** 向量模型（Bi-Encoder）在编码阶段把 query 和 document 分别编码，计算相似度时没有交互。Reranker（Cross-Encoder）把 query 和 document 拼在一起编码，能捕捉更细微的相关性信号——代价是速度慢 100 倍以上，所以只能在小候选集上使用。
+
+```python
+from sentence_transformers import CrossEncoder
+
+# 加载 Reranker 模型
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+
+def retrieve_with_rerank(query: str, chunks: list[str],
+                         retriever, reranker, top_k: int = 20, final_k: int = 3):
+    """两阶段检索：粗筛 Top-K → Reranker 精排"""
+    
+    # 第一阶段：快速向量检索（粗排）
+    candidates = retriever.get_relevant_documents(query, k=top_k)
+    
+    # 第二阶段：Cross-Encoder 精排
+    pairs = [[query, doc.page_content] for doc in candidates]
+    scores = reranker.predict(pairs)  # 对每对 (query, doc) 打分
+    
+    # 按得分排序，取 Top-N
+    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    return [doc for doc, score in ranked[:final_k]]
+```
+
+加上 Reranker 后的完整检索流水线：
+
+```
+用户查询
+    │
+    ▼
+[Query 增强：HyDE / 查询扩展]  ← 可选
+    │
+    ▼
+[混合检索：Dense Vector + BM25]  → 候选集 40 条
+    │
+    ▼
+[RRF 融合]  → 候选集 20 条
+    │
+    ▼
+[Cross-Encoder Rerank]  → 精选 3 条
+    │
+    ▼
+[上下文拼接] → LLM 生成
+```
+
+实测数据（来自 Policy Document QA 基准）：
+
+| 配置 | Faithfulness 分数 |
+|------|:---:|
+| 纯 LLM（无检索） | 0.347 |
+| 基础 RAG（向量检索 Top-3） | 0.621 |
+| 高级 RAG（Hybrid + Rerank） | **0.797** |
+
+Reranker 带来的提升是 RAG 流水线中单步收益最大的优化之一。
+
+## 第六环节：Prompt 构建与生成
+
+检索到的上下文最终要通过 Prompt 注入 LLM：
+
+```python
+def build_rag_prompt(query: str, contexts: list[str]) -> str:
+    """构建 RAG 的 Prompt —— 看似简单，细节决定效果"""
+    context_text = "\n\n---\n\n".join(
+        f"[来源 {i+1}] {ctx}" for i, ctx in enumerate(contexts)
+    )
+    
+    prompt = f"""请基于以下参考文档回答问题。如果文档中没有相关信息，请明确说"根据已有资料无法回答"。
+
+## 参考文档
+{context_text}
+
+## 问题
+{query}
+
+## 回答
+"""
+    return prompt
+```
+
+几个 Prompt 工程的关键技巧：
+
+1. **明确指示"不知道"**：让模型在缺乏信息时不再编造，这是 RAG 防幻觉的第一道防线
+2. **标注来源**：给每段上下文编号或标注来源，让模型在回答中能引用具体出处，便于追溯验证
+3. **上下文顺序很重要**：LLM 对 prompt 开头和结尾的内容最关注（"Lost in the Middle"现象），把最相关的放在头部
+4. **指令分离**：用 `##` 和 `---` 清晰分隔系统指令、上下文和用户问题
+
+## RAG 的四大演进阶段
+
+理解了基本流水线之后，来看 RAG 从 2020 年到今天经历的四次重大范式升级。
+
+### 阶段一：Naive RAG（2020）
+
+```
+文档 → 分块 → 嵌入 → 向量库 → 检索 → 拼接 → 生成
+```
+
+Meta AI 在 2020 年首次提出 RAG 概念。这是最原始的"检索-生成"线性管道：使用 BM25 或基础 DPR 做检索，把 Top-K 文本拼进 prompt 交给 LLM 生成。
+
+**缺陷**：检索精度低、无法处理复杂问题、容易引入噪声上下文。
+
+### 阶段二：Advanced RAG（2021-2023）
+
+```
+文档 → 分块 → 嵌入 → 向量库
+                         │
+用户问题 → Query 增强 → 混合检索 → Rerank → 上下文压缩 → 生成
+```
+
+在 Naive 基础上引入**预检索优化**（查询重写、HyDE）和**后检索优化**（Reranker、上下文压缩）。混合检索（Dense + Sparse）成为生产标准。
+
+### 阶段三：Modular RAG（2024）
+
+```
+┌──────────────────────────────────────────────────┐
+│                    编排层                          │
+│   ┌───┐    ┌───┐    ┌───┐    ┌───┐    ┌───┐     │
+│   │索引│ ←→ │检索│ ←→ │记忆│ ←→ │推理│ ←→ │生成│     │
+│   └───┘    └───┘    └───┘    └───┘    └───┘     │
+│       ↕        ↕        ↕        ↕        ↕       │
+│   ┌──────────────────────────────────────────┐   │
+│   │        工具层（API、数据库、搜索引擎）       │   │
+│   └──────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────┘
+```
+
+每个模块可独立替换、自由组合。支持条件路由、并行检索、迭代循环等编排模式。引入 Memory 模块，支持多轮对话和长期记忆。
+
+### 阶段四：Agentic RAG（2024-2026）
+
+Agentic RAG = Agent + 工具 + RAG。不是固定管线，而是让 LLM 作为**智能体**自主决策每一个环节。
+
+```python
+# Agentic RAG 的核心决策循环
+class AgenticRAG:
+    """Agent 自主决策的 RAG 系统"""
+    
+    def __init__(self, llm, retriever, tools):
+        self.llm = llm
+        self.retriever = retriever
+        self.tools = tools  # 可用工具：向量搜索、web搜索、计算器等
+    
+    def run(self, query: str) -> str:
+        context = []
+        
+        for step in range(MAX_STEPS):
+            # Agent 决定下一步动作
+            action = self.llm.decide(
+                query=query,
+                context=context,
+                tools=self.tools,
+                history=[]  # 已执行的步骤
+            )
+            
+            if action.type == "retrieve":
+                # Agent 决定"需要检索"并自己构造检索查询
+                docs = self.retriever.search(
+                    query=action.rewritten_query,  # Agent 重写了查询
+                    source=action.source  # Agent 选择了检索源
+                )
+                context.append(docs)
+            
+            elif action.type == "reason":
+                # Agent 判断当前信息足够，开始推理
+                break
+            
+            elif action.type == "web_search":
+                # Agent 判断内部知识库不够，需要上网
+                web_results = self.tools["web_search"](action.search_query)
+                context.append(web_results)
+            
+            elif action.type == "answer":
+                # Agent 准备好最终回答
+                return self.llm.generate(query, context)
+        
+        return self.llm.generate(query, context)
+```
+
+Agentic RAG 的本质是**把"何时检索、检索什么、去哪里检索"的控制权交给 LLM**。它不再是盲目地每次查询都固定检索 K 个 chunk，而是按需决策：
+
+```
+IF（是否需要检索？）
+  → No → 直接回答（常识性问题、闲聊）
+  → Yes → WHAT（需要什么信息？）
+           → WHERE（从哪个源获取？内部知识库 / Web / 数据库？）
+           → HOW（单次检索 / 多步迭代检索？）
+           → GENERATE（生成答案 → 是否需要补充检索？）
+```
+
+## 三种进阶 RAG 技术的源码级剖析
+
+### HyDE：用"想象中"的答案来找答案
+
+**核心洞察**：用户的问题是"我怎么配置 Nginx 反向代理？"，而知识库里的文档是"配置 Nginx 反向代理需要在 server 块中使用 proxy_pass 指令...". 问题和文档处在不同的语义空间——问题短而抽象，文档长而具体。直接拿问题向量去搜文档向量，本质上是在跨越一道语义鸿沟。
+
+HyDE 的做法：先让 LLM 编一个"假设性答案"，然后拿这个答案的向量去搜。
+
+```python
+def hyde_retrieve(query: str, llm, embeddings, vector_db, k: int = 10):
+    """HyDE：用 LLM 生成的假设文档替代原始查询做向量检索"""
+    
+    # Step 1: 生成假设文档
+    hyde_prompt = f"""请针对以下问题，写一段可能出现在技术文档中的回答。
+    注意：你不需要给出正确答案，只需要写出"看起来像是正确答案"的文段。
+    你的输出将被用作搜索查询。
+    
+    问题：{query}
+    假设文档："""
+    
+    hypothetical_doc = llm.invoke(hyde_prompt).content
+    
+    # Step 2: 用假设文档（而非原始问题）的向量去检索
+    hyde_embedding = embeddings.embed_query(hypothetical_doc)
+    results = vector_db.search(hyde_embedding, k=k)
+    
+    return results, hypothetical_doc
+
+
+# 示例
+query = "如何解决 Python 多线程性能问题？"
+results, hyde_doc = hyde_retrieve(query, llm, embeddings, vector_db)
+
+print(f"假设文档: {hyde_doc}")
+# "Python 的 GIL（全局解释器锁）限制了多线程在 CPU 密集型任务中的性能。
+#  可以通过 multiprocessing 模块、C 扩展..."
+print(f"检索到 {len(results)} 条相关文档")
+```
+
+**HyDE 为什么能工作？** 关键点在于——假设文档不需要事实正确，它只需要"风格正确"。即使 LLM 编造的答案包含错误信息，它的语言风格、用词选择、句子结构与真实文档足够接近，能把你带到向量空间中"正确答案所在的街区"。一旦进入正确的语义邻域，精确检索就容易多了。
+
+**性能数据**：中文知识库上 MRR@5 提升约 22%，代价是每查询增加 1 次 LLM 调用（约 200-400ms 延迟）。
+
+### Self-RAG：让模型自己决定什么时候该查资料
+
+普通 RAG 把检索当作"固定前置步骤"——无论什么问题都先检索再说。Self-RAG 打破了这一点，模型可以主动说"这个问题我知道，不需要查"。
+
+```python
+class SelfRAG:
+    """Self-RAG：按需检索 + 相关性评判 + 支持度自检"""
+    
+    def __init__(self, llm, retriever):
+        self.llm = llm
+        self.retriever = retriever
+    
+    def generate(self, query: str) -> str:
+        # 决策 1：是否需要检索？
+        need_retrieve = self._should_retrieve(query)
+        
+        context = ""
+        if need_retrieve:
+            docs = self.retriever.get_relevant_documents(query)
+            
+            # 决策 2：检索结果是否相关？
+            relevant_docs = self._filter_relevant(query, docs)
+            
+            if relevant_docs:
+                context = "\n\n".join(d.page_content for d in relevant_docs[:3])
+        
+        # 决策 3：基于（可能为空的）上下文生成答案
+        return self._generate_with_citation(query, context)
+    
+    def _should_retrieve(self, query: str) -> bool:
+        """判断是否需要外部知识"""
+        prompt = f"""判断以下问题是否需要查阅外部资料。
+        常识性问题（如"1+1等于几"、"今天的日期"）不需要。
+        需要专业知识或特定数据的问题需要检索。
+        
+        问题：{query}
+        需要检索？(yes/no):"""
+        
+        response = self.llm.invoke(prompt).content.strip().lower()
+        return "yes" in response
+    
+    def _filter_relevant(self, query: str, docs) -> list:
+        """使用 Critic 模型评估每条检索结果的相关性"""
+        relevant = []
+        for doc in docs:
+            prompt = f"""判断以下文档是否对回答问题有帮助。
+            问题：{query}
+            文档：{doc.page_content[:500]}
+            相关？(relevant/irrelevant):"""
+            
+            if "relevant" in self.llm.invoke(prompt).content.strip().lower():
+                relevant.append(doc)
+        return relevant
+    
+    def _generate_with_citation(self, query: str, context: str) -> str:
+        """生成答案，并标注信息来源"""
+        prompt = f"""基于以下上下文回答问题。如果上下文为空，使用你的知识回答。
+        
+        上下文：
+        {context if context else "（无可用上下文）"}
+        
+        问题：{query}
+        
+        要求：
+        1. 如果使用上下文信息，请标注引用来源编号
+        2. 如果上下文不足以回答问题，请明确说明
+        """
+        return self.llm.invoke(prompt).content
+```
+
+Self-RAG 的三个决策点对应了 RAG 流水线中最容易出错的三处：**要不要检索**（避免无意义的检索延迟）、**检索结果能用吗**（过滤噪声）、**生成的答案有据可查吗**（防止幻觉）。
+
+### CRAG：检索评估 + 自动纠错闭环
+
+CRAG（Corrective RAG）在 Self-RAG 基础上增加了**质量评分-自动纠错-网络兜底**的闭环：
+
+```
+用户查询
+    │
+    ▼
+向量检索 → 文档集
+    │
+    ▼
+检索评估器（轻量模型，逐个文档打分）
+    │
+    ├── 高分（正确） → 精炼后传给 LLM
+    ├── 中分（模糊） → 精炼 + Web 搜索补充
+    └── 低分（错误） → 查询重写 → Web 搜索 → 生成
+```
+
+```python
+class CRAG:
+    """Corrective RAG：检索评估 + 知识精炼 + 自动纠错"""
+    
+    def __init__(self, llm, retriever, web_search_tool, grader):
+        self.llm = llm
+        self.retriever = retriever
+        self.web_search = web_search_tool
+        self.grader = grader  # 轻量级检索评估器
+    
+    def generate(self, query: str) -> str:
+        # Step 1: 检索
+        docs = self.retriever.get_relevant_documents(query)
+        
+        # Step 2: 逐条评估检索质量
+        correct = []
+        ambiguous = []
+        for doc in docs:
+            score = self.grader.evaluate(query, doc.page_content)
+            if score == "correct":
+                correct.append(doc)
+            elif score == "ambiguous":
+                ambiguous.append(doc)
+        
+        # Step 3: 根据评估结果选择策略
+        if len(correct) >= 2:
+            # 足够的正确结果：精炼后生成
+            knowledge = self._refine_knowledge(query, correct)
+        
+        elif len(correct) + len(ambiguous) >= 1:
+            # 结果不够好：精炼 + 网络搜索补充
+            knowledge = self._refine_knowledge(query, correct + ambiguous)
+            web_knowledge = self.web_search.search(query)
+            knowledge += "\n\n---\n\n" + web_knowledge
+        
+        else:
+            # 检索完全失败：重写查询 → 网络搜索
+            rewritten_query = self.llm.invoke(
+                f"将以下问题改写为适合搜索引擎查询的关键词：{query}"
+            ).content
+            knowledge = self.web_search.search(rewritten_query)
+        
+        return self.llm.invoke(
+            f"基于以下知识回答问题：\n\n{knowledge}\n\n问题：{query}"
+        ).content
+    
+    def _refine_knowledge(self, query: str, docs) -> str:
+        """知识精炼：从文档中提取与问题最相关的片段"""
+        combined = "\n\n".join(d.page_content for d in docs)
+        prompt = f"""从以下文档中，提取与问题最相关的关键信息片段。
+        只保留直接相关的内容，删除无关细节。
+        
+        问题：{query}
+        文档：{combined}
+        
+        关键信息："""
+        return self.llm.invoke(prompt).content
+```
+
+**18 种 RAG 技术基准对比中，CRAG 以 0.824 的综合得分领先。**
+
+## RAG 的评估体系
+
+没有评估就没有优化方向。RAG 的评估需要从"检索"和"生成"两个维度分别度量。
+
+### Ragas：RAG 评估的工业标准
+
+```bash
+pip install ragas
+```
+
+```python
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,          # 忠实度：答案是否有上下文支撑
+    answer_relevancy,      # 答案相关性：答案是否切题
+    context_precision,     # 上下文精度：检索结果排序质量
+    context_recall,        # 上下文召回：是否遗漏了关键信息
+    context_relevancy,     # 上下文相关性：检索到的内容是否有用
+)
+
+# 准备评估数据
+eval_dataset = Dataset.from_dict({
+    "question": [
+        "Python 的 GIL 是什么？",
+        "RAG 如何解决 LLM 幻觉问题？",
+    ],
+    "answer": [
+        "GIL 是全局解释器锁，限制了 CPython 多线程并行能力。",
+        "RAG 通过先检索外部知识再生成回答，避免模型编造信息。",
+    ],
+    "contexts": [
+        ["GIL（Global Interpreter Lock）是 CPython 中的互斥锁..."],
+        ["RAG 在生成回答前先从知识库检索相关文档..."],
+    ],
+    "ground_truth": [
+        "GIL 是 CPython 解释器中的全局互斥锁，同一时刻只允许一个线程执行 Python 字节码。",
+        "RAG 将检索系统与生成模型结合，在回答前先检索权威知识源，减少模型幻觉。",
+    ],
+})
+
+# 评估
+result = evaluate(eval_dataset, metrics=[
+    faithfulness,
+    answer_relevancy,
+    context_precision,
+    context_recall,
+])
+print(result)
+```
+
+### 四大核心指标详解
+
+**1. Faithfulness（忠实度）——最重要**
+
+```
+Faithfulness = 有上下文支撑的陈述数 / 总陈述数
+```
+
+算法：
+1. 将生成的答案拆解为原子陈述（"X 是 Y"、"A 导致 B"）
+2. 对每条陈述，检查是否能从上下文中推理出来
+3. 得分 = 能推理出的陈述比例
+
+**2. Context Precision（上下文精度）**
+
+衡量检索结果中，相关的文档是否排在不相关的文档前面。使用 MRR（平均倒数排名）和 NDCG 组合计算。
+
+**3. Context Recall（上下文召回）**
+
+衡量检索到的文档是否覆盖了回答所需的全部信息。是否遗漏了关键文档？
+
+**4. Answer Relevancy（答案相关性）**
+
+衡量生成的答案是否直接回应了用户问题，而不是跑题。
+
+### 评估的真谛
+
+```
+端到端延迟 < 2s ？
+检索 Recall@5 > 80% ？
+Rerank 后 Precision@3 > 90%  ？
+Faithfulness > 0.85 ？
+幻觉率 < 3% ？
+如果以上全部满足，可以上线了。
+如果有一个不满足，去找是哪个环节出了问题。
+```
+
+## 生产环境部署最佳实践
+
+### 完整的生产级 RAG 架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    API Gateway / 限流                     │
+├─────────────────────────────────────────────────────────┤
+│  查询层                                                  │
+│  ┌──────────┐ ┌──────────┐ ┌────────────┐              │
+│  │Query 改写│ │意图分类  │ │敏感词过滤   │              │
+│  └──────────┘ └──────────┘ └────────────┘              │
+├─────────────────────────────────────────────────────────┤
+│  检索层                                                  │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐    │
+│  │Hybrid检索│ │ Reranker │ │ 缓存层    │ │Web兜底 │    │
+│  │Dense+BM25│ │CrossEnc  │ │(Redis)   │ │        │    │
+│  └──────────┘ └──────────┘ └──────────┘ └────────┘    │
+├─────────────────────────────────────────────────────────┤
+│  生成层                                                  │
+│  ┌──────────┐ ┌──────────┐ ┌────────────┐              │
+│  │Prompt构建│ │生成/校验 │ │引用标注     │              │
+│  └──────────┘ └──────────┘ └────────────┘              │
+├─────────────────────────────────────────────────────────┤
+│  基础设施                                               │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+│  │向量数据库│ │ 监控告警  │ │ 日志追踪  │ │评估管道   │  │
+│  │(Qdrant) │ │(Otel+   │ │(Langfuse)│ │(Ragas)   │  │
+│  │          │ │ Grafana) │ │          │ │          │  │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 十条生产铁律
+
+1. **分块是一切的基础**。用递归分块做默认，语义分块做高价值文档。永远设置 10-20% 的 overlap
+2. **混合检索是标配**。纯向量检索会漏掉精确术语匹配，BM25 会漏掉同义词。两者结合 + RRF 融合
+3. **Reranker 是性价比最高的优化**。延迟增加 50ms，检索精度提升 20% 以上
+4. **缓存检索结果**。高频问题占查询量的 80%，缓存其检索结果可以省掉向量搜索 + Rerank 的全部开销
+5. **监控什么就该量化什么**。为检索 Recall、生成 Faithfulness、端到端延迟设置告警阈值
+6. **设置"我不知道"的门槛**。Prompt 中明确指示模型在不确定性高时拒绝回答，比输出幻觉要好
+7. **关注更新策略**。知识库不是一次性的——文档新增、修改、删除都要反映到向量库中。设计好增量更新而非全量重建
+8. **安全过滤不可省略**。用户查询和检索结果都需要经过内容安全检查
+9. **长事务会害死你**——这个在数据库那篇文章中讲过，对 RAG 同样适用：超长文档要截断，超长检索列表要裁剪
+10. **用 Ragas 做持续评估**。每次流水线变更后跑一次评估，把指标趋势画在 Grafana 看板上
+
+### 不同规模的技术选型
+
+| 规模 | 分块 | Embedding | 向量库 | Reranker | LLM |
+|------|------|-----------|--------|----------|-----|
+| 原型（1k 以下文档） | 递归分块 | BGE/OpenAI | Chroma/FAISS | 可选 | GPT-4o-mini |
+| 成长（100k 以下文档） | 递归+语义 | BGE-m3 | Qdrant/pgvector | BGE-Reranker | GPT-4o |
+| 生产（100k 以上文档） | 混合策略 | 多模型 | Milvus | 专用Reranker | GPT-4o/Claude |
+| 企业（1M 以上文档） | 自适应 | 微调模型 | 分布式集群 | 多级Reranker | 自部署 |
+
+## 总结
+
+RAG 经历了不到六年的时间，从一篇学术论文的概念演变为 AI 应用的事实标准架构。这篇文章覆盖了六个层次：
+
+1. **原理层**：RAG 的核心是"先检索，再生成"——用外部知识弥补 LLM 的知识盲区
+2. **工程层**：分块 → 嵌入 → 向量检索 → 重排序 → Prompt 构建 → 生成，每个环节都有陷阱和最佳实践
+3. **策略层**：HyDE（假设文档嵌入）、Self-RAG（按需检索+自检）、CRAG（检索评估+自动纠错）三大进阶技术
+4. **演进层**：Naive → Advanced → Modular → Agentic，从固定管道到智能体自主决策
+5. **评估层**：用 Ragas 量化 Faithfulness、Context Precision、Answer Relevancy，没有度量就没有优化
+6. **生产层**：缓存、安全、监控、增量更新——原型能跑和线上能抗是两回事
+
+RAG 不是银弹。它不能替代 fine-tuning 让模型学会新的推理模式，也不能替代 prompt engineering 精心控制输出格式。但它是目前将 LLM 与现实世界知识连接起来最成熟、最经济的方案。理解 RAG 的底层机制，就是理解现代 AI 应用的核心基础设施。
