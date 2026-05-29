@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { getAllPosts, getPostBySlug, getAdjacentPosts } from '@/lib/posts';
 import { SITE } from '@/constants/site';
@@ -46,6 +47,16 @@ export default async function ArticlePage({ params }: PageProps) {
   return (
     <>
       <ReadingProgress />
+      <div className="section-padding pb-0">
+        <Container>
+          <Link
+            href="/articles"
+            className="inline-flex items-center gap-1 text-sm text-muted hover:text-primary transition-colors"
+          >
+            ← 返回文章列表
+          </Link>
+        </Container>
+      </div>
       <article>
         <ArticleHeader post={post} />
 

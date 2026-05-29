@@ -4,7 +4,7 @@ import { useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft } from 'lucide-react'
 
-const STATUSES = ['进行中', '已完成', '维护中']
+const STATUSES = ['进行中', '已完成', '维护中', '已暂停', '已取消']
 
 interface ProjectData {
   title: string

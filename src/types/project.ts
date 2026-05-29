@@ -1,4 +1,4 @@
-export type ProjectStatus = '进行中' | '已完成' | '维护中';
+export type ProjectStatus = '进行中' | '已完成' | '维护中' | '已暂停' | '已取消';
 
 export interface WorkEntry {
   date: string;
@@ -7,10 +7,10 @@ export interface WorkEntry {
 
 export interface ProjectFrontmatter {
   title: string;
-  description: string;
+  description?: string;
   date: string;
   status: ProjectStatus;
-  techStack: string[];
+  techStack?: string[];
   github?: string;
   demo?: string;
   featured?: boolean;

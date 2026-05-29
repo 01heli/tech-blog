@@ -8,11 +8,17 @@ export function cn(...inputs: ClassValue[]) {
 
 export function formatDate(dateString: string): string {
   const date = new Date(dateString);
-  return date.toLocaleDateString('zh-CN', {
+  const datePart = date.toLocaleDateString('zh-CN', {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
   });
+  const hasTime = / \d{2}:\d{2}:\d{2}/.test(dateString);
+  if (hasTime) {
+    const timePart = dateString.split(' ')[1].slice(0, 5);
+    return `${datePart} ${timePart}`;
+  }
+  return datePart;
 }
 
 export function calculateReadingTime(content: string): number {

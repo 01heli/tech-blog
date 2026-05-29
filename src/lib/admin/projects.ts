@@ -24,13 +24,14 @@ function ensureDir() {
 }
 
 function slugFromTitle(title: string, date: string): string {
+  const dateOnly = date.split(' ')[0].split('T')[0]
   const base = title
     .toLowerCase()
     .replace(/[\s/\\]+/g, '-')
     .replace(/[^\w\-]/g, '')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
-  return `${date}-${base}`.replace(/-$/, '')
+  return `${dateOnly}-${base}`.replace(/-$/, '')
 }
 
 function serializeProject(input: ProjectInput): string {

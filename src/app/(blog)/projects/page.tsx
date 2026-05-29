@@ -16,6 +16,8 @@ const statusStyles: Record<ProjectStatus, string> = {
   '进行中': 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
   '已完成': 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
   '维护中': 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400',
+  '已暂停': 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
+  '已取消': 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
 };
 
 function ProjectCard({ project, index }: { project: Project; index: number }) {
@@ -38,12 +40,14 @@ function ProjectCard({ project, index }: { project: Project; index: number }) {
           </span>
         </div>
 
-        <p className="text-sm text-muted mb-4 line-clamp-2">
-          {project.frontmatter.description}
-        </p>
+        {project.frontmatter.description && (
+          <p className="text-sm text-muted mb-4 line-clamp-2">
+            {project.frontmatter.description}
+          </p>
+        )}
 
         <div className="flex flex-wrap gap-1.5 mb-4">
-          {project.frontmatter.techStack.map((tech) => (
+          {(project.frontmatter.techStack || []).map((tech) => (
             <span
               key={tech}
               className="px-2 py-0.5 rounded-md bg-secondary text-xs text-muted"

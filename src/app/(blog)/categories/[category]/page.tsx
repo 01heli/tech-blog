@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ArticleGrid } from '@/components/home/ArticleGrid';
 import { Container } from '@/components/layout/Container';
@@ -34,6 +35,12 @@ export default function CategoryPage({ params }: PageProps) {
   return (
     <div className="section-padding">
       <Container>
+        <Link
+          href="/categories"
+          className="inline-flex items-center gap-1 text-sm text-muted hover:text-primary transition-colors mb-6"
+        >
+          ← 所有分类
+        </Link>
         <AnimatedSection>
           <div className="flex items-center gap-3 mb-2">
             <span

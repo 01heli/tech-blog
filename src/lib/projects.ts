@@ -6,7 +6,7 @@ import type { Project, ProjectFrontmatter, WorkEntry } from '@/types/project';
 
 const PROJECTS_DIR = path.join(process.cwd(), 'content', 'projects');
 
-const DATE_HEADING_RE = /^## (\d{4}-\d{2}-\d{2})$/;
+const DATE_HEADING_RE = /^## (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)$/;
 
 function parseTimeline(content: string): WorkEntry[] {
   const lines = content.split('\n');

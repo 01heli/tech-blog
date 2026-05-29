@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { getAllProjects, getProjectBySlug } from '@/lib/projects';
 import { SITE } from '@/constants/site';
@@ -37,6 +38,8 @@ const statusStyles: Record<ProjectStatus, string> = {
   '进行中': 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
   '已完成': 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
   '维护中': 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400',
+  '已暂停': 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
+  '已取消': 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
 };
 
 export default async function ProjectPage({ params }: PageProps) {
@@ -46,6 +49,12 @@ export default async function ProjectPage({ params }: PageProps) {
   return (
     <div className="section-padding">
       <Container size="small">
+        <Link
+          href="/projects"
+          className="inline-flex items-center gap-1 text-sm text-muted hover:text-primary transition-colors mb-6"
+        >
+          ← 返回项目列表
+        </Link>
         <AnimatedSection>
           <div className="mb-10">
             <div className="flex items-center gap-3 mb-2">
@@ -63,7 +72,7 @@ export default async function ProjectPage({ params }: PageProps) {
             </p>
 
             <div className="flex flex-wrap items-center gap-2 mb-4">
-              {project.frontmatter.techStack.map((tech) => (
+              {(project.frontmatter.techStack || []).map((tech) => (
                 <span
                   key={tech}
                   className="px-2.5 py-0.5 rounded-md bg-secondary text-xs text-muted"
