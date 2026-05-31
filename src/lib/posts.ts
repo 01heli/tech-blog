@@ -25,6 +25,7 @@ export const getAllPosts = cache((): Post[] => {
       frontmatter,
       content,
       readingTime,
+      viewCount: 0,
       headings,
     } as Post;
   });
@@ -47,6 +48,7 @@ export function getPostBySlug(slug: string): Post | null {
     frontmatter,
     content,
     readingTime: frontmatter.readingTime || calculateReadingTime(content),
+    viewCount: 0,
     headings: extractHeadings(content),
   } as Post;
 }

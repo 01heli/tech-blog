@@ -1,9 +1,46 @@
 ---
 title: IP 归属地查询服务
-description: 极简的 IP 归属地查询服务，通过 HTTP 接口传入 IP 地址，返回国家、城市、ISP、经纬度等信息，基于 MaxMind GeoLite2 离线数据库
+description: 极简的 IP 归属地查询服务，基于 FastAPI + ip-api.com 免费 API，支持中文界面、私网本地识别、Docker 部署
 date: '2026-05-30 02:25:16'
-status: 进行中
+status: 已完成
+techStack:
+  - Python 3.11+
+  - FastAPI
+  - uvicorn
+  - httpx
+  - Docker
+github: 'https://github.com/01heli/ip-geo-lookup'
+featured: true
 ---
+## 2026-06-01 01:39:00
+
+- 发布上线，源码已推送到 GitHub 仓库：[github.com/01heli/ip-geo-lookup](https://github.com/01heli/ip-geo-lookup)
+
+## 2026-05-31 22:30:00
+
+- 修复私网 IP 查询报错问题：使用 Python `ipaddress` 模块在本地识别 13 种私有/保留地址段（私网 A/B/C 类、回环 v4/v6、链路本地、运营商 NAT、组播、E 类保留、IPv6 唯一本地地址），返回中文说明，不消耗 API 配额
+- 替换 Swagger UI 为 Scalar CDN 接口文档：`/docs` 路径加载 `@scalar/api-reference`，界面更现代且支持中文
+- 编写中文测试首页 `/`：暗色主题，输入 IP → 点击查询 → 表格展示结果（国家、省份、城市、经纬度、时区、ISP）
+
 ## 2026-05-30 02:25:16
 
-- 确定项目的技术架构：Python 3.11+、FastAPI + uvicorn、MaxMind GeoLite2 离线 IP 地理数据库、geoip2 Python 库、Docker 部署
+- 技术选型调研：对比 MaxMind GeoLite2（需注册下载数据库）、ip2region（需下载 xdb 文件）、ip-api.com（免费 HTTP API，无需注册），最终选择 ip-api.com 作为数据源——**零注册零下载，启动即用**
+- 确定技术架构：Python 3.11+、FastAPI + uvicorn HTTP 框架、httpx 异步 HTTP 客户端、ipaddress 标准库做私网识别、Docker 容器化部署
+- 实现核心查询逻辑 `service/geoip.py`：
+  - `IPAPILookup` 类封装 ip-api.com 调用，5 秒超时，中文语言参数 `lang=zh-CN`
+  - `_classify_special()` 函数本地识别私有/保留地址，命中则直接返回中文描述
+  - 公网 IP 走外部 API 查询，失败抛出中文错误提示
+- 搭建 FastAPI 应用 `main.py`：
+  - `GET /api/lookup?ip=8.8.8.8` — IP 归属地查询接口
+  - `GET /health` — 健康检查
+  - 使用 lifespan 管理 httpx 客户端生命周期
+- 编写 Dockerfile：基于 `python:3.11-slim`，暴露 8000 端口
+- 编写项目 README，包含快速开始、API 表格、Docker 部署说明
+
+## 参考资料
+
+- [ip-api.com — Free IP Geolocation API](https://ip-api.com/)（本项目使用的免费 IP 地理查询 API）
+- [FastAPI 官方文档](https://fastapi.tiangolo.com/zh/)（Python Web 框架）
+- [Python ipaddress 模块文档](https://docs.python.org/zh-cn/3/library/ipaddress.html)（用于本地私网地址识别）
+- [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml)（特殊用途 IP 地址段官方注册表）
+- [Scalar API Reference](https://github.com/scalar/scalar)（替代 Swagger 的现代化 API 文档工具）

@@ -1,0 +1,67 @@
+---
+title: 本地 RAG 知识库
+description: 从零手动实现 RAG（检索增强生成）知识库系统，基于 LM Studio 本地部署的 LLM 和嵌入模型，逐步深入理解 RAG 原理
+date: '2026-06-01 02:10:00'
+status: 进行中
+techStack:
+  - Python 3.13
+  - LM Studio
+  - Qwen3.5-9B
+  - BGE-M3
+  - OpenAI SDK
+github: 'https://github.com/01heli/local-rag-knowledge-base'
+featured: true
+---
+
+## 2026-06-01 02:10:00
+
+- **第 2 步：嵌入接口 + 余弦相似度** — 编写 `step2_embedding.py`，掌握文本转向量和语义相似度计算
+  - **练习 A**：调用 `client.embeddings.create()`，传入 `"苹果是一种水果"`，拿到 768 维向量
+  - **练习 B**：不用 NumPy，纯 Python 实现 `dot_product()` / `magnitude()` / `cosine_similarity()` 三个函数，自测向量自身的相似度为 `1.0`
+  - **练习 C — 语义相似度对比**：
+
+    **BGE-M3（中文嵌入模型）——最终结果：**
+
+    | 文本 A | 文本 B | 相似度 | 结论 |
+    |--------|--------|--------|------|
+    | 苹果很好吃 | 香蕉很好吃 | 0.8004 | 高 — 同主题（水果 + 口感） |
+    | 苹果很好吃 | 苹果是一种水果 | 0.8290 | 高 — 同一对象（苹果） |
+    | 苹果很好吃 | 今天天气不错 | 0.6144 | 低 — 完全不相关 |
+
+  - **遇到问题 1 — 英文嵌入模型对中文无效**：最初使用 `nomic-embed-text-v1.5`（英文原生模型），跑同样的三组对比，所有相似度全部挤在 0.73~0.78 之间，根本分不清哪组相关哪组不相关：
+
+    **nomic-embed-text-v1.5（英文模型）——失败结果：**
+
+    | 文本 A | 文本 B | 相似度 | 结论 |
+    |--------|--------|--------|------|
+    | 苹果很好吃 | 香蕉很好吃 | 0.7822 | 无法区分 |
+    | 苹果很好吃 | 苹果是一种水果 | 0.7306 | 无法区分 |
+    | 苹果很好吃 | 今天天气不错 | 0.7532 | 无法区分 |
+
+    原因：英文模型没有中文语义表征能力，对中文文本只能捕捉到浅层字符级特征。解决：替换为支持中文的 **BGE-M3** 嵌入模型，分数立即拉开差距（最低 0.61 vs 最高 0.83，跨度为 0.22）
+
+  - **遇到问题 2 — LM Studio 无法同时运行两个模型**：同一时间只能加载一个模型到 Server。现阶段影响不大（分步操作），后续做 RAG 管线串联时需要考虑双实例方案
+
+## 2026-06-01 01:39:00
+
+- 在 GitHub 创建仓库并推送初始代码：[github.com/01heli/local-rag-knowledge-base](https://github.com/01heli/local-rag-knowledge-base)
+- **第 1 步：验证 LM Studio 对话接口** — 编写 `main.py`，通过 OpenAI 兼容接口调用本地部署的 Qwen3.5-9B 模型
+  - LM Studio 本地 API 地址：`http://127.0.0.1:1234/v1`
+  - 模型：`qwen/qwen3.5-9b`（推理模型）
+  - 关键经验：Qwen3.5-9B 是推理模型，对话结果可能存放在 `reasoning_content` 字段而非 `content`，需设置 `max_tokens=4000` 避免截断
+- 制定整体路线图（共 8 步）：
+  - 第 1 步 ✅ 验证对话接口
+  - 第 2 步 ✅ 嵌入接口 + 余弦相似度
+  - 第 3 步：文本分块器（chunker）
+  - 第 4 步：向量库（VectorStore）
+  - 第 5 步：文档加载器
+  - 第 6 步：RAG 管线串联
+  - 第 7 步：交互命令行界面
+  - 第 8 步：优化与扩展
+
+## 参考资料
+
+- [LM Studio — 本地运行 LLM](https://lmstudio.ai/)（本项目使用的本地模型部署工具）
+- [OpenAI Python SDK](https://github.com/openai/openai-python)（与 LM Studio 兼容的 API 客户端）
+- [Qwen3.5-9B 模型卡片](https://huggingface.co/Qwen/Qwen3.5-9B)（本项目使用的对话模型）
+- [BGE-M3 — BAAI 多语言嵌入模型](https://huggingface.co/BAAI/bge-m3)（第 2 步替换的中文嵌入模型）

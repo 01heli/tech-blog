@@ -5,6 +5,7 @@ import { ArticleGrid } from '@/components/home/ArticleGrid';
 import { Container } from '@/components/layout/Container';
 import { AnimatedSection } from '@/components/shared/AnimatedSection';
 import { getPostsByCategory } from '@/lib/posts';
+import { withViewCounts } from '@/lib/views';
 import { CATEGORIES, getCategoryBySlug } from '@/constants/categories';
 import { SITE } from '@/constants/site';
 
@@ -26,11 +27,11 @@ export function generateMetadata({ params }: PageProps): Metadata {
   };
 }
 
-export default function CategoryPage({ params }: PageProps) {
+export default async function CategoryPage({ params }: PageProps) {
   const cat = getCategoryBySlug(params.category);
   if (!cat) notFound();
 
-  const posts = getPostsByCategory(params.category);
+  const posts = await withViewCounts(getPostsByCategory(params.category));
 
   return (
     <div className="section-padding">

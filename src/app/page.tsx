@@ -5,12 +5,13 @@ import { FeaturedArticle } from '@/components/home/FeaturedArticle';
 import { ArticleGrid } from '@/components/home/ArticleGrid';
 import { AnimatedSection } from '@/components/shared/AnimatedSection';
 import { Container } from '@/components/layout/Container';
-import { getAllPosts, getFeaturedPosts } from '@/lib/posts';
+import { getAllPosts } from '@/lib/posts';
+import { withViewCounts } from '@/lib/views';
 
-export default function Home() {
-  const allPosts = getAllPosts();
-  const featured = getFeaturedPosts(1);
-  const recent = allPosts.slice(featured.length, 7);
+export default async function Home() {
+  const allPosts = await withViewCounts(getAllPosts());
+  const featured = allPosts.filter((p) => p.frontmatter.featured).slice(0, 1);
+  const recent = allPosts.slice(featured.length ? 1 : 0, 7);
 
   return (
     <>

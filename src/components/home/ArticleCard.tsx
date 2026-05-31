@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import Image from 'next/image';
-import { Clock } from 'lucide-react';
+import { Eye } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { formatDate, normalizeCategorySlug } from '@/lib/utils';
 import { getCategoryBySlug } from '@/constants/categories';
@@ -11,7 +11,7 @@ interface ArticleCardProps {
 }
 
 export function ArticleCard({ post }: ArticleCardProps) {
-  const { slug, frontmatter, readingTime } = post;
+  const { slug, frontmatter, viewCount } = post;
   const categoryMeta = getCategoryBySlug(normalizeCategorySlug(frontmatter.category));
 
   return (
@@ -61,8 +61,8 @@ export function ArticleCard({ post }: ArticleCardProps) {
               ))}
             </div>
             <span className="flex items-center gap-1 text-xs text-muted/50 whitespace-nowrap ml-2">
-              <Clock className="w-3 h-3" />
-              {readingTime} min
+              <Eye className="w-3 h-3" />
+              {viewCount} 次阅读
             </span>
           </div>
         </div>

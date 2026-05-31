@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { getAllPosts, getPostBySlug, getAdjacentPosts } from '@/lib/posts';
+import { withViewCount } from '@/lib/views';
 import { SITE } from '@/constants/site';
 import { ArticleHeader } from '@/components/article/ArticleHeader';
 import { ArticleContent } from '@/components/article/ArticleContent';
@@ -10,6 +11,7 @@ import { ArticleNavigation } from '@/components/article/ArticleNavigation';
 import { ReadingProgress } from '@/components/layout/ReadingProgress';
 import { Container } from '@/components/layout/Container';
 import { AdminEditButton } from '@/components/admin/AdminEditButton';
+import { ViewTracker } from '@/components/shared/ViewTracker';
 
 interface PageProps {
   params: { slug: string };
@@ -42,6 +44,7 @@ export default async function ArticlePage({ params }: PageProps) {
   const post = getPostBySlug(params.slug);
   if (!post) notFound();
 
+  const enrichedPost = await withViewCount(post);
   const { prev, next } = getAdjacentPosts(params.slug);
 
   return (
@@ -58,7 +61,7 @@ export default async function ArticlePage({ params }: PageProps) {
         </Container>
       </div>
       <article>
-        <ArticleHeader post={post} />
+        <ArticleHeader post={enrichedPost} />
 
         <Container>
           <div className="lg:flex lg:gap-12">
@@ -72,6 +75,7 @@ export default async function ArticlePage({ params }: PageProps) {
         <ArticleNavigation prev={prev} next={next} />
       </article>
       <AdminEditButton slug={params.slug} />
+      <ViewTracker slug={params.slug} />
     </>
   );
 }
