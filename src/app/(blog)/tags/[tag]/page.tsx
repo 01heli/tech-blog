@@ -5,6 +5,7 @@ import { ArticleGrid } from '@/components/home/ArticleGrid';
 import { Container } from '@/components/layout/Container';
 import { AnimatedSection } from '@/components/shared/AnimatedSection';
 import { getPostsByTag, getAllTags } from '@/lib/posts';
+import { withViewCounts } from '@/lib/views';
 import { SITE } from '@/constants/site';
 
 interface PageProps {
@@ -23,9 +24,9 @@ export function generateMetadata({ params }: PageProps): Metadata {
   };
 }
 
-export default function TagPage({ params }: PageProps) {
+export default async function TagPage({ params }: PageProps) {
   const tag = decodeURIComponent(params.tag);
-  const posts = getPostsByTag(tag);
+  const posts = await withViewCounts(getPostsByTag(tag));
 
   if (posts.length === 0) notFound();
 

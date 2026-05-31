@@ -581,3 +581,18 @@ COMMIT;                              COMMIT;
 4. **实践层面**——丢失更新和写偏斜两个超越 ANSI 级别的真实陷阱，以及何时该选什么隔离级别
 
 理解事务隔离，就是在理解并发控制的源代码如何保护你的数据尊严。
+
+---
+
+## 参考资料
+
+- [ANSI X3.135-1992 — Database Language SQL](https://www.contrib.andrew.cmu.edu/~shadow/sql/sql1992.txt)（ANSI SQL-92 标准，四种隔离级别的原始定义）
+- [A Critique of ANSI SQL Isolation Levels — Berenson 等人 (1995)](https://www.microsoft.com/en-us/research/publication/a-critique-of-ansi-sql-isolation-levels/)（发现 ANSI 级别的缺陷，提出 Snapshot Isolation 和写偏斜）
+- [MySQL 8.0 Reference Manual — Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html)（InnoDB 隔离级别官方文档）
+- [MySQL 8.0 — InnoDB Multi-Versioning (MVCC)](https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html)（InnoDB MVCC 实现细节）
+- [MySQL 8.0 — InnoDB Locking (Next-Key Lock)](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html)（间隙锁与 Next-Key Lock 文档）
+- [PostgreSQL 16 — Transaction Isolation](https://www.postgresql.org/docs/16/transaction-iso.html)（PG 隔离级别 + SSI 官方文档）
+- [PostgreSQL 16 — Chapter 73. Transaction Processing in PostgreSQL](https://www.postgresql.org/docs/16/transaction-processing.html)（PG 事务内部实现）
+- [Serializable Snapshot Isolation in PostgreSQL — Cahill 等人 (2009)](https://drkp.net/papers/ssi-vldb09.pdf)（PostgreSQL SSI 的学术论文，提出 SIREAD 锁和危险结构概念）
+- [Generalized Isolation Level Definitions — Adya 等人 (2000)](https://pmg.csail.mit.edu/papers/icde00.pdf)（学术形式化定义，提出 Snapshot Isolation 和更多异常类型）
+- [Designing Data-Intensive Applications — Martin Kleppmann (2017)](https://dataintensive.net/)（第 7 章事务隔离的经典书籍章节）

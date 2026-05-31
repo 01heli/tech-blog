@@ -68,6 +68,12 @@ export const CATEGORIES: CategoryMeta[] = [
     description: '前端工程化、性能优化与现代框架实践',
     color: 'from-pink-500 to-rose-500',
   },
+  {
+    name: 'Network',
+    slug: 'network',
+    description: '网络协议、传输层优化与协议栈深度解析',
+    color: 'from-teal-500 to-cyan-500',
+  },
 ];
 
 const categoryBySlug = new Map(CATEGORIES.map((c) => [c.slug, c]));

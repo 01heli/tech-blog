@@ -703,3 +703,18 @@ Python 3.15+ (预计 2026-2027)
 如果你在启动新项目，建议用 `python3.13t` 做兼容性测试。自由线程是 Python 社区 30 年来最重要的一次底层变革——它不会在一夜之间改变一切，但会成为默认选项。
 
 GIL 的故事是一个关于**工程权衡**的经典案例。一个在 1992 年做出的正确决策，支撑了 Python 三十年的发展，现在正被更先进的工程技术平稳替代。理解 GIL 的设计考量、内部机制和绕过方案，能让你在它彻底成为历史之前，写出最优的 Python 并发代码。
+
+---
+
+## 参考资料
+
+- [PEP 703 — Making the Global Interpreter Lock Optional in CPython](https://peps.python.org/pep-0703/)（自由线程模式的核心提案）
+- [PEP 684 — A Per-Interpreter GIL](https://peps.python.org/pep-0684/)（子解释器独立 GIL，自由线程的前置基础）
+- [PEP 554 — Multiple Interpreters in the Stdlib](https://peps.python.org/pep-0554/)（子解释器方案提案）
+- [Python 3.13 Free-Threaded CPython — 官方文档](https://docs.python.org/3.13/howto/free-threading.html)
+- [CPython Internals — Real Python 电子书](https://realpython.com/products/cpython-internals/)（GIL 源码级剖析）
+- [Cython 官方文档 — Using Cython with the GIL](https://cython.readthedocs.io/en/latest/src/userguide/memoryviews.html#nogil)
+- [Numba 官方文档 — Threading Layer & nogil](https://numba.pydata.org/numba-doc/latest/user/threading-layer.html)
+- [David Beazley — Understanding the Python GIL (PyCon 2010)](https://www.dabeaz.com/python/UnderstandingGIL.pdf)（经典 GIL 演讲）
+- [Larry Hastings — Gilectomy (PyCon 2016)](https://www.youtube.com/watch?v=P3AyI_u66Bw)（最早的无 GIL CPython 实验）
+- [Sam Gross — nogil CPython (GitHub)](https://github.com/colesbury/nogil)（PEP 703 的原型实现）

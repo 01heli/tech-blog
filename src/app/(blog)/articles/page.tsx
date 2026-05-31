@@ -4,6 +4,7 @@ import { ArticleGrid } from '@/components/home/ArticleGrid';
 import { Container } from '@/components/layout/Container';
 import { AnimatedSection } from '@/components/shared/AnimatedSection';
 import { getAllPosts } from '@/lib/posts';
+import { withViewCounts } from '@/lib/views';
 import { SITE } from '@/constants/site';
 
 const PER_PAGE = 6;
@@ -13,12 +14,12 @@ export const metadata: Metadata = {
   description: `${SITE.name} 所有技术文章列表`,
 };
 
-export default function ArticlesPage({
+export default async function ArticlesPage({
   searchParams,
 }: {
   searchParams: { page?: string };
 }) {
-  const allPosts = getAllPosts();
+  const allPosts = await withViewCounts(getAllPosts());
   const totalPages = Math.ceil(allPosts.length / PER_PAGE);
   const currentPage = Math.min(
     Math.max(1, parseInt(searchParams.page || '1') || 1),

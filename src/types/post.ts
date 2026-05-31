@@ -8,7 +8,8 @@ export type Category =
   | 'Kubernetes'
   | 'System Design'
   | 'DevOps'
-  | 'Frontend';
+  | 'Frontend'
+  | 'Network';
 
 export interface PostFrontmatter {
   title: string;
@@ -32,5 +33,6 @@ export interface Post {
   frontmatter: PostFrontmatter;
   content: string;
   readingTime: number;
+  viewCount: number;
   headings: Heading[];
 }

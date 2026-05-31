@@ -25,3 +25,8 @@ model SmsCode {
 
   @@index([phone, code])
 }
+
+model ArticleView {
+  slug  String @id
+  count Int    @default(1)
+}

@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { Clock, ArrowRight } from 'lucide-react';
+import { Eye, ArrowRight } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { formatDate } from '@/lib/utils';
 import type { Post } from '@/types/post';
@@ -9,7 +9,7 @@ interface FeaturedArticleProps {
 }
 
 export function FeaturedArticle({ post }: FeaturedArticleProps) {
-  const { slug, frontmatter, readingTime } = post;
+  const { slug, frontmatter, viewCount } = post;
 
   return (
     <Link href={`/articles/${slug}`} className="group block">
@@ -31,8 +31,8 @@ export function FeaturedArticle({ post }: FeaturedArticleProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <span className="flex items-center gap-1 text-sm text-muted/50">
-                <Clock className="w-3.5 h-3.5" />
-                {readingTime} min read
+                <Eye className="w-3.5 h-3.5" />
+                {viewCount} 次阅读
               </span>
               <div className="flex gap-1.5">
                 {frontmatter.tags.map((tag) => (

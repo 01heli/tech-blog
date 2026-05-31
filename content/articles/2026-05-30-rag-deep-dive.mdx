@@ -991,3 +991,37 @@ RAG 经历了不到六年的时间，从一篇学术论文的概念演变为 AI 
 6. **生产层**：缓存、安全、监控、增量更新——原型能跑和线上能抗是两回事
 
 RAG 不是银弹。它不能替代 fine-tuning 让模型学会新的推理模式，也不能替代 prompt engineering 精心控制输出格式。但它是目前将 LLM 与现实世界知识连接起来最成熟、最经济的方案。理解 RAG 的底层机制，就是理解现代 AI 应用的核心基础设施。
+
+---
+
+## 参考资料
+
+### RAG 基础与演进
+- [Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks — Lewis 等人 (2020)](https://arxiv.org/abs/2005.11401)（Meta AI 提出 RAG 概念的开山之作）
+- [RAG: Retrieval-Augmented Generation — Meta AI Blog](https://ai.meta.com/blog/retrieval-augmented-generation-streamlining-the-creation-of-intelligent-natural-language-processing-models/)
+- [Modular RAG: Transforming RAG Systems into LEGO-like Reconfigurable Frameworks](https://arxiv.org/abs/2407.21059)（模块化 RAG 的系统化定义）
+
+### 进阶技术
+- [Precise Zero-Shot Dense Retrieval without Relevance Labels (HyDE) — Gao 等人 (2022)](https://arxiv.org/abs/2212.10496)（HyDE 假设文档嵌入的原始论文）
+- [Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection — Asai 等人 (2023)](https://arxiv.org/abs/2310.11511)（Self-RAG 按需检索 + 反思校验）
+- [Corrective Retrieval Augmented Generation (CRAG) — Yan 等人 (2024)](https://arxiv.org/abs/2401.15884)（检索评估器 + 自动纠错闭环）
+- [Lost in the Middle — Liu 等人 (2023)](https://arxiv.org/abs/2307.03172)（LLM 对长上下文中间信息处理困难的经典研究）
+
+### Embedding 与索引
+- [BGE-M3 — BAAI](https://huggingface.co/BAAI/bge-m3)（支持多语言、8192 token 的开源 Embedding 模型）
+- [OpenAI Embeddings 文档](https://platform.openai.com/docs/guides/embeddings)
+- [Qdrant — High-Performance Vector Database](https://qdrant.tech/)（生产级向量数据库）
+- [Chroma — AI-Native Open-Source Embedding Database](https://www.trychroma.com/)（原型阶段常用的轻量向量库）
+
+### Reranker
+- [BGE-Reranker — BAAI](https://huggingface.co/BAAI/bge-reranker-v2-m3)（开源重排序模型）
+- [Cohere Rerank](https://docs.cohere.com/v2/docs/rerank-guide)（商业 Reranker API）
+
+### 评估体系
+- [Ragas — Evaluation framework for RAG](https://docs.ragas.io/)（RAG 评估的工业标准）
+- [Ragas Metrics — 官方文档](https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/)（Faithfulness、Context Precision 等指标详解）
+
+### 工具生态
+- [LangChain — Building RAG Applications](https://python.langchain.com/docs/tutorials/rag/)
+- [LlamaIndex — RAG Framework](https://docs.llamaindex.ai/en/stable/)
+- [Langfuse — LLM Observability](https://langfuse.com/)（RAG 流水线的日志追踪与监控）

@@ -1,4 +1,4 @@
-import { Clock, Calendar } from 'lucide-react';
+import { Eye, Calendar } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { formatDate } from '@/lib/utils';
 import type { Post } from '@/types/post';
@@ -8,7 +8,7 @@ interface ArticleHeaderProps {
 }
 
 export function ArticleHeader({ post }: ArticleHeaderProps) {
-  const { frontmatter, readingTime } = post;
+  const { frontmatter, viewCount } = post;
 
   return (
     <header className="text-center pt-16 pb-8">
@@ -31,8 +31,8 @@ export function ArticleHeader({ post }: ArticleHeaderProps) {
             {formatDate(frontmatter.date)}
           </span>
           <span className="flex items-center gap-1.5">
-            <Clock className="w-3.5 h-3.5" />
-            {readingTime} min read
+            <Eye className="w-3.5 h-3.5" />
+            {viewCount} 次阅读
           </span>
         </div>
 
