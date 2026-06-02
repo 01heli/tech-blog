@@ -1,0 +1,47 @@
+---
+title: blog-writer Skill 开发
+description: 为 Claude Code 开发一个技术博客写作规范 Skill——从 AI 写出"一眼 AI"的文章出发，设计四步写作流程和反 AI 化规则，让每篇博客保持统一的深度和风格
+date: '2026-06-02 21:30:00'
+status: 已完成
+techStack:
+  - Claude Code Skill
+  - Markdown
+  - YAML frontmatter
+  - prompt engineering
+github: 'https://github.com/01heli/skills'
+featured: true
+---
+
+## 2026-06-02 20:57:18
+
+- **动手编写 blog-writer Skill** — 从零设计一个技术博客写作规范 Skill，共 113 行，覆盖四步流程 + 五段式结构 + 反 AI 化规则
+  - **四步流程**：搜索资料 → 确定结构 → 撰写正文 → 添加参考资料，第一步强制 WebSearch 防止 AI "凭记忆编造"
+  - **五段式结构**：场景（5%）→ 理论（30%）→ 深入（40%）→ 实践（20%）→ 总结（10%），每段分配比例确保深度
+  - **反 AI 化三层设计**：语言层面（禁止表情符号/AI 套话）→ 内容层面（自构造代码/不直译原文）→ 质量层面（术语解释/具体数字/历史背景）
+
+- **遇到问题：description 怎么写才能精准触发**
+  - 第一版只写"撰写技术博客"，太模糊，可能在不该触发的时候触发
+  - 解决方案：前半句描述场景（"在 tech-blog 项目中按照统一规范撰写技术博客"），后半句列出具体触发词（"写博客"、"新增一篇博客"、"写一篇关于 XX 的文章"），语义匹配 + 精确兜底
+
+- **遇到问题：模糊建议无法约束 AI 行为**
+  - "不要抄袭"对 AI 来说不可执行——AI 不懂什么叫抄袭
+  - 解决方案：拆成三条精确规则——"参考资料的原文不要直接翻译"、"代码示例尽量自己构造"、"行文结构要有自己的逻辑，不要跟随某篇参考文章的叙事顺序"，分别对应语言、代码、结构三个层面
+  - 核心经验：**AI 遵守精确规则，忽略模糊建议**。每个质量标准必须转化为可验证的条件
+
+- **遇到问题：表情符号难以彻底清除**
+  - 即使用"禁止"措辞，AI 仍可能在 ASCII 图表中偶然使用勾号/叉号等符号
+  - 解决方案：在最终检查环节增加表情符号的正则扫描（`[\x{1F300}-\x{1F9FF}]` 等 Unicode 范围）
+
+- **设计收获：硬性指标与软性指导的分离**
+  - 硬性指标（不可违反）：参考资料 10+ 条、代码块标注语言、禁止表情符号、frontmatter 完整、文末必附参考资料
+  - 软性指导（风格选择）：用哪个日常场景引入、选什么语言作为示例
+  - "硬壳软核"设计确保底线质量的同时，每篇文章保留自己的风格
+
+## 参考资料
+
+- [Claude Code 官方文档 — Slash Commands & Skills](https://docs.anthropic.com/en/docs/claude-code/slash-commands)（Skill 系统的官方说明）
+- [GitHub — 01heli/skills](https://github.com/01heli/skills)（blog-writer Skill 开源仓库）
+- [CommonMark 规范](https://spec.commonmark.org/0.31.2/)（Markdown 语法标准，Skill 文件遵循的基础格式规范）
+- [YAML 规范 1.2](https://yaml.org/spec/1.2.2/)（Skill frontmatter 区域使用的配置格式）
+- [Anthropic — Prompt Engineering Guide](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering)（官方 prompt 工程指南）
+- [人人都懂系列 — 技术写作风格专栏](https://www.zhihu.com/column/renrendou)（blog-writer Skill 的风格参考来源）
