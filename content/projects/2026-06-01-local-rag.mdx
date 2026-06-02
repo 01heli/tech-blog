@@ -13,6 +13,33 @@ github: 'https://github.com/01heli/local-rag-knowledge-base'
 featured: true
 ---
 
+## 2026-06-02 21:31:26
+
+- **一口气推进 4 步（第 3~6 步）** — 从文本分块器到 RAG 管线全部串联跑通
+  - **第 3 步 `step3_chunker.py`**：纯 Python 实现文本分块器，核心是 `find_split_point()`——在目标位置附近找最自然的语义断点（优先级：句号 > 换行 > 逗号 > 空格 > 硬切），保证不会在句子中间切一刀。`_advance_by_tokens()` 和 `_rewind_by_tokens()` 两个辅助函数做"字符索引 [X] token 数"的近似映射，中文按字计、英文按单词计
+  - **第 4 步 `step4_vectorstore.py`**：两个 list（`_chunks` + `_vectors`）实现向量库，`search()` 暴搜所有向量算余弦相似度然后排序取 top_k，`save()/load()` 用 JSON 持久化——数据透明，文本编辑器就能看
+  - **第 5 步 `step5_loader.py`**：文档加载器，支持 txt/md/pdf 三种格式。Markdown 加载时剥离 YAML frontmatter（只认文件开头的 `---` 对），正文中的 `---` 分割线不动。编码用 utf-8 优先 + gbk 回退（Windows 中文文档常见）。单个文件损坏不连累其他文件
+  - **第 6 步 `step6_rag_pipeline.py`**：把前 5 步串成两个命令——`build`（建库）和 `ask`（问答）。提示词设计上，每个资料块标注 `[来源: 文件名]` 实现可溯源，明确要求 LLM "不知道就说不知道"防止幻觉
+  - 编写了完整的 [README.md](https://github.com/01heli/local-rag-knowledge-base)，包含数据流 ASCII 图、8 步路线图（带完成标记）、环境准备说明
+
+- **遇到问题：step2 无法被 import**
+  - step2 的 `client = OpenAI(...)` 和 `response = client.embeddings.create(...)` 写在模块顶层，没有 `if __name__ == "__main__"` 保护
+  - 导致 `from step2_embedding import cosine_similarity` 时会立刻发起 HTTP 请求——如果 LM Studio 没启动，import 就报错
+  - 解决：把 API 调用代码全部移到 `if __name__ == "__main__":` 里面，模块顶层只留纯函数定义。第 4、6 步正是依赖这个修复才能安全复用 step2 的函数
+
+- **遇到问题：中文引号与 Python 字符串冲突**
+  - 测试文本中的 `"参考资料"`（中文全角双引号 U+201C/U+201D）被文件系统/工具链自动转换成了 ASCII 半角引号 `"`
+  - Python 解析器把转换后的 `"` 当作字符串结束符，导致 `SyntaxError`
+  - 解决：外层用单引号 `'...'` 包裹，内部的中文引号就不会冲突
+
+- **遇到问题：极端小 chunk_size 下出现碎片 chunk**
+  - 测试时 chunk_size=80（刻意的小值），某些短句被单独切成一个 20 token 的碎片 chunk——因为 `find_split_point` 找到句号后立即切分，没有检查 chunk 是否太小
+  - 解决：在 `chunk_text` 中增加最小 chunk 保护——如果切出来的 chunk 比 overlap 还短，往后推到下一个断点再切，保证每个 chunk 至少比重叠区长
+
+- **遇到问题：LM Studio 单模型限制**
+  - 建库需要 BGE-M3（嵌入），问答既需要 BGE-M3（嵌入问题）又需要 Qwen（生成回答），但 LM Studio 同一时间只能加载一个模型
+  - 解决：`ask` 命令内部拆成两段——先用 BGE-M3 做检索，再提示用户切换到 Qwen 生成回答。如果 Qwen 没加载，不静默失败，而是打印完整提示词让用户手动复制发给模型
+
 ## 2026-06-01 02:10:00
 
 - **第 2 步：嵌入接口 + 余弦相似度** — 编写 `step2_embedding.py`，掌握文本转向量和语义相似度计算
@@ -50,8 +77,8 @@ featured: true
   - 模型：`qwen/qwen3.5-9b`（推理模型）
   - 关键经验：Qwen3.5-9B 是推理模型，对话结果可能存放在 `reasoning_content` 字段而非 `content`，需设置 `max_tokens=4000` 避免截断
 - 制定整体路线图（共 8 步）：
-  - 第 1 步 ✅ 验证对话接口
-  - 第 2 步 ✅ 嵌入接口 + 余弦相似度
+  - 第 1 步：验证对话接口
+  - 第 2 步：嵌入接口 + 余弦相似度
   - 第 3 步：文本分块器（chunker）
   - 第 4 步：向量库（VectorStore）
   - 第 5 步：文档加载器
