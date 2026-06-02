@@ -3,6 +3,7 @@
 import { useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft } from 'lucide-react'
+import { ImagePasteTextarea } from './ImagePasteTextarea'
 
 const CATEGORIES = [
   'MySQL', 'Redis', 'Docker', 'Linux', 'Go', 'Python',
@@ -187,9 +188,9 @@ export function ArticleEditor({ initial }: ArticleEditorProps) {
           <label className="block text-sm font-medium mb-1.5">
             正文 (Markdown) <span className="text-red-500">*</span>
           </label>
-          <textarea
+          <ImagePasteTextarea
             value={content}
-            onChange={(e) => setContent(e.target.value)}
+            onChange={setContent}
             placeholder="使用 Markdown 编写文章内容..."
             rows={24}
             className="w-full px-4 py-3 rounded-lg border border-black/10 dark:border-white/10 bg-transparent text-sm outline-none focus:border-blue-500 transition-colors font-mono leading-relaxed resize-y"

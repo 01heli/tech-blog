@@ -3,6 +3,7 @@
 import { useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft } from 'lucide-react'
+import { ImagePasteTextarea } from './ImagePasteTextarea'
 
 const STATUSES = ['进行中', '已完成', '维护中', '已暂停', '已取消']
 
@@ -217,9 +218,9 @@ export function ProjectEditor({ initial }: ProjectEditorProps) {
           <p className="text-xs text-muted mb-2">
             用 ## YYYY-MM-DD 作为每天的标题，记录当天工作内容
           </p>
-          <textarea
+          <ImagePasteTextarea
             value={content}
-            onChange={(e) => setContent(e.target.value)}
+            onChange={setContent}
             placeholder={`## 2026-06-03
 - 完成的功能
 - 修复的 bug
