@@ -2,16 +2,7 @@ import createMDX from '@next/mdx'
 import remarkGfm from 'remark-gfm'
 import rehypeSlug from 'rehype-slug'
 import rehypeAutolinkHeadings from 'rehype-autolink-headings'
-import rehypePrettyCode from 'rehype-pretty-code'
-
-/** @type {import('rehype-pretty-code').Options} */
-const prettyCodeOptions = {
-  theme: {
-    dark: 'github-dark',
-    light: 'github-light',
-  },
-  keepBackground: false,
-}
+import rehypeShiki from '@shikijs/rehype'
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -31,7 +22,13 @@ const withMDX = createMDX({
     rehypePlugins: [
       rehypeSlug,
       [rehypeAutolinkHeadings, { behavior: 'wrap' }],
-      [rehypePrettyCode, prettyCodeOptions],
+      [rehypeShiki, {
+        themes: {
+          dark: 'github-dark',
+          light: 'github-light',
+        },
+        defaultColor: false,
+      }],
     ],
   },
 })

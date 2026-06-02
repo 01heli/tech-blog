@@ -1,7 +1,7 @@
 import { compileMDX } from 'next-mdx-remote/rsc';
 import remarkGfm from 'remark-gfm';
 import rehypeSlug from 'rehype-slug';
-import rehypePrettyCode from 'rehype-pretty-code';
+import rehypeShiki from '@shikijs/rehype';
 import { Callout } from './Callout';
 import { CodeBlock } from './CodeBlock';
 
@@ -19,13 +19,13 @@ export async function ArticleContent({ content }: ArticleContentProps) {
           rehypePlugins: [
             rehypeSlug,
             [
-              rehypePrettyCode,
+              rehypeShiki,
               {
-                theme: {
+                themes: {
                   dark: 'github-dark',
                   light: 'github-light',
                 },
-                keepBackground: false,
+                defaultColor: false,
               },
             ],
           ],
@@ -41,7 +41,8 @@ export async function ArticleContent({ content }: ArticleContentProps) {
             children.props
           ) {
             const childProps = children.props as Record<string, unknown>;
-            return <CodeBlock {...childProps} />;
+            // @shikijs/rehype puts data-language on <pre>, merge it down
+            return <CodeBlock {...childProps} data-language={props['data-language'] || childProps['data-language']} />;
           }
           return <pre {...props}>{children}</pre>;
         },
