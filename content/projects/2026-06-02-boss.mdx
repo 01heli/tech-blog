@@ -1,13 +1,41 @@
 ---
-title: BOSS 直聘爬虫
-description: 基于 DrissionPage 的 BOSS 直聘岗位爬虫，绕过反爬检测，实现登录态保持、搜索筛选、全量详情抓取
-date: '2026-06-02 23:50:36'
+title: BOSS 直聘爬虫 + 数据可视化系统
+description: 基于 Playwright 的 BOSS 直聘岗位爬虫 + FastAPI REST API + Next.js 可视化仪表盘，覆盖反爬绕过、多城市批量抓取、自动数据清洗、交互式图表分析
+date: '2026-06-06 01:23:29'
 status: 进行中
 techStack:
   - Python 3.13
-  - DrissionPage
-  - Microsoft Edge CDP
+  - Playwright
+  - FastAPI
+  - SQLite (WAL)
+  - Next.js 16
+  - React 19
+  - Recharts
+  - Tailwind CSS v4
 ---
+
+## 2026-06-06 01:23:29
+
+- **修复 location 字段全空的问题** — `parse_location()` 依赖 "XX区" 模式提取区级地点，但 `location_raw` 只有城市名，导致 `cleaned_jobs.location` 全员为空。我在 `scraper.py` 的 `_parse_all_fields` 中增加了回退逻辑：当 `location_raw` 提取不到区级信息时，改用 `address` 字段（如"深圳南山区科技园"）重新提取。写了一次性回填脚本，从 `raw_jobs.address` 中重新解析并 UPDATE `cleaned_jobs.location`，476/534 条（89%）成功补全。剩余 58 条 address 不含 "区" 字，区级信息确实缺失。
+  - 顺便修复了 Edit 过程中不慎将 `if` 语句塞进 dict 字面量导致的语法错误。
+
+- **FastAPI 后端搭建完成** — 新建 `api/` 包，实现 10 个 REST 端点。核心文件：[api/main.py](f:\claude_project\boss_ai\api\main.py)（FastAPI 入口 + CORS 中间件）、[api/utils/db_queries.py](f:\claude_project\boss_ai\api\utils\db_queries.py)（7 个 SQLite 聚合查询函数，用 `json_each(tech_stack)` 实现 JSON 数组展开分组）、[api/routers/](f:\claude_project\boss_ai\api\routers)（stats/jobs/analytics 三个路由模块）。CORS 开放 localhost:3000-3001，SQLite 开启 WAL 模式保证爬虫和仪表盘并发读写不互斥。当前数据：534 条岗位，平均月薪 17.7k，中位数 14.5k，Top 技术栈 Python（304 次），Top 城市深圳（123 条）。
+
+- **Next.js 可视化仪表盘** — 新建 `dashboard/` 项目（Next.js 16.2.7 + React 19.2.4 + TypeScript + Tailwind CSS v4），通过 `create-next-app` 脚手架搭建后实现 3 个页面和 6 个图表组件。
+  - 仪表盘总览（`app/page.tsx`）：4 张统计卡片 + 薪资直方图 + 学历环形图 + 技术栈横向柱状图 + 城市柱状图 + 经验 vs 薪资散点图。数据获取用 SWR，loading 用 Skeleton 占位。
+  - 岗位列表（`app/jobs/page.tsx`）：城市/关键词/技术栈/薪资/学历 7 个筛选条件动态拼 SQL，分页，大屏表格 + 小屏卡片自适应。
+  - 岗位详情（`app/jobs/[id]/page.tsx`）：完整职位描述 + 技术栈标签 + 元信息卡片 + BOSS 直聘源链接。
+  - 暗色模式（`hooks/useDarkMode.ts`）：Tailwind `dark` class 策略 + localStorage 持久化 + `prefers-color-scheme` 自动检测。
+  - 前端全部组件 TypeScript 严格模式，`lib/types.ts` 与 Pydantic 模型一一对应，`lib/api.ts` 封装 SWR fetcher 带泛型。
+
+- **TypeScript 和 Windows 编码问题修复** —
+  - Recharts Tooltip formatter 类型不兼容：Recharts 内部类型为 `ValueType | undefined`，与显式 `number` 注解冲突，5 个图表组件统一改用 `(value: any, name: any)` 补 `eslint-disable` 消掉。
+  - OverviewCards 联合类型报错：动态 array mapping 中 `format` 函数签名不同（`number→string` vs `string+data→string`），替换为 4 个显式 `<StatCard>` 组件消除类型歧义。
+  - GBK 控制台崩溃：`uvicorn` 启动时 emoji 字符（📂）在 Windows GBK 编码下抛出 `UnicodeEncodeError`，移除所有 emoji 字符改为纯英文日志。
+  - 端口冲突：前一次会话残留的后台进程（PID 3332 占 8000、PID 9804 占 3001）导致 `uvicorn` 和 `npm run dev` 均启动失败，`taskkill /F` 杀掉后恢复正常。
+
+- **推送 GitHub 并更新 README** — [github.com/01heli/boss_ai](https://github.com/01heli/boss_ai)（commit `aa9ce1e`），共 53 个文件。`.gitignore` 排除了 `data/`、`node_modules/`、`edge_profile/`、`session.json`。README 全面改写为当前架构的完整文档，覆盖爬虫/API/仪表盘的使用步骤、数据库表结构、10 个 API 端点说明和 config.py 配置指南。
+
 ## 2026-06-02 23:50:36
 
 - **从 Playwright 迁移到 DrissionPage 绕过反爬** — BOSS 直聘对 Playwright 的自动化注入检测非常敏感，即使使用 `channel="msedge"` + `launch_persistent_context` 也会被识别为 webdriver 并跳转到 `about:blank`。DrissionPage 通过原生 CDP 协议控制浏览器，不注入任何自动化标记，成功绕过检测
