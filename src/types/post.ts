@@ -6,7 +6,10 @@ export type Category =
   | 'Go'
   | 'Python'
   | 'Kubernetes'
+  | 'System'
   | 'System Design'
+  | 'AI'
+  | 'Database'
   | 'DevOps'
   | 'Frontend'
   | 'Network';

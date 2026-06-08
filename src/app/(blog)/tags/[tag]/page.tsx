@@ -8,6 +8,8 @@ import { getPostsByTag, getAllTags } from '@/lib/posts';
 import { withViewCounts } from '@/lib/views';
 import { SITE } from '@/constants/site';
 
+export const revalidate = 300;
+
 interface PageProps {
   params: { tag: string };
 }

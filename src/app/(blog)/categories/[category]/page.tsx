@@ -9,6 +9,8 @@ import { withViewCounts } from '@/lib/views';
 import { CATEGORIES, getCategoryBySlug } from '@/constants/categories';
 import { SITE } from '@/constants/site';
 
+export const revalidate = 300;
+
 interface PageProps {
   params: { category: string };
 }

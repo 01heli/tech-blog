@@ -5,7 +5,8 @@ export async function getViewCount(slug: string): Promise<number> {
   try {
     const row = await prisma.articleView.findUnique({ where: { slug } });
     return row?.count ?? 0;
-  } catch {
+  } catch (err) {
+    console.error(`[views] getViewCount("${slug}") failed:`, err);
     return 0;
   }
 }
@@ -21,7 +22,8 @@ export async function getViewCounts(slugs: string[]): Promise<Map<string, number
       map.set(r.slug, r.count);
     }
     return map;
-  } catch {
+  } catch (err) {
+    console.error('[views] getViewCounts failed:', err);
     return new Map();
   }
 }
@@ -34,7 +36,8 @@ export async function incrementViewCount(slug: string): Promise<number> {
       update: { count: { increment: 1 } },
     });
     return row.count;
-  } catch {
+  } catch (err) {
+    console.error(`[views] incrementViewCount("${slug}") failed:`, err);
     return 0;
   }
 }

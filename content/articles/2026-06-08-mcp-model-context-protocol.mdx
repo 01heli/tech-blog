@@ -1,0 +1,656 @@
+---
+title: AI 工具的「USB-C 时代」——Model Context Protocol（MCP）从入门到上手
+description: 从「每接一个工具写一套胶水代码」的痛点讲起，深入解析 MCP 的架构、核心原语、开发实战，以及它与 Function Calling 和 A2A 的区别，帮你理解 AI Agent 互联的通用协议标准。
+date: '2026-06-08'
+category: AI
+tags:
+  - MCP
+  - Model Context Protocol
+  - AI Agent
+  - Function Calling
+  - A2A
+  - LLM
+  - tool-calling
+featured: true
+---
+
+## 开篇：一个"每接一个 API 就写一套胶水代码"的故事
+
+假设你最近迷上了 AI 编程助手。你希望它能直接帮你查数据库、搜公司内部文档、甚至调用 Jira 创建工单。
+
+第一天，你接了一个天气 API：
+
+```python
+def get_weather(city: str) -> str:
+    # 自己封装 HTTP 请求，定义 JSON Schema，写错误处理……
+    ...
+```
+
+第二天，你又想加一个数据库查询功能。于是你又写了一套胶水代码：定义函数、注册到模型、处理参数转换、处理返回格式。第三天是 Slack 消息发送，第四天是 GitHub Issue 查询……
+
+你很快发现一个让人崩溃的事实：**每一个新工具，你都要从头写适配代码**。这些代码做的事情本质上完全一样——把"大模型的理解"翻译成"工具的调用"，再把"工具的返回"翻译成"大模型能懂的格式"。但因为每个工具长得不一样（有的用 REST，有的用 gRPC，有的走命令行），你没法复用任何东西。
+
+这就是 **M×N 适配噩梦**：M 个模型 × N 个工具 = M×N 套胶水代码。
+
+```
+       ┌───────────────┐
+       │   Claude      │──┬── 天气API胶水代码
+       └───────────────┘  ├── 数据库胶水代码
+                          ├── GitHub胶水代码
+       ┌───────────────┐  ├── Slack胶水代码
+       │   GPT         │──┼── 天气API胶水代码  ← 都重写一遍
+       └───────────────┘  ├── 数据库胶水代码
+                          ├── ...
+```
+
+2024 年 11 月，Anthropic 开源了 **Model Context Protocol（MCP）**，试图成为这个问题的终结者。它的口号很直接：**"AI 应用的 USB-C 接口"**。就像 USB-C 让所有设备共用一个物理接口一样，MCP 让所有 AI 应用通过一个协议接入所有工具。
+
+这篇文章会讲清楚：MCP 到底是什么、怎么工作的、和已有的 Function Calling 以及后来的 A2A 是什么关系、以及你该怎么上手。
+
+> 对于本文的时效性做一个说明：MCP 规范在快速迭代中，从 2024 年 11 月发布至今（2026 年 6 月），已经经历了 4 个主要版本。2025 年 12 月，Anthropic 将 MCP 捐赠给了 Linux 基金会旗下的 **Agentic AI Foundation**，由社区共同维护。本文基于截至写作时的最新规范 `2025-06-18` 版本。
+
+## 什么是 MCP？
+
+### 一句话定义
+
+**MCP 是一个开放协议，定义了 AI 应用（Host/Client）如何发现和调用外部工具/数据源（Server）的标准化方式。**
+
+拆开来看：
+
+- **开放协议**：不是 Anthropic 一家的私有标准，任何人都可以实现和扩展
+- **标准化**：不管你用什么模型（Claude、GPT、Gemini）、什么语言（Python、TypeScript、Go、Java），只要遵守 MCP 协议，就能互相通信
+- **发现**：不需要手动注册函数——AI 应用能自动发现 Server 提供了哪些工具
+- **调用**：大模型决定"我要用哪个工具"，然后通过 Client → Server 这条标准化通道发出调用
+
+### 为什么叫"USB-C 时刻"？
+
+USB-C 出现之前，不同设备用不同接口：鼠标用 PS/2、打印机用并口、U 盘用 USB-A、显示器用 VGA/DVI/HDMI。你需要一堆转换头。
+
+MCP 出现之前，每个 AI 应用对接每个工具都是一对一"硬编码"：你得针对 Claude 的 API 格式写一套工具描述，针对 GPT 的 API 再写一套，两个格式还不一样。
+
+MCP 改变了这个模型：**工具开发者只写一次 MCP Server，所有支持 MCP 的 AI 应用都能自动发现并使用它。** 复杂度从 M×N 降到了 M+N：
+
+```
+MCP之前:  M个应用 × N个工具 = M×N 条连接线
+MCP之后:  M个应用 + N个工具 = M+N 条连接线（每个应用只需连MCP, 每个工具只需实现一次）
+```
+
+### 谁在支持 MCP？
+
+| 厂商/产品 | 支持情况 |
+|-----------|---------|
+| **Anthropic** | 首发者——Claude Desktop、Claude Code、Claude.ai 原生支持 |
+| **OpenAI** | 2025 年 3 月宣布支持——ChatGPT Desktop、Responses API、Realtime API |
+| **Google** | Gemini SDK 原生支持 MCP |
+| **Microsoft** | Azure OpenAI、Semantic Kernel、VS Code（2025 年 6 月全面支持） |
+| **Meta** | Llama 模型接入 MCP 生态 |
+| **其他** | Cursor、Sourcegraph、Replit、Cloudflare、Block 等均已支持 |
+
+2025 年底，MCP 已经有了**数千个可用的 MCP Server**，覆盖数据库、API 网关、文件系统、搜索引擎、项目管理工具等领域。
+
+## MCP 的架构：Host → Client → Server
+
+MCP 遵循严格的**三层架构**：
+
+```
+┌──────────────────────────────────────────────────┐
+│                   MCP Host                        │
+│   (Claude Desktop / VS Code / Cursor / 你的App)    │
+│                                                   │
+│   ┌─────────────┐  ┌─────────────┐  ┌──────────┐ │
+│   │ MCP Client  │  │ MCP Client  │  │MCP Client│ │
+│   │  (连接器)    │  │  (连接器)    │  │ (连接器)  │ │
+│   └──────┬──────┘  └──────┬──────┘  └─────┬────┘ │
+└──────────┼────────────────┼───────────────┼──────┘
+           │                │               │
+     ┌─────▼─────┐   ┌──────▼──────┐  ┌─────▼──────┐
+     │   MCP     │   │    MCP      │  │    MCP     │
+     │  Server   │   │   Server    │  │   Server   │
+     │  (天气)    │   │  (数据库)    │  │ (GitHub)   │
+     └───────────┘   └─────────────┘  └────────────┘
+```
+
+三个角色的分工：
+
+| 组件 | 职责 | 类比 |
+|------|------|------|
+| **MCP Host** | AI 应用本身——接收用户输入，调用大模型，展示结果 | 手机 |
+| **MCP Client** | Host 和 Server 之间的"翻译器"，维护 1:1 连接 | 手机的 USB-C 控制器芯片 |
+| **MCP Server** | 具体的工具/数据源实现——暴露能力，执行操作 | 插入的 U 盘 / 显示器 / 充电器 |
+
+**关键设计：一个 Client 只连接一个 Server**。如果是本地 Server（通过标准输入/输出通信），一个 Server 也只服务一个 Client。远程 Server 可以通过 HTTP 同时服务多个 Client。
+
+### 两层协议
+
+MCP 在协议层面分为两层：
+
+```
+┌──────────────────────────────────┐
+│      数据层 (JSON-RPC 2.0)       │  ← 定义"说什么"（消息格式）
+│  Tools / Resources / Prompts     │
+│  Sampling / Elicitation          │
+│  生命周期管理、能力协商            │
+└──────────────────────────────────┘
+┌──────────────────────────────────┐
+│      传输层 (Transport)          │  ← 定义"怎么说"（通信方式）
+│  stdio (本地子进程)               │
+│  Streamable HTTP (远程服务)       │
+└──────────────────────────────────┘
+```
+
+**数据层**基于 JSON-RPC 2.0——一个非常简单的 RPC 协议。如果你写过 JSON-RPC，你会发现 MCP 的消息格式很眼熟：`{"jsonrpc": "2.0", "method": "xxx", "params": {...}, "id": 1}`。
+
+**传输层**有两种选择：
+- **stdio**：Server 是一个本地子进程，通过标准输入/输出收发 JSON。零网络开销、单客户端。适合本地工具（文件系统操作、本地数据库等）。
+- **Streamable HTTP**：Server 通过 HTTP 对外暴露，Client 用 HTTP POST 发送请求。支持认证（OAuth 2.1）、多客户端。适合远程服务（第三方 API 代理、企业内部服务）。
+
+## MCP 的四大核心原语
+
+MCP Server 可以对外暴露四种能力，分为两类：
+
+### Server 提供的能力（Server → Client）
+
+| 原语 | 作用 | 一句话类比 |
+|------|------|-----------|
+| **Tools**（工具） | 大模型可调用的可执行函数 | REST 的 POST——有副作用，执行操作 |
+| **Resources**（资源） | 大模型可以读取的结构化数据 | REST 的 GET——只读，不做修改 |
+| **Prompts**（提示模板） | 预定义的、可参数化的交互模板 | 快捷指令 / 命令行别名 |
+
+### Client 提供的能力（Client → Server）
+
+| 原语 | 作用 | 一句话类比 |
+|------|------|-----------|
+| **Sampling**（采样） | Server 可以请求 Client 调用大模型生成内容 | "你帮我问问 LLM 这事怎么看" |
+| **Elicitation**（引导） | Server 可以请求用户输入额外信息 | "你帮我问一下用户，让他确认一下这个操作" |
+
+下面逐一展开。
+
+### Tools（工具）：让大模型"行动"
+
+Tools 是 MCP 最核心的原语。每个 Tool 定义了三件事：
+
+1. **名称和描述**：告诉大模型"我是干什么的"
+2. **输入 Schema**：用 JSON Schema 定义参数（名称、类型、是否必填、描述）
+3. **执行逻辑**：真正调用 API / 查数据库 / 操作文件的代码
+
+以下面这个天气查询工具为例：
+
+```typescript
+server.tool(
+  "get_weather",                        // 工具名称
+  "获取指定城市的当前天气和预报信息",       // 描述——大模型靠这个理解"什么时候该用我"
+  {
+    city: z.string().describe("城市名称，如 'Beijing' 或 'Tokyo'"),
+    unit: z.enum(["celsius", "fahrenheit"]).default("celsius")
+      .describe("温度单位")
+  },
+  async ({ city, unit }) => {
+    const weather = await fetchWeatherAPI(city, unit);
+    return {
+      content: [{
+        type: "text",
+        text: `${city}当前气温 ${weather.temp}°${unit === "celsius" ? "C" : "F"}，${weather.description}`
+      }]
+    };
+  }
+);
+```
+
+当大模型判断"用户想知道北京的天气"时，它不会自己去发 HTTP 请求——它告诉 Host："请调用 `get_weather` 工具，参数是 `city='Beijing', unit='celsius'`"。Host 通过 Client 把调用发给 Server，Server 执行后返回结果，Host 把结果塞回对话上下文，大模型再根据结果生成自然语言回答。
+
+整个流程：
+
+```
+用户："北京今天天气怎么样？"
+  ↓
+Host 把用户消息 + 可用工具列表发给大模型
+  ↓
+大模型：应该调用 get_weather(city="Beijing")
+  ↓
+Host → Client → Server: 调用 get_weather
+  ↓
+Server 执行 API 请求，返回结果
+  ↓
+Host 把结果加入对话上下文，再发给大模型
+  ↓
+大模型："北京今天晴，气温22°C，适合户外活动。"
+```
+
+### Resources（资源）：让大模型"看到"数据
+
+Tools 是"做事"，Resources 是"看到数据"。Resources 暴露的是**上下文数据**——文件内容、数据库记录、API 响应、实时日志等。
+
+```typescript
+server.resource(
+  "config",                              // 资源名称
+  new ResourceTemplate("config://{key}", { list: undefined }),
+  async (uri, { key }) => ({
+    contents: [{
+      uri: uri.href,
+      mimeType: "application/json",
+      text: JSON.stringify(configStore.get(key))
+    }]
+  })
+);
+```
+
+Resources 与 Tools 的核心区别：
+
+| | Tools | Resources |
+|------|-------|----------|
+| **语义** | 执行操作（有副作用） | 读取数据（只读） |
+| **何时用** | 发消息、创建工单、修改文件 | 查配置、读日志、获取文档 |
+| **类比** | REST POST / PUT | REST GET |
+| **大模型的视角** | "我要做这件事" | "我需要了解这个信息" |
+
+### Prompts（提示模板）：预定义的交互模式
+
+Prompts 是一组预先设计好的对话模板，让用户或开发者一键触发特定工作流：
+
+```typescript
+server.prompt(
+  "review-code",                         // 模板名称
+  "让大模型对指定代码进行安全审查",        // 描述
+  {
+    code: z.string().describe("要审查的代码"),
+    language: z.string().describe("编程语言")
+  },
+  ({ code, language }) => ({
+    messages: [{
+      role: "user",
+      content: {
+        type: "text",
+        text: `请审查以下 ${language} 代码的安全漏洞和潜在问题：\n\n\`\`\`${language}\n${code}\n\`\`\`\n\n请从以下维度分析：\n1. SQL注入\n2. XSS攻击\n3. 敏感信息泄露\n4. 越权风险`
+      }
+    }]
+  })
+);
+```
+
+有了这个 Prompt 模板，用户只需说"用 review-code 审查这段代码"，大模型就会套用预定义的分析维度，输出结构化的审查结果。不需要每次都手打一大段提示词。
+
+### Sampling（采样）：让 Server 反问大模型
+
+这是 MCP 设计中最巧妙的部分之一——**Server 不需要内置任何 AI 能力，但它可以"借用"Host 的大模型**。
+
+比如，一个代码审查 MCP Server 需要对代码做多轮分析：
+
+```
+Server 收到代码
+  → 第一轮：用 Sampling 请求 Host 的大模型"找出所有潜在漏洞"
+  → Server 对结果做去重和过滤
+  → 第二轮：再用 Sampling 请求大模型"对每个漏洞做攻击链分析"
+  → 返回最终审查报告
+```
+
+Server 自己不需要运行任何模型——它借 Host 的大模型来完成推理任务。
+
+### 一次典型会话的完整流程
+
+结合所有原语，一次 MCP 会话的完整步骤是：
+
+```
+1. 初始化与能力协商
+   Client → Server: initialize（告诉 Server 我支持什么）
+   Server → Client: 我的能力：Tools ✓, Resources ✓, Prompts ✗
+
+2. 发现
+   Client → Server: tools/list    → 返回可用工具列表
+   Client → Server: resources/list → 返回可用资源列表
+
+3. 运行
+   用户提问 → Host 发大模型 → 大模型决定调用 tool → Client 调用 Server
+   或：大模型需要上下文 → Client 读取 Resource
+   或：Server 需要推理 → Server 发起 Sampling 请求
+
+4. 实时更新
+   Server → Client: notifications/tools/list_changed（工具列表变了）
+   Host 收到通知后，重新获取 tools/list
+```
+
+> Server **不能**读取完整对话上下文，也不能看到其他 Server 的数据。每个 Server 只收到它需要的那部分信息。Host 负责所有安全边界——这是 MCP 安全模型的核心。
+
+## 横向对比：MCP vs Function Calling vs A2A
+
+MCP 不是凭空发明的。在它之前有 **Function Calling**（2023 年 6 月 OpenAI 首发），在它之后有 **A2A**（2025 年 3 月 Google 推出）。三者经常被放在一起讨论，但解决的是完全不同层次的问题。
+
+### 三句话定位
+
+| 协议 | 一句话 |
+|------|--------|
+| **Function Calling** | 让大模型"打一次电话"调用一个外部工具 |
+| **MCP** | 让大模型通过"标准万能接口"接入所有工具 |
+| **A2A** | 让多个 AI Agent 像"项目组"一样分工协作 |
+
+### 用工厂流水线类比
+
+> **Function Calling** = 给机器人一本电话簿，它能按需打电话给某个部门。
+>
+> **MCP** = 给机器人装上 USB-C 万能接口，什么工具插上都能用，再也不用为每个设备买转换头。
+>
+> **A2A** = 一座车间里，每个工位的机器人都接好了 MCP 工具，它们之间通过 A2A 沟通："我组装完发动机了，喷漆工位该你了。""收到，我这儿还要 2 分钟。"
+
+### 技术维度对比
+
+| 维度 | Function Calling | MCP | A2A |
+|------|-----------------|-----|-----|
+| **首发方** | OpenAI (2023.6) | Anthropic (2024.11) | Google (2025.3) |
+| **解决的层次** | 模型 ↔ 单个工具 | 模型 ↔ 多工具标准化 | Agent ↔ Agent 协作 |
+| **架构** | 请求-响应（单次调用） | Client-Server（持久连接） | 服务网格（消息路由） |
+| **工具发现** | 手动注册 JSON Schema | 自动发现（`tools/list`） | 通过 Agent Card 元数据发现 |
+| **工具复用** | 每个模型接每个工具要单独适配 | 写一次 MCP Server，所有 MCP Host 通用 | 不涉及工具复用 |
+| **部署复杂度** | 低（单进程） | 中等（需部署 MCP Server 进程） | 高（需消息中间件 + 注册中心） |
+| **链式调用** | 不原生支持（需开发者编排） | 支持 | 支持（跨 Agent 任务委派） |
+| **状态** | 无状态，每次调用独立 | 有状态（会话级连接） | 有状态（任务级状态管理） |
+| **延迟** | 100-500ms | 200-800ms | 500ms-3s |
+
+### 三者的层次关系
+
+三者不是竞争关系，而是不同抽象层的互补：
+
+```
+┌──────────────────────────────────────────────────┐
+│               A2A 层（Agent 协作）                  │
+│    Agent A ←──→ Agent B ←──→ Agent C             │
+│    每个 Agent 知道"该找谁帮忙"                      │
+└──────────────────┬───────────────────────────────┘
+                   │ 每个 Agent 内部用 MCP 接工具
+┌──────────────────▼───────────────────────────────┐
+│               MCP 层（工具标准化）                  │
+│    天气 Server   数据库 Server   GitHub Server    │
+│    所有 MCP Host 都能用，不管里面跑的是哪个模型      │
+└──────────────────┬───────────────────────────────┘
+                   │ 底层调用机制
+┌──────────────────▼───────────────────────────────┐
+│          Function Calling 层（单次调用）            │
+│    LLM 理解意图 → 生成结构化参数 → 调用函数          │
+│    本质上是 MCP Tools 调用的底层实现机制             │
+└──────────────────────────────────────────────────┘
+```
+
+> **关键认知**：大多数 MCP Server 内部本质上还是通过 Function Calling 机制运作的——大模型看到"哦，有个叫 get_weather 的工具，参数是 city"，然后生成结构化调用。**MCP 并没有取代 Function Calling，而是在它之上加了一层标准化封装**，解决了"每个模型、每个工具都要单独适配"的问题。
+
+### 什么时候用什么？
+
+| 场景 | 推荐 |
+|------|------|
+| 在一个 App 里让大模型调用 1-2 个简单 API | Function Calling 直接上 |
+| 需要多个工具、多个模型、或团队间复用工具 | **MCP** |
+| 需要多个 AI Agent 分工协作完成一个复杂任务 | **A2A**（每个 Agent 内部配合 MCP） |
+| 快速原型验证 | Function Calling |
+| 企业级可扩展平台 | **MCP + A2A** 组合 |
+
+## 动手实践：构建你的第一个 MCP Server
+
+说了这么多理论，来动手写一个。我们用 TypeScript（官方 SDK 支持最好的语言），做一个"笔记管理" MCP Server——支持创建笔记、列出所有笔记、读取笔记内容。
+
+### 环境准备
+
+```bash
+mkdir mcp-notes-server && cd mcp-notes-server
+npm init -y
+npm install @modelcontextprotocol/sdk zod
+npm install -D typescript @types/node
+```
+
+### 编写 Server
+
+创建 `src/index.ts`：
+
+```typescript
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+// 用一个简单的 Map 当笔记存储（实际项目会用数据库）
+const notes = new Map<string, { title: string; content: string; createdAt: string }>();
+
+// 创建 MCP Server 实例
+const server = new McpServer({
+  name: "notes-server",
+  version: "1.0.0"
+});
+
+// ─── Tool 1: 创建笔记 ───
+server.tool(
+  "create_note",
+  "创建一篇新笔记。当你需要帮用户记录想法、保存信息时使用。",
+  {
+    title: z.string().describe("笔记标题"),
+    content: z.string().describe("笔记正文内容"),
+    tags: z.array(z.string()).optional().describe("可选的标签列表")
+  },
+  async ({ title, content, tags }) => {
+    const id = `note_${Date.now()}`;
+    notes.set(id, {
+      title,
+      content: tags ? `标签: ${tags.join(", ")}\n\n${content}` : content,
+      createdAt: new Date().toISOString()
+    });
+    return {
+      content: [{
+        type: "text",
+        text: `笔记创建成功！ID: ${id}\n标题: ${title}\n标签: ${tags?.join(", ") || "无"}`
+      }]
+    };
+  }
+);
+
+// ─── Tool 2: 搜索笔记 ───
+server.tool(
+  "search_notes",
+  "在所有笔记中搜索包含指定关键词的笔记。",
+  {
+    keyword: z.string().describe("搜索关键词")
+  },
+  async ({ keyword }) => {
+    const results: string[] = [];
+    for (const [id, note] of notes) {
+      if (note.title.includes(keyword) || note.content.includes(keyword)) {
+        results.push(`- [${id}] ${note.title} (${note.createdAt})`);
+      }
+    }
+    return {
+      content: [{
+        type: "text",
+        text: results.length > 0
+          ? `找到 ${results.length} 篇笔记：\n${results.join("\n")}`
+          : `没有找到包含 "${keyword}" 的笔记。`
+      }]
+    };
+  }
+);
+
+// ─── Tool 3: 列出所有笔记 ───
+server.tool(
+  "list_notes",
+  "列出所有笔记的标题和 ID。需要概览笔记列表时使用。",
+  {},
+  async () => {
+    const list = Array.from(notes.entries()).map(([id, note]) =>
+      `- [${id}] ${note.title}`
+    );
+    return {
+      content: [{
+        type: "text",
+        text: list.length > 0 ? `共 ${list.length} 篇笔记：\n${list.join("\n")}` : "还没有任何笔记。"
+      }]
+    };
+  }
+);
+
+// ─── Resource: 读取单篇笔记 ───
+server.resource(
+  "note",
+  new ResourceTemplate("note://{id}", { list: undefined }),
+  async (uri, { id }) => {
+    const note = notes.get(id as string);
+    if (!note) {
+      return { contents: [{ uri: uri.href, text: "笔记不存在。" }] };
+    }
+    return {
+      contents: [{
+        uri: uri.href,
+        mimeType: "text/plain",
+        text: `标题: ${note.title}\n创建时间: ${note.createdAt}\n\n${note.content}`
+      }]
+    };
+  }
+);
+
+// ─── 启动 Server ───
+const transport = new StdioServerTransport();
+await server.connect(transport);
+```
+
+编译并运行：
+
+```bash
+npx tsc src/index.ts --outDir dist --module NodeNext --moduleResolution NodeNext
+node dist/index.js
+```
+
+### 配置 Claude Desktop 使用这个 Server
+
+在 Claude Desktop 的配置文件（`claude_desktop_config.json`）中添加：
+
+```json
+{
+  "mcpServers": {
+    "notes": {
+      "command": "node",
+      "args": ["/path/to/mcp-notes-server/dist/index.js"]
+    }
+  }
+}
+```
+
+重启 Claude Desktop 后，你就可以直接跟它说：
+
+- "帮我把今天开会讨论的三个要点记成笔记"
+- "搜索包含'部署'关键词的笔记"
+- "列出我所有的笔记"
+
+Claude 会自动发现你的 `notes-server` 提供的三个工具和一个资源，并在需要时调用它们。
+
+### 测试 Server（不用 Claude Desktop）
+
+MCP 官方提供了一个 **MCP Inspector** 工具，可以在不启动任何 AI 应用的情况下测试你的 Server：
+
+```bash
+npx @modelcontextprotocol/inspector node dist/index.js
+```
+
+它会打开一个 Web 页面，你可以：
+- 查看 Server 注册的所有 Tools / Resources / Prompts
+- 手动填写参数调用 Tool，查看返回值
+- 检查错误处理和边界情况
+
+这对调试非常有帮助——你可以先确保 Server 本身是正常的，再接入 AI 应用。
+
+## 构建 MCP Server 的最佳实践
+
+### 1. 工具描述决定一切
+
+大模型是靠**工具名称和描述**来决定什么时候调用哪个工具的。描述写得太模糊，模型就会乱调：
+
+```typescript
+// 不好的描述——太模糊
+server.tool("search", "search something", ...)
+
+// 好的描述——说清楚"什么时候用"、"输入什么"、"返回什么"
+server.tool(
+  "search_notes",
+  "在笔记中搜索包含指定关键词的内容。当用户问'我记过什么关于XX的笔记'或'帮我找之前的XX记录'时使用。返回匹配的笔记列表（ID、标题、创建时间）。",
+  ...
+)
+```
+
+### 2. 错误信息要让大模型能"自我纠正"
+
+如果参数校验失败，返回**结构化的、可操作的错误信息**，而不是直接抛异常堆栈：
+
+```typescript
+// 不推荐
+throw new Error("Invalid city name");  // 模型拿到这个没法修正
+
+// 推荐
+return {
+  content: [{ type: "text", text: "城市名称不在支持列表中。" }],
+  isError: true
+};
+// 附带一个 list_cities 工具的建议
+```
+
+大模型看到清晰的错误提示后，可能会自动修正参数后重试。
+
+### 3. 安全三原则
+
+- **输入校验**：不要信任来自 Client 的任何参数。所有输入都应在 Server 端再次校验。
+- **最小编译单元**：每个 MCP Server 只暴露最少、最必要的操作。不要写一个"万能 Server"。
+- **Sandbox**：如果 Server 执行的是用户提供的代码（如代码执行沙箱），一定要在容器或隔离环境中运行。
+
+### 4. 传输选择
+
+| 场景 | 推荐传输 |
+|------|---------|
+| 本地工具（文件操作、本地数据库） | stdio |
+| 远程服务（第三方 API 代理） | Streamable HTTP |
+| 多人共享的企业内部服务 | Streamable HTTP + OAuth 2.1 |
+
+## 总结与建议
+
+MCP 解决的问题其实很简单：**让 AI 应用接入工具这个动作，从"每次手工接线"变成"插 USB 一样即插即用"**。
+
+协议本身不难——JSON-RPC 2.0 + 标准的 Tool/Resource/Prompt 定义。真正的价值在于**网络效应**：当越来越多的工具实现了 MCP，新加入的 AI 应用不需要任何额外开发就能直接使用所有这些工具。
+
+针对不同角色的建议：
+
+**工具开发者**（写 API、数据库、内部服务的人）：学会把已有功能封装成 MCP Server。TypeScript SDK 最成熟，Python SDK 正在追赶。从最简单的 stdio Server 开始——一个 `McpServer` 实例 + 几个 `server.tool()` 调用 + `StdioServerTransport`，一个下午就能搞出来一个可用的。
+
+**AI 应用开发者**：在项目里优先选用支持 MCP 的工具。不要自己写天气预报的函数包装——去找一个已有的 MCP Weather Server。不要手写数据库查询工具——去连接 MCP PostgreSQL Server。你专注于业务逻辑和用户体验，工具接入交给 MCP。
+
+**架构师/技术负责人**：MCP 不是银弹——它适合工具级别的标准化。如果你们团队需要的是多个 AI Agent 之间的任务协调和状态同步，那需要关注 A2A（Agent-to-Agent Protocol）。对于大多数"让 AI 助手能用更多工具"的需求，MCP + Function Calling 的组合是最务实的选择。
+
+**基础架构/SRE**：关注 MCP Server 的运维——连接池管理、速率限制、监控（OpenTelemetry trace）、认证（OAuth 2.1）。远程 MCP Server 本质上是一个微服务，需要同等的可观测性和可靠性保障。
+
+MCP 还年轻——它的 1.0 版本还没有发布。但从 Anthropic 开源它那天（2024 年 11 月）到现在不到两年，它已经从一个"Anthropic 的实验性协议"变成了 AI 行业的事实标准之一。当 OpenAI、Google、Microsoft 都在支持同一个协议的时候，你就知道它大概率不会是一阵风。
+
+**学会写 MCP Server，就是给自己装上通往 AI Agent 世界的 USB-C 接口。**
+
+## 参考资料
+
+### 官方规范与文档
+
+- [Model Context Protocol — Official Specification](https://modelcontextprotocol.io/specification/draft/)（MCP 官方规范，当前最新为 2025-06-18 版本）
+- [MCP Specification — Architecture](https://modelcontextprotocol.io/specification/draft/architecture/index)（MCP 架构的官方说明，Host/Client/Server 三层角色定义）
+- [MCP GitHub — specification](https://github.com/modelcontextprotocol/specification)（MCP 协议规范的 GitHub 仓库，TypeScript 源码为规范的事实来源）
+- [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk)（官方 TypeScript/JavaScript SDK，开发 MCP Server 和 Client 的首选）
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)（官方 Python SDK）
+- [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk)（官方 Go SDK）
+
+### 新闻与背景
+
+- [Anthropic — Introducing the Model Context Protocol](https://www.anthropic.com/news/model-context-protocol)（Anthropic 于 2024 年 11 月发布 MCP 的官方博客，讲清了初衷和愿景）
+- [InfoQ — Anthropic Publishes Model Context Protocol Specification](https://www.infoq.com/news/2024/12/anthropic-model-context-protocol/)（InfoQ 对 MCP 发布的技术报道，含架构分析）
+- [Wikipedia — Model Context Protocol](https://en.wikipedia.org/wiki/Model_Context_Protocol)（维基百科对 MCP 的词条，梳理了发布时间线和产业采用情况）
+- [SD Times — Several new updates make their way into the MCP specification](https://sdtimes.com/ai/several-new-updates-make-their-way-into-the-mcp-specification/)（2025 年 6 月 MCP 重大更新的技术报道）
+
+### 深度文章
+
+- [INNOQ — Building Standardized AI Tools with the Model Context Protocol](https://www.innoq.com/en/articles/2025/03/model-context-protocol/)（德文技术咨询公司 INNOQ 的深度解读，含实际架构图）
+- [Red Hat Developer — Building effective AI agents with MCP](https://developers.redhat.com/articles/2026/01/08/building-effective-ai-agents-mcp)（Red Hat 关于如何构建有效的 MCP AI Agent 的实践文章）
+- [Machine Learning Mastery — The Complete Guide to Model Context Protocol](https://machinelearningmastery.com/the-complete-guide-to-model-context-protocol/)（面向初学者的 MCP 完整指南）
+
+### 对比与选型
+
+- [Zilliz — 谁能统一 Agent 接口？MCP 对比 A2A、Function Calling](https://zilliz.com.cn/blog/Who-Can-Unify-Agent-Interfaces-MCP-A2A-Function-Calling)（向量数据库公司 Zilliz 对三种协议的技术对比）
+- [腾讯云开发者社区 — Function Calling、MCP、A2A 的区别](https://cloud.tencent.cn/developer/article/2526901)（中文社区对三者差异的梳理）
+- [The Great AI Agent Protocol Race — Function Calling vs MCP vs A2A](https://dev.to/zilliz/the-great-ai-agent-protocol-race-function-calling-vs-mcp-vs-a2a-2k5b)（Dev.to 上的通俗对比文章）
+
+### 开发工具与生态
+
+- [MCP Inspector](https://github.com/modelcontextprotocol/inspector)（官方调试工具，无需 AI 应用即可测试 MCP Server）
+- [MCP Tools Cookbook](https://github.com/ydmitry/mcp-tools-cookbook)（MCP 工具模式与最佳实践集合，含多种设计模式参考）
+- [Skywork — MCP Server Enhance-Prompt Best Practices 2025](https://skywork.ai/blog/mcp-server-enhance-prompt-best-practices-2025/)（关于 MCP Prompt 设计的最佳实践总结）
+- [Agentic AI Foundation](https://agenticai.org/)（Linux 基金会下托管 MCP 的联盟，2025 年 12 月成立）

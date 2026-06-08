@@ -1,0 +1,1034 @@
+---
+title: 为什么程序能记住「回家路」？——从函数调用到内存分配，一文讲清堆与栈
+description: 从数据结构到内存模型，从汇编级栈帧到栈溢出攻击，再到堆内存管理与垃圾回收，全面讲清「堆」（heap）和「栈」（stack）这两个每个程序员都必须理解的核心概念。
+date: '2026-06-08'
+category: System
+tags:
+  - stack
+  - heap
+  - memory
+  - call-stack
+  - assembly
+  - buffer-overflow
+  - garbage-collection
+  - data-structure
+featured: true
+---
+
+## 开篇：一个“函数套娃”引发的故事
+
+你有没有见过这行报错？
+
+```
+RangeError: Maximum call stack size exceeded
+```
+
+翻译过来就是"调用栈爆了"。很多初学者第一次见到这个错误时，第一反应是：**栈是什么？我明明只写了几个函数，哪来的"栈"？**
+
+我们先从一个简单的例子说起。假设你正在写一个处理订单的函数：
+
+```python
+def process_order(order_id):
+    user = get_user(order_id)          # 第1步：查用户
+    product = get_product(order_id)    # 第2步：查商品
+    price = calc_price(user, product)  # 第3步：算价格
+    pay(user, price)                   # 第4步：支付
+    return "done"
+```
+
+程序执行到第3步 `calc_price` 的时候，前两步的结果还"悬浮"在某个地方等着被用。`calc_price` 内部可能又调用了 `apply_discount`，`apply_discount` 内部又调用了 `check_coupon`……函数一层套一层，像俄罗斯套娃。
+
+问题是：**当最里层的 `check_coupon` 执行完毕后，程序怎么知道要回到哪里继续执行？** `user`、`product` 这些局部变量又在哪儿存着？
+
+答案就是这篇文章的主角之一——**栈**（Stack）。
+
+但故事还没完。你可能还见过另一个错误：
+
+```
+OutOfMemoryError: Java heap space
+```
+
+这里的 **堆**（Heap）又是怎么回事？它和"数据结构课上的二叉堆"是一回事吗？为什么有的数据放在栈上，有的放在堆上？Java 和 Python 程序员不用 `free`，那堆上的垃圾谁来清理？
+
+"栈"和"堆"这两个名字在不同的上下文中各指好几样东西。栈可以指**数据结构**、**内存区域**、**调用机制**；堆可以指**二叉堆数据结构**、**动态内存区域**。很多教程混在一起讲，初学者越看越糊涂。这篇文章会把它们拆开，逐一讲清，最后再串起来。
+
+## 第一层：栈，作为一个数据结构
+
+### 什么是"后进先出"？
+
+想象你在一家餐厅洗碗。洗好的盘子一个一个摞起来——最先洗的盘子被压在最底下，最后洗的盘子在最上面。你要拿盘子的时候，只能从最上面拿，也就是**最后放上去的盘子最先被拿走**。
+
+这就是栈的核心规则：**LIFO（Last In, First Out，后进先出）**。
+
+在编程里，一个栈只支持两种基本操作：
+
+| 操作 | 含义 | 类比 |
+|------|------|------|
+| **push** | 把一个元素放到栈顶 | 放一个盘子到最上面 |
+| **pop** | 从栈顶取走一个元素 | 从最上面拿走一个盘子 |
+
+此外通常还有 `peek`（看一眼栈顶但不拿走）和 `isEmpty`（判断栈是否为空）。
+
+用 Python 几行代码就能实现一个栈：
+
+```python
+class Stack:
+    def __init__(self):
+        self.items = []
+
+    def push(self, item):
+        self.items.append(item)
+
+    def pop(self):
+        if self.is_empty():
+            raise IndexError("栈空了，不能再pop")
+        return self.items.pop()
+
+    def peek(self):
+        if self.is_empty():
+            return None
+        return self.items[-1]
+
+    def is_empty(self):
+        return len(self.items) == 0
+
+    def size(self):
+        return len(self.items)
+```
+
+来看一个实际操作的例子：
+
+```
+初始状态:  []
+push("A"): ["A"]
+push("B"): ["A", "B"]
+push("C"): ["A", "B", "C"]
+pop():     ["A", "B"]   ← C被取出
+pop():     ["A"]        ← B被取出
+push("D"): ["A", "D"]
+```
+
+你可以看到，最先进入的 "A" 一直沉在栈底，最后进入的总是最先离开。
+
+### 栈数据结构在哪里被用到？
+
+除了课本上的教学示例，栈在真实软件中随处可见：
+
+- **浏览器的前进/后退**：你每访问一个新页面，URL 就被推入历史栈。点"后退"就是 pop 一个 URL，跳回上一页。点"前进"用的是另一个栈（把后退时弹出的 URL 再推回去）。
+- **撤销（Undo）操作**：Word 里打一个字、删一段话，每个操作都 push 到栈里。按 Ctrl+Z 就是 pop 最后一个操作，反转它的效果。
+- **括号匹配**：编译器检查你的 `{`、`[`、`(` 是否成对出现——遇到左括号 push，遇到右括号就 pop 栈顶，看它们是不是一对。
+- **迷宫求解**：走到一个岔路口，把当前位置 push 到栈里，选一条路走。如果走到死胡同，pop 回到上一个岔路口，换另一条路试。这叫**回溯**（backtracking）。
+
+这些场景有一个共同特点：你需要"记住自己到过哪里"，然后按"原路返回"的顺序逐级回溯。这正是栈最适合的事情。
+
+### 中场插曲：堆，作为一个数据结构
+
+在进入内存层的讨论之前，必须先把"数据结构里的堆"讲清楚。因为很多人第一次听到"堆"这个词是在数据结构课上——那个能"随时取出最大/最小值"的神奇二叉树，和内存分配完全不是一码事。
+
+**堆（Heap）作为一种数据结构，是一棵满足"堆性质"的完全二叉树。**
+
+什么叫"堆性质"？分两种情况：
+
+| 类型 | 规则 | 直观理解 |
+|------|------|---------|
+| **最小堆（Min-Heap）** | 每个节点的值都 **小于或等于** 它的子节点 | 根节点永远是最小值 |
+| **最大堆（Max-Heap）** | 每个节点的值都 **大于或等于** 它的子节点 | 根节点永远是最大值 |
+
+注意：堆只保证父子之间的大小关系，**不保证兄弟之间的顺序**。这和二叉搜索树（左子树 < 根 < 右子树）是完全不同的规则。
+
+一个最小堆长这样：
+
+```
+            1              ← 根节点是最小值
+          /   \
+         3     6           ← 3 < 6? 无所谓，只要都比1大就行
+        / \   / \
+       8  10 9  12         ← 同一层的8和10没有大小约定
+      /
+     15                    ← 完全二叉树：节点从左到右紧密排列
+```
+
+堆有两个核心操作，它们都依赖一个叫做 **堆化（heapify）** 的调整过程：
+
+| 操作 | 做法 | 时间复杂度 |
+|------|------|-----------|
+| **插入（insert）** | 把新元素放在最后一个位置，然后"往上浮"（和父节点比较、交换，直到满足堆性质） | O(log n) |
+| **删除根（extract）** | 把最后一个元素搬到根的位置，然后"往下沉"（和较小的子节点比较、交换，直到满足堆性质） | O(log n) |
+
+用 Python 实现一个最小堆（Python 标准库有 `heapq`，但这里手动实现以展示原理）：
+
+```python
+class MinHeap:
+    def __init__(self):
+        self.heap = []
+
+    def parent(self, i):
+        return (i - 1) // 2
+
+    def left_child(self, i):
+        return 2 * i + 1
+
+    def right_child(self, i):
+        return 2 * i + 2
+
+    def insert(self, val):
+        self.heap.append(val)          # 先放到末尾
+        self._sift_up(len(self.heap) - 1)  # 往上浮
+
+    def _sift_up(self, i):
+        while i > 0 and self.heap[i] < self.heap[self.parent(i)]:
+            # 比父节点小？交换位置
+            self.heap[i], self.heap[self.parent(i)] = \
+                self.heap[self.parent(i)], self.heap[i]
+            i = self.parent(i)
+
+    def extract_min(self):
+        if not self.heap:
+            return None
+        root = self.heap[0]
+        self.heap[0] = self.heap.pop()  # 把最后一个元素搬到根
+        self._sift_down(0)              # 往下沉
+        return root
+
+    def _sift_down(self, i):
+        smallest = i
+        left = self.left_child(i)
+        right = self.right_child(i)
+
+        if left < len(self.heap) and self.heap[left] < self.heap[smallest]:
+            smallest = left
+        if right < len(self.heap) and self.heap[right] < self.heap[smallest]:
+            smallest = right
+
+        if smallest != i:
+            self.heap[i], self.heap[smallest] = \
+                self.heap[smallest], self.heap[i]
+            self._sift_down(smallest)
+```
+
+操作演示：
+
+```
+插入 5:  [1, 3, 6, 8, 10, 9, 12, 15, 5]  ← 5在末尾
+         → 5<10? 交换 → 5<3? 停止
+         [1, 3, 5, 8, 6, 9, 12, 15, 10]
+
+取最小:  返回1
+         → 10搬到根: [10, 3, 5, 8, 6, 9, 12, 15]
+         → 10和3比, 3更小, 交换: [3, 10, 5, 8, 6, 9, 12, 15]
+         → 10和8比, 8更小, 交换: [3, 8, 5, 10, 6, 9, 12, 15]
+```
+
+**堆排序（Heap Sort）** 就是利用堆的这种性质：先把所有元素建堆（O(n)），然后反复取出根节点（O(n log n)），就得到了排序结果。它和快速排序、归并排序一样是 O(n log n) 级别，但它是原地排序（不需要额外数组）。
+
+**优先队列（Priority Queue）** 是堆最常见的应用。普通队列是"先来先服务"，优先队列是"优先级高的先服务"——医院急诊室就是一个现实中的优先队列，心脏病发作的人比感冒的人先看医生，不管你排了多久。操作系统调度进程、Dijkstra 最短路径算法、Huffman 编码都依赖优先队列。
+
+到此为止，你应该搞清楚了一个关键区别：**数据结构里的"堆"是一棵满足特定大小关系的完全二叉树，和内存分配毫无关系。** 至于为什么内存中的那个动态分配区域也叫"堆"，只是因为历史上它是一堆乱七八糟的、随意分配释放的内存块，和整洁有序的栈形成对比——纯属命名巧合。
+
+## 第二层：栈，作为一块内存区域
+
+数据结构里的"栈"是一个抽象概念。但当你写 C 语言、Rust 甚至 Python 代码的时候，"栈"也指一块真实存在的物理内存——程序运行时，操作系统为它划分出来的一片区域。
+
+### 程序运行时，内存长什么样？
+
+一个运行中的程序（进程）占用的内存空间，大致是这样划分的：
+
+```
+高地址（大数字）
+┌────────────────────────┐
+│        栈 (Stack)       │  ← 向下增长 (地址减小)
+│          ↓              │
+│                         │
+│     (空闲空间)           │
+│                         │
+│          ↑              │
+│        堆 (Heap)        │  ← 向上增长 (地址增大)
+├────────────────────────┤
+│     数据段 (Data)       │  ← 全局变量、静态变量
+├────────────────────────┤
+│     代码段 (Text)       │  ← 程序指令（只读）
+└────────────────────────┘
+低地址（小数字）
+```
+
+这张图看起来简单，但包含了几个关键信息：
+
+1. **栈和堆共享同一块空闲空间**，一个从上往下长，一个从下往上长。
+2. **栈在高地址，往低地址方向增长**——这一点很多教程搞反了。在 x86/x86-64 架构上，栈指针减小表示"分配了新空间"。
+3. **代码段和数据段在低地址区**，它们的大小在程序启动时就确定了。
+
+> **大白话版本**：你可以把程序的内存想象成一本空白笔记本。笔记本的第一页写程序指令（代码段），接着几页记全局变量（数据段）。剩下的页面，从前面往后写是"堆"，从后面往前写是"栈"。栈紧张的时候堆可以多占点，反过来也行。
+
+### 栈上的变量 vs 堆上的变量
+
+在 C 语言里，下面两行代码做的事情完全不同：
+
+```c
+int a = 42;              // 这是栈上的变量
+int *p = malloc(100);    // p 本身在栈上，但它指向的 100 字节在堆上
+```
+
+`a` 的生命周期完全由它所在的函数决定——函数执行完，`a` 就没了。而 `p` 指向的那 100 字节，会一直存在，直到你调用 `free(p)` 把它释放。如果忘了 `free`，那就是**内存泄漏**。
+
+用一个表格对比栈和堆的核心区别：
+
+| 维度 | 栈（Stack） | 堆（Heap） |
+|------|-----------|-----------|
+| **分配方式** | 编译器自动管理 | 程序员手动管理（或 GC） |
+| **分配速度** | 极快（一条 CPU 指令） | 较慢（需要查找空闲块） |
+| **大小限制** | 有限（通常几 MB） | 可以很大（受物理内存限制） |
+| **生命周期** | 跟随函数调用，结束自动销毁 | 可以跨越函数调用，需要显式释放 |
+| **适用数据** | 大小在编译时就确定的简单数据 | 大小在运行时才能确定的复杂数据 |
+| **碎片问题** | 无 | 有（多次分配释放后产生"空洞"） |
+| **线程安全** | 每个线程有独立的栈 | 所有线程共享同一个堆 |
+
+一个经典的坑：**返回局部变量的指针**。
+
+```c
+int* bad_function() {
+    int local_value = 42;
+    return &local_value;  // 危险！local_value 在栈上，函数返回后就失效了
+}
+```
+
+指针 `&local_value` 指向的地址还在，但那块栈内存已经被"回收"（下次函数调用会复写它）。这种 **悬空指针**（dangling pointer）导致的 bug 往往难以复现，因为取决于后续函数调用是否恰好覆盖了那块位置。
+
+### 为什么栈这么快？
+
+栈分配只需要一条指令——移动栈指针寄存器。比如要在栈上分配 64 个字节：
+
+```asm
+sub rsp, 64    ; 栈指针向下移 64 字节，分配完成
+```
+
+释放同样是一条指令：
+
+```asm
+add rsp, 64    ; 栈指针向上移 64 字节，释放完成
+```
+
+堆分配就没这么简单了。`malloc` 内部要维护一个"空闲块列表"，每次分配时：
+1. 在空闲列表中搜索一块足够大的内存
+2. 把这块标记为"已使用"
+3. 如果空闲块比请求的大，还要拆分成两块
+
+这个过程可能需要几十到几百个 CPU 周期。所以对于频繁创建销毁的小对象，语言的"逃逸分析"优化会尽量把它们放在栈上。
+
+### 堆内存的里里外外
+
+前面一直在拿堆当"对比项"来衬托栈，现在我们深入堆内部，看看它到底是怎么工作的。
+
+#### malloc 和 free 在做什么？
+
+假设你在 C 里写 `malloc(100)`，系统并不是直接从操作系统那里拿 100 字节——那样太慢了（每次分配都要系统调用）。实际的流程是：
+
+```
+malloc(100)
+  └→ 查一下"空闲列表"里有没有 ≥100 字节的块
+       ├─ 有：返回这块的地址，标记为"已占用"
+       └─ 没有：向操作系统申请一块更大的内存（通常用 brk() 或 mmap()），
+               切出 100 字节返回，剩下的加入空闲列表
+```
+
+`free(ptr)` 也不简单——它不把内存还给操作系统，而是把这块标记为"空闲"，放回空闲列表，等着下次 `malloc` 来用。这就像图书馆的还书——书还回来后不是被销毁，而是放回书架，下一个读者可以借走。
+
+正因为 `free` 不会真正清空数据，下面的代码可能"看起来正常"：
+
+```c
+int *p = malloc(sizeof(int));
+*p = 42;
+free(p);
+printf("%d\n", *p);  // 可能还是打印 42！但这是未定义行为
+```
+
+这种 **use-after-free（释放后使用）** 是 C/C++ 最臭名昭著的 bug 之一。它可能正常运行一万次，然后在第一万零一次崩溃——因为那块内存恰好被另一个分配拿走了。
+
+#### 内存碎片：为什么堆会变成"瑞士奶酪"？
+
+假设你连续分配了 A、B、C 三块内存，然后释放了 B：
+
+```
+分配后:  [AAAA][BBBB][CCCC]
+释放B:   [AAAA][空闲][CCCC]    ← B的位置变成了空洞
+```
+
+空闲的总量（4 + 4 = 8 字节）够分配一个 6 字节的新块吗？不够——因为空闲空间不是连续的，而是被 C 隔开了。这种现象叫**外部碎片**（External Fragmentation）。
+
+```
+请求 6 字节:  [AAAA][空闲 4B][CCCC]  ← 哪个空块都不够6字节
+              ↑只能4B   ↑也是4B
+```
+
+堆分配器通过"空闲块合并"来缓解这个问题：如果相邻的两个块都是空闲的，就把它们合并成一个大块。但碎片化仍然是长期运行的服务程序（比如数据库、Web 服务器）需要警惕的问题。
+
+#### 堆内存分配策略
+
+几十年来，人们发明了多种内存分配算法来平衡速度和空间利用率。以下是几种经典策略：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  First Fit（首次适配）                                    │
+│  从头开始找，遇到第一个够大的块就分配。                      │
+│  优点：快，O(n)。缺点：前面会产生很多"碎屑"。              │
+├─────────────────────────────────────────────────────────┤
+│  Best Fit（最佳适配）                                     │
+│  遍历所有空闲块，找"刚好够大"的那一块。                     │
+│  优点：浪费少。缺点：慢（每次都要全扫一遍），               │
+│  而且剩余的碎屑太小，基本没法再用。                         │
+├─────────────────────────────────────────────────────────┤
+│  Buddy System（伙伴系统）                                  │
+│  内存按 2 的幂次划分（16B、32B、64B、128B...）。          │
+│  请求 50 字节？给 64 字节的块。释放时，"伙伴"（相邻同大小的块） │
+│  可以合并成大一倍的新块。这是 Linux 内核使用的策略。         │
+├─────────────────────────────────────────────────────────┤
+│  Slab Allocation（Slab 分配）                             │
+│  为固定大小的对象预分配"Slab"缓存。                        │
+│  常用于内核（如 inode、task_struct 等固定结构体）。        │
+│  分配和释放都是 O(1)。                                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+现代通用内存分配器（如 Linux 的 **ptmalloc2**、FreeBSD 的 **jemalloc**、Google 的 **tcmalloc**）都混合使用了多种策略，针对不同大小的请求走不同的"快车道"和"慢车道"。
+
+### 垃圾回收：不用 free 的语言怎么管理堆？
+
+Java、Python、JavaScript、Go 这些语言的程序员从来没写过 `free`，但程序不会无限吃内存。因为它们在运行时内置了**垃圾回收器**（Garbage Collector，简称 GC），自动找出堆上"没人要"的对象并清理。
+
+GC 的核心问题是：**怎么判断一个对象"没人要"了？**
+
+#### 引用计数（Reference Counting）
+
+每个对象身上挂一个数字——"有几个地方在引用我"。引用数变成 0 的时候，对象就可以被清理了。
+
+```
+a = [1, 2, 3]     # 这个列表的引用计数 = 1（a 在引用它）
+b = a              # 引用计数 = 2（a 和 b 都在引用它）
+a = None           # 引用计数 = 1（只有 b 在引用）
+b = None           # 引用计数 = 0 → 没人引用了，清理！
+```
+
+Python 主要使用引用计数。优点是**即时回收**——对象"死掉"的瞬间就被清理。缺点也很明显：
+
+- **循环引用**：A 引用 B，B 引用 A，但外界没有任何东西引用它们。引用计数永远不会变成 0，但它们确实是垃圾。
+- **性能开销**：每次赋值都要增减计数，多线程下还需要加锁。
+
+Python 用**标记-清除**（见下一节）作为补充来回收循环引用产生的垃圾。
+
+#### 标记-清除（Mark and Sweep）
+
+分两步走：
+
+```
+第一步（标记）：
+  从"根"（全局变量、栈上的局部变量、寄存器）出发，
+  沿着所有引用链走一遍，能到达的对象全部标记为"存活"。
+
+第二步（清除）：
+  扫描整个堆，没有标记的对象就是垃圾，回收它们。
+```
+
+```
+标记前：      [根] → A → B → C    D ← E （D和E互相引用但无外界引用）
+标记后：      [根] → A✓→ B✓→ C✓   D  E （无法从根到达，没被标记）
+清除后：      [根] → A → B → C          （D和E被回收）
+```
+
+JavaScript（V8）、Go 都使用标记-清除。它解决了循环引用问题，但有一个显著的代价——**Stop The World**：标记和清除期间，程序必须暂停。对于需要低延迟的应用（比如游戏引擎），突然卡顿几十毫秒是不可接受的。
+
+#### 分代回收（Generational Collection）
+
+一个经验性的观察：**大多数对象都是"英年早逝"的。** 统计显示，80%–90% 的新建对象在几毫秒内就不再被需要了。
+
+基于这个观察，分代 GC 将堆划分成几个"代"：
+
+```
+┌──────────────┐
+│  新生代 (Young) │  ← 新创建的对象。空间小，回收频率高（"轻量级GC"）
+├──────────────┤
+│  老年代 (Old)   │  ← 活得够久的对象被"晋升"到这里。空间大，回收频率低（"重量级GC"）
+├──────────────┤
+│  永久代 (Perm)   │  ← 类定义、方法元数据等（Java 8 后改为 Metaspace）
+└──────────────┘
+```
+
+新生代内部通常又分为 Eden 区和两个 Survivor 区（From/To）。对象先在 Eden 区创建，经过一次 GC 后，存活下来的搬到 Survivor 区，再活过几次 GC 后晋升到老年代。
+
+Java 的 HotSpot JVM、.NET CLR、V8 的 Orinoco GC 都采用了分代回收。分代 GC 的核心优势是：**大部分 GC 操作只在新生代这个小区域运行**，速度快，停顿时间短。
+
+#### 三种 GC 对比
+
+| 策略 | 原理 | 优势 | 劣势 | 代表语言 |
+|------|------|------|------|---------|
+| **引用计数** | 每个对象记录被引用次数，0 就回收 | 即时回收，概念简单 | 无法处理循环引用，每次赋值有开销 | Python（为主）、Objective-C、Swift（旧版） |
+| **标记-清除** | 从根出发标记可达对象，未标记的回收 | 解决循环引用 | Stop The World，暂停时间不可控 | Go、JavaScript（V8） |
+| **分代回收** | 年轻对象放在小区域高频回收，老对象低频回收 | 大部分 GC 很快，平均停顿短 | 实现复杂，老年代回收仍会有长停顿 | Java（HotSpot）、.NET、V8（增强版） |
+
+> 现代 GC 往往是这些策略的组合。比如 Python 用引用计数 + 标记清除（处理循环引用）；V8 用分代回收 + 标记清除 + 标记压缩（整理碎片）；Go 用并发标记-清除，尽量减少 STW 时间。
+
+### 堆上的安全隐患
+
+栈有缓冲区溢出，堆也有自己的一套安全问题：
+
+- **堆溢出（Heap Overflow）**：和栈溢出类似，但发生在堆分配的缓冲区上。覆盖的是相邻的堆块，可能破坏堆管理器的元数据（空闲块链表指针），进而实现任意地址写入。
+- **释放后使用（Use-After-Free）**：指针已经 `free` 了但程序还继续用它。如果那块内存在被分配给了其他用途，写入操作就会破坏不相干的数据——这种 bug 极难调试。
+- **双重释放（Double Free）**：对同一块内存调用两次 `free`。第二次释放时，那块内存的元数据已经被第一次释改写过了，释放器会做出不可预测的行为，常常导致崩溃或被利用执行任意代码。
+
+这也是为什么 Rust 把所有权和借用检查直接内置到编译器里——在编译时就把 use-after-free 和 double-free 的问题全部拦下来。
+
+## 第三层：栈，作为调用机制
+
+这是大多数程序员最常遇到的"栈"——**调用栈**（Call Stack）。当你看到一个报错信息后面跟着一串 `at xxx (file.js:行号)`，那就是调用栈在说话。
+
+### 函数调用时发生了什么？
+
+每当程序调用一个函数，运行时会在栈上创建一个叫做**栈帧**（Stack Frame）的结构。这个栈帧就像一张"便签"，上面写着：
+
+- 传给这个函数的**参数**
+- 这个函数内部声明的**局部变量**
+- **返回地址**——函数执行完后，该回到哪个位置继续执行
+
+用一段看得见调用关系的代码来说明：
+
+```javascript
+function multiply(x, y) {
+    return x * y;
+}
+
+function square(n) {
+    return multiply(n, n);  // square 内部调用 multiply
+}
+
+function main() {
+    const result = square(4);  // main 内部调用 square
+    console.log(result);
+}
+
+main();
+```
+
+程序的执行过程和调用栈的变化如下：
+
+```
+步骤1: 调用 main()
+       栈: [main]
+
+步骤2: main() 中调用 square(4)
+       栈: [square, main]
+
+步骤3: square() 中调用 multiply(4, 4)
+       栈: [multiply, square, main]
+
+步骤4: multiply() 返回 16，栈帧被移除
+       栈: [square, main]
+
+步骤5: square() 返回 16，栈帧被移除
+       栈: [main]
+
+步骤6: main() 结束，栈帧被移除
+       栈: [] (空)
+```
+
+注意一个细节：**最后调用的函数最先返回**——这又回到了数据结构的 LIFO 特性，不是巧合，是设计。
+
+### 栈溢出是怎么回事？
+
+每个线程的栈空间是有限的（Linux 默认 8MB，Windows 默认 1MB）。如果你不断往里塞栈帧而不弹出，早晚会撞上天花板。最常见的触发方式是**无限递归**：
+
+```python
+def infinite():
+    return infinite()  # 没有终止条件！
+
+infinite()
+# RecursionError: maximum recursion depth exceeded
+```
+
+每次递归调用都会压入一个新的栈帧，但从来没有返回——栈空间被逐步消耗，直到溢出。
+
+但即便不是无限递归，**过深的递归**也会导致栈溢出。比如用递归算斐波那契第 5000 项，或者遍历一棵深度上万层的树。解决这些问题的常用思路是**尾递归优化**（编译器把递归转成循环）或直接用循环替代递归。
+
+### 错误信息里的调用栈怎么读？
+
+以一段会报错的 JavaScript 代码为例：
+
+```javascript
+function fetchData() {
+    throw new Error("网络请求失败");
+}
+
+function loadUser() {
+    fetchData();
+}
+
+function initApp() {
+    loadUser();
+}
+
+initApp();
+```
+
+报错信息：
+
+```
+Error: 网络请求失败
+    at fetchData (app.js:2:11)
+    at loadUser (app.js:6:5)
+    at initApp (app.js:10:5)
+    at app.js:13:1
+```
+
+从下往上读：程序从第 13 行开始，调用 `initApp`，`initApp` 调用 `loadUser`，`loadUser` 调用 `fetchData`，在 `fetchData` 里出错了。**最底下的行是起源，越往上越接近出错点。**
+
+## 深入：汇编视角下的栈帧
+
+要真正理解栈，需要往下走一层，看看 CPU 和汇编层面是怎么操作的。别担心看不懂汇编——我尽量用注释把每一行的作用说明白。
+
+### 关键的寄存器
+
+x86-64 架构下，有几个寄存器专门负责栈的管理：
+
+| 寄存器 | 名称 | 作用 |
+|--------|------|------|
+| **RSP** | Stack Pointer（栈指针） | 始终指向栈顶（最低地址），操作栈的行为都围绕它 |
+| **RBP** | Base Pointer（基址指针） | 指向当前栈帧的"地基"，用来访问函数参数和局部变量 |
+| **RIP** | Instruction Pointer（指令指针） | 指向下一条要执行的指令，`call` 指令会把它压入栈中 |
+
+在 32 位模式（x86）下，它们叫 ESP、EBP、EIP（E 代表 Extended）。64 位加上 R（Register）。
+
+### 函数序言和尾声
+
+几乎每个函数的汇编代码都以相同的模式开始和结束：
+
+**序言（Prologue）**——进入函数时执行，搭好栈帧：
+
+```asm
+push rbp          ; 把调用者的基址指针保存到栈上（因为马上要改 rbp 了）
+mov  rbp, rsp     ; 把当前栈顶设为新栈帧的"地基"
+sub  rsp, 48      ; 栈指针向下移 48 字节，给局部变量腾位置
+```
+
+**尾声（Epilogue）**——退出函数时执行，拆掉栈帧：
+
+```asm
+mov  rsp, rbp     ; 把栈指针恢复到基址位置（等于释放了所有局部变量）
+pop  rbp          ; 恢复调用者的基址指针
+ret               ; 从栈上弹出返回地址，跳回去
+```
+
+进来搭框架，出去拆框架——每个函数都严格遵循这个规矩。正因为如此，无论函数嵌套多深，栈都不会乱。
+
+### 栈帧的内存布局
+
+一个完整的栈帧长这样：
+
+```
+               ┌─────────────────────┐ 高地址
+               │  参数 2              │
+               │  参数 1              │  ← 调用者传入的参数
+               ├─────────────────────┤
+               │  返回地址            │  ← call 指令自动压入
+RBP (旧值) ──→ ├─────────────────────┤
+               │  保存的旧 RBP        │  ← push rbp 压入
+RBP ─────────→ ├─────────────────────┤
+               │  局部变量 1          │
+               │  局部变量 2          │
+               │  ...                │
+RSP ──────────→ ├─────────────────────┤ 低地址 (当前栈顶)
+               │  (可用空间)          │
+               └─────────────────────┘
+```
+
+理解这个布局，你就能理解很多底层问题的根源：
+
+- **局部数组越界写为什么会覆盖返回地址？** 因为局部变量和返回地址在物理上是相邻的，越界写正好往高地址方向覆盖。
+- **函数参数为什么在第 8 字节（RBP+8）开始？** 因为 RBP 指向的是"保存的旧 RBP"（占 8 字节），再往上是返回地址（又占 8 字节），再往上才是参数。
+- **64 位下前 6 个参数为什么用寄存器传？** 因为寄存器比内存快得多。只有第 7 个及之后的参数才放到栈上。这是 x86-64 System V 调用约定的一部分。
+
+### 调用约定：谁负责打扫战场？
+
+当函数调用结束时，栈上的参数怎么办？谁来清理？这个问题没有唯一答案——取决于**调用约定**（Calling Convention）。
+
+| 约定 | 谁清理参数 | 典型使用方 |
+|------|-----------|-----------|
+| **cdecl** | 调用者 | C 语言（默认），Unix/Linux |
+| **stdcall** | 被调用者（用 `ret N` 指令） | Windows Win32 API |
+| **fastcall** | 被调用者（前几个参数用寄存器） | 性能敏感场景 |
+| **System V AMD64** | 调用者 | 64 位 Linux/macOS（前 6 个整数参数走寄存器） |
+| **Microsoft x64** | 调用者 | 64 位 Windows（前 4 个参数走寄存器） |
+
+> cdecl 之所以让调用者清理，是因为它要支持**可变参数函数**（如 `printf`）。只有调用者才知道自己传了几个参数，被调用者无法提前知道。
+
+## 安全隐患：当栈被人动了手脚
+
+前面我们聊的都是栈的"正常用法"。但栈也是历史上最著名的安全漏洞——**缓冲区溢出**（Buffer Overflow）——的作案现场。
+
+### 原理：覆盖返回地址
+
+想象一个 C 函数：
+
+```c
+void greet(char *name) {
+    char buffer[16];          // 栈上分配 16 字节
+    strcpy(buffer, name);     // 把 name 复制到 buffer，不检查长度！
+    printf("Hello, %s!\n", buffer);
+}
+```
+
+`buffer` 只有 16 字节，但如果调用者传了一个 100 字节的 `name`，`strcpy` 会忠实地把 100 字节全部写进去——多出来的 84 字节会覆盖栈上紧挨着 `buffer` 的数据。
+
+还记得上一小节的栈帧布局吗？顺着 `buffer` 往高地址方向分别是：**保存的 RBP → 返回地址 → 函数参数**。如果攻击者精心构造那 100 字节的数据，就可以：
+
+1. 用垃圾数据填满 buffer 的 16 字节
+2. 用任意值覆盖保存的 RBP（不影响攻击）
+3. **用一段恶意代码的地址覆盖返回地址**
+4. 当 `greet` 执行 `ret` 时，CPU 就会跳到攻击者指定的地址去执行
+
+```
+正常流程：greet 执行完 → ret 跳回 main
+攻击后：  greet 执行完 → ret 跳到攻击者的 shellcode → 执行任意代码
+```
+
+### 危险的 C 函数
+
+以下 C 标准库函数不检查目标缓冲区大小，是缓冲区溢出的重灾区：
+
+| 危险函数 | 安全替代 |
+|---------|---------|
+| `gets()` | `fgets()` |
+| `strcpy()` | `strncpy()` / `strlcpy()` |
+| `strcat()` | `strncat()` / `strlcat()` |
+| `sprintf()` | `snprintf()` |
+| `scanf("%s", buf)` | `scanf("%99s", buf)`（限制读取宽度） |
+
+### 三道防线
+
+现代操作系统和编译器构建了三道防线来对抗栈溢出攻击：
+
+```
+┌──────────────────────────────────┐
+│  第一道：Stack Canary（栈金丝雀）  │
+│  在返回地址前放一个随机值。        │
+│  函数返回前检查它是否被改动。      │
+│  如果被覆盖了一定是溢出了 → 终止   │
+├──────────────────────────────────┤
+│  第二道：NX/DEP（栈不可执行）      │
+│  标记栈内存为"不可执行"。          │
+│  就算注入了 shellcode 也跑不起来。  │
+│  但可以被 ROP 技术绕过            │
+├──────────────────────────────────┤
+│  第三道：ASLR（地址随机化）        │
+│  每次运行时栈、堆、库的地址随机化。  │
+│  攻击者不知道 shellcode 该放哪。   │
+│  但可以被地址泄露绕过             │
+└──────────────────────────────────┘
+```
+
+> **金丝雀**这个名字来自煤矿工人的历史习惯——他们下矿时会带一只金丝雀。金丝雀对瓦斯比人敏感，如果金丝雀死了，说明矿里有毒气，赶紧逃。栈金丝雀同理：如果编译器的"金丝雀值"被修改了，说明发生了溢出，立刻终止程序。
+
+三道防线层层叠加，虽然都不是完美的（都存在已知的绕过方法），但组合起来让栈溢出攻击的成本提高了好几个数量级。
+
+## 动手实践
+
+光看不练容易忘。下面三个练习由浅入深，帮助你亲手感受栈。
+
+### 练习一：用 Python 体验调用栈
+
+Python 有个内置模块 `traceback`，可以打印当前调用栈：
+
+```python
+import traceback
+
+def level_c():
+    print("=== 当前调用栈 ===")
+    traceback.print_stack()  # 打印调用链
+
+def level_b():
+    level_c()
+
+def level_a():
+    level_b()
+
+level_a()
+```
+
+输出会显示从程序入口到当前行的完整调用链。把这个代码改一下，体验栈溢出：
+
+```python
+def deep(n):
+    if n % 100 == 0:
+        print(f"深度: {n}")
+    return deep(n + 1)  # 没有终止条件，一直递归
+
+deep(1)
+# RecursionError: maximum recursion depth exceeded
+```
+
+Python 默认递归深度限制是 1000。你可以用 `sys.setrecursionlimit(3000)` 调大它，但要小心这可能导致 C 层面的栈真正溢出（Python 解释器本身也是 C 写的）。
+
+### 练习二：用调试器看栈帧
+
+如果你有 Linux 环境（或 WSL），用 `gdb` 可以直观地看到栈帧。以下面的 C 程序为例（保存为 `demo.c`）：
+
+```c
+#include <stdio.h>
+
+int add(int a, int b) {
+    int sum = a + b;
+    return sum;
+}
+
+int main() {
+    int x = 3, y = 4;
+    int result = add(x, y);
+    printf("%d\n", result);
+    return 0;
+}
+```
+
+编译时加调试信息和关闭优化（避免变量被优化掉）：
+
+```bash
+gcc -g -O0 -o demo demo.c
+gdb ./demo
+```
+
+在 `gdb` 里执行：
+
+```
+(gdb) break add              # 在 add 函数入口设断点
+(gdb) run                    # 运行程序
+(gdb) info registers rsp rbp rip  # 查看关键寄存器
+(gdb) backtrace              # 查看调用栈
+#0  add (a=3, b=4) at demo.c:4
+#1  0x... in main () at demo.c:10
+
+(gdb) info frame             # 查看当前栈帧详情
+(gdb) x/16x $rsp             # 查看栈顶附近的 16 个十六进制值
+```
+
+`backtrace` 的输出就是调用栈的最直观呈现。`info frame` 会告诉你当前帧的基址、返回地址、局部变量的位置——和前面理论部分讲的完全对应。
+
+### 练习三：常用安全编译选项
+
+如果你是 C/C++ 开发者，这几个编译器标志应该成为你的肌肉记忆：
+
+```bash
+# GCC/Clang 安全编译选项
+gcc -fstack-protector-strong   \   # 开启栈保护（金丝雀）
+    -D_FORTIFY_SOURCE=2        \   # 强化字符串函数检查
+    -Wformat -Wformat-security \   # 格式字符串警告
+    -fPIE -pie                 \   # 位置无关可执行文件（配合 ASLR）
+    -o myapp myapp.c
+```
+
+对于现有的二进制文件，可以用 `checksec` 工具检查它启用了哪些保护：
+
+```bash
+checksec --file=./myapp
+```
+
+输出会显示 CANARY、NX、PIE、ASLR 等保护是否开启。
+
+### 练习四：用 Python 实现堆排序
+
+前面讲了二叉堆和堆排序的原理，现在用 Python 的 `heapq` 模块来体验一下：
+
+```python
+import heapq
+
+# heapq 默认是最小堆
+nums = [5, 2, 9, 1, 7, 3]
+heapq.heapify(nums)        # 原地建堆, O(n)
+print(f"堆化后: {nums}")   # [1, 2, 3, 5, 7, 9]
+
+# 依次取出最小值 → 这就是堆排序
+sorted_nums = []
+while nums:
+    sorted_nums.append(heapq.heappop(nums))
+
+print(f"排序后: {sorted_nums}")  # [1, 2, 3, 5, 7, 9]
+```
+
+进阶练习——用最大堆实现一个优先队列：
+
+```python
+import heapq
+
+class PriorityQueue:
+    def __init__(self):
+        self.heap = []
+        self.counter = 0  # 防止同优先级时比较元素本身
+
+    def push(self, task, priority):
+        # heapq 是最小堆，存负数实现最大堆效果
+        heapq.heappush(self.heap, (-priority, self.counter, task))
+        self.counter += 1
+
+    def pop(self):
+        priority, _, task = heapq.heappop(self.heap)
+        return task, -priority  # 把优先级反转回来
+
+# 使用示例
+pq = PriorityQueue()
+pq.push("普通用户请求", 1)
+pq.push("VIP用户请求", 10)
+pq.push("管理员命令", 100)
+pq.push("另一个普通请求", 1)
+
+while pq.heap:
+    task, priority = pq.pop()
+    print(f"[优先级{priority:3d}] {task}")
+```
+
+运行结果——优先级最高的"管理员命令"最先被处理：
+
+```
+[优先级100] 管理员命令
+[优先级 10] VIP用户请求
+[优先级  1] 普通用户请求
+[优先级  1] 另一个普通请求
+```
+
+### 练习五：观察内存碎片
+
+用 C 写一个小程序，观察堆碎片化的效果（在 Linux/WSL 上编译运行）：
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    // 分配三块内存
+    char *a = malloc(1024);
+    char *b = malloc(1024);
+    char *c = malloc(1024);
+
+    printf("A: %p\n", (void*)a);
+    printf("B: %p\n", (void*)b);
+    printf("C: %p\n", (void*)c);
+
+    // 释放中间的 B → 产生一个空洞
+    free(b);
+    printf("已释放 B\n");
+
+    // 分配一个比 B 稍大的块
+    char *d = malloc(2048);
+    printf("D: %p\n", (void*)d);  // 大概率不是 B 的地址，因为 1024 < 2048
+
+    // 分配一个同样大小的块
+    char *e = malloc(1024);
+    printf("E: %p\n", (void*)e);  // 大概率就是 B 原来的位置
+
+    free(a); free(c); free(d); free(e);
+    return 0;
+}
+```
+
+这个实验让你亲眼看到：释放的块如果大小合适，会被直接复用（E 拿到了原来 B 的地址）；如果大小不合适，分配器会在别处找新空间（D 没有拿 B 的地址），原来的空洞就暂时留着了。
+
+### 练习六：观察 Python 的引用计数
+
+Python 的 `sys.getrefcount()` 可以查看对象的引用数：
+
+```python
+import sys
+
+a = [1, 2, 3]
+print(f"创建后: {sys.getrefcount(a)}")   # 2（a 一次，getrefcount 参数一次）
+
+b = a
+print(f"b=a 后: {sys.getrefcount(a)}")  # 3（多了 b）
+
+c = [a, a]
+print(f"c包含a两次: {sys.getrefcount(a)}")  # 5（多了 c[0] 和 c[1]）
+
+del b
+print(f"del b 后: {sys.getrefcount(a)}")  # 4
+
+del c
+print(f"del c 后: {sys.getrefcount(a)}")  # 2 → 只剩下 a 自己
+
+# 循环引用示例
+class Node:
+    def __init__(self, name):
+        self.name = name
+        self.ref = None
+
+x = Node("X")
+y = Node("Y")
+x.ref = y
+y.ref = x   # 循环引用！即使 del x 和 del y，它们也不会被引用计数方式回收
+
+del x
+del y
+# x 和 y 现在没有任何变量名指向它们，但因为互相引用，引用计数永远不为 0
+# Python 的 GC 模块会用标记-清除在后台处理这种循环
+```
+
+用 `gc` 模块可以手动触发 Python 的标记-清除，观察它如何处理循环引用：
+
+```python
+import gc
+gc.set_debug(gc.DEBUG_SAVEALL)  # 把回收的对象保存到 gc.garbage
+# ... 创建循环引用 ...
+gc.collect()   # 手动触发 GC
+```
+
+## 总结与建议
+
+本文覆盖了两个核心概念：
+
+| | **栈（Stack）** | **堆（Heap）** |
+|------|-----------|-----------|
+| **数据结构层** | LIFO 线性表，push/pop/peek | 完全二叉树，满足堆性质（大小关系），堆化 O(log n) |
+| **内存层** | 编译器自动管理，极快（一条指令），几 MB 限制，无碎片 | 手动管理或 GC，较慢，可动态扩展，会产生碎片 |
+| **其他名字** | 调用栈（Call Stack）——函数调用的执行记录 | 二叉堆、优先队列——和内存分配无关 |
+| **典型安全风险** | 栈缓冲区溢出（覆盖返回地址） | 堆溢出、Use-After-Free、Double-Free |
+| **关键防护** | Stack Canary、NX/DEP、ASLR | Safe allocators、Address Sanitizer、Rust 所有权系统 |
+
+针对不同角色的程序员，建议如下：
+
+**后端开发者**：关注栈大小限制（Go goroutine 初始栈只有几 KB）和堆内存管理（选用合适的 GC 策略）。如果你的 C/C++ 服务用到了递归处理深层嵌套的数据，考虑改成迭代。对于 Go/Java 服务，理解 GC 的停顿特性，合理设置堆大小（`-Xmx`）和 GC 策略。
+
+**前端开发者**：调用栈和堆都在起作用。Chrome DevTools 里 Call Stack 面板对应本文的调用栈，Memory 面板里的 Heap Snapshot 对应堆内存。学会用 Memory 面板做堆快照对比（取两次快照，看中间的增量），是排查前端内存泄漏的核心技能——哪些对象还在堆上，为什么没被回收。
+
+**安全工程师**：栈溢出是二进制安全的入门课，堆漏洞（Heap Overflow、Use-After-Free）是进阶课。理解堆分配器（ptmalloc2/jemalloc）的内部结构后，建议做 CTF 的 pwn 题，推荐 [pwnable.kr](http://pwnable.kr)、[how2heap](https://github.com/shellphish/how2heap) 和 [ROP Emporium](https://ropemporium.com)。
+
+**初学者**：这篇文章很长，不要试图一口气读完。建议分三次：第一遍理解数据结构层的栈和堆（push/pop/LIFO、最小堆/堆化）；第二遍理解内存层的栈分配和堆分配的区别；第三遍看汇编层、调用约定、安全攻防。每完成一个阶段，你对计算机运行原理的理解都会前进一大步。
+
+栈很小（几 MB），堆很大（可达 GB 级），但两者的关系决定了程序如何组织数据、如何执行函数、如何管理内存。**理解了堆和栈，你就理解了程序运行时的半壁江山。**
+
+## 参考资料
+
+### 栈相关
+
+- [MDN Web Docs — Call stack](https://developer.mozilla.org/en-US/docs/Glossary/Call_stack)（Mozilla 对调用栈的官方术语解释，简洁清晰）
+- [Oracle — Call Stacks and Program Execution](https://docs.oracle.com/cd/E19205-01/821-0304/6nlc8j8ni/index.html)（Oracle 官方文档中关于调用栈与程序执行的章节，含实际示例）
+- [CTF101 — What is the Stack?](https://ctf101.org/binary-exploitation/what-is-the-stack/)（CTF 入门教程中对栈的讲解，从安全角度切入）
+- [Eli Bendersky — Stack Frame Layout on x86-64](https://eli.thegreenplace.net/2011/09/06/stack-frame-layout-on-x86-64/)（著名技术博客对 x86-64 栈帧布局的深入剖析，含汇编代码和内存示意图）
+- [Wikipedia — Stack buffer overflow](https://en.wikipedia.org/wiki/Stack_buffer_overflow)（维基百科对栈缓冲区溢出的完整综述，涵盖攻击原理和防御手段）
+- [OWASP — Buffer Overflow Attack](https://owasp.org/www-community/attacks/Buffer_overflow_attack)（OWASP 对缓冲区溢出攻击的权威叙述，含 ASLR 绕过等进阶主题）
+- [CWE-121 — Stack-based Buffer Overflow](https://cwe.mitre.org/data/definitions/121.html)（MITRE 对栈缓冲区溢出的漏洞定义，CWE 编号 121）
+- [x86 Assembly Guide — University of Virginia](https://www.cs.virginia.edu/~evans/cs216/guides/x86.html)（弗吉尼亚大学的 x86 汇编指南，含栈操作指令的详细说明）
+- [GDB Documentation — Examining the Stack](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Stack.html)（GDB 官方手册中查看栈的章节）
+- [FreeBSD Developers' Handbook — Buffer Overflows](https://docs.freebsd.org/en/books/developers-handbook/secure-bufferov/)（FreeBSD 开发者手册中关于缓冲区溢出和防御的章节）
+
+### 堆相关
+
+- [Rust Official Book — The Stack and the Heap](https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html#the-stack-and-the-heap)（Rust 官方教材中栈和堆的章节，把所有权机制和内存模型结合讲解，推荐必读）
+- [Wikipedia — Memory management](https://en.wikipedia.org/wiki/Memory_management)（维基百科对内存管理的全面介绍，覆盖堆分配算法、GC 策略）
+- [Wikipedia — Garbage collection (computer science)](https://en.wikipedia.org/wiki/Garbage_collection_(computer_science))（维基百科对垃圾回收的完整综述，涵盖引用计数、标记-清除、分代回收）
+- [The Garbage Collection Handbook](http://gchandbook.org/)（Richard Jones 所著的 GC 权威参考书，涵盖几乎所有 GC 算法及其实现细节）
+- [V8 Blog — Trash talk: the Orinoco garbage collector](https://v8.dev/blog/trash-talk)（V8 团队对 Orinoco GC 的官方介绍，讲清了并发标记和并行压缩的设计思路）
+- [Python Documentation — gc module](https://docs.python.org/3/library/gc.html)（Python 官方文档对 gc 模块的介绍，含调试循环引用的方法）
+- [how2heap](https://github.com/shellphish/how2heap)（堆漏洞利用教学仓库，从最简单的堆溢出到高级的 House of 系列技巧，适合安全方向深造）
+- [Heap Exploitation — CTF101](https://ctf101.org/binary-exploitation/heap-exploitation/)（CTF 入门教程中对堆漏洞利用的讲解）
+- [jemalloc](https://jemalloc.net/)（FreeBSD/libc 使用的内存分配器，Facebook 也用它优化大规模服务的内存占用）
+- [tcmalloc](https://github.com/google/tcmalloc)（Google 开发的内存分配器，针对多线程和高并发场景优化）
+
+### 练习平台与工具
+
+- [pwnable.kr](http://pwnable.kr)（经典的二进制安全 CTF 练习平台，从最简单的栈溢出题开始循序渐进）
+- [ROP Emporium](https://ropemporium.com)（专门练习 ROP（Return-Oriented Programming）的平台）
+- [checksec — checksec.sh](https://github.com/slimm609/checksec.sh)（检查 ELF 二进制文件安全保护机制的脚本，包括 CANARY、NX、PIE、ASLR 等）
+- [AddressSanitizer (ASan)](https://clang.llvm.org/docs/AddressSanitizer.html)（LLVM/Clang 的内存错误检测工具，能检测 use-after-free、heap buffer overflow 等）
+- [Valgrind](https://valgrind.org/)（Linux 下经典的内存调试和性能分析工具，memcheck 工具能检测内存泄漏和非法访问）

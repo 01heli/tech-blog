@@ -13,6 +13,8 @@ import { Container } from '@/components/layout/Container';
 import { AdminEditButton } from '@/components/admin/AdminEditButton';
 import { ViewTracker } from '@/components/shared/ViewTracker';
 
+export const revalidate = 60; // ISR: view counts refresh at most every 60s
+
 interface PageProps {
   params: { slug: string };
 }

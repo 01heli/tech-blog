@@ -8,6 +8,8 @@ import { Container } from '@/components/layout/Container';
 import { getAllPosts } from '@/lib/posts';
 import { withViewCounts } from '@/lib/views';
 
+export const revalidate = 300; // ISR: home page view counts refresh every 5 min
+
 export default async function Home() {
   const allPosts = await withViewCounts(getAllPosts());
   const featured = allPosts.filter((p) => p.frontmatter.featured).slice(0, 1);
