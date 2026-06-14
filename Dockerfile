@@ -2,13 +2,11 @@
 
 # ---- 构建阶段 ----
 FROM node:20-alpine AS builder
-# 阿里云镜像加速（服务器在阿里云，官方源极慢）
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
-RUN npm ci --registry=https://registry.npmmirror.com
+RUN npm ci
 
 COPY . .
 
@@ -17,8 +15,7 @@ RUN npm run build
 
 # ---- 运行阶段 ----
 FROM node:20-alpine AS runner
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories \
-    && apk add --no-cache openssl
+RUN apk add --no-cache openssl
 WORKDIR /app
 
 ENV NODE_ENV=production
