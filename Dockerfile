@@ -2,7 +2,7 @@
 
 # ---- 构建阶段 ----
 FROM node:20-alpine AS builder
-RUN apk add --no-cache openssl
+RUN apk add --no-cache openssl python3 build-base
 WORKDIR /app
 
 COPY package.json package-lock.json ./
