@@ -14,6 +14,13 @@ const nextConfig = {
   images: {
     formats: ['image/avif', 'image/webp'],
   },
+  webpack: (config, { isServer }) => {
+    // sql.js 的 UMD 和 webpack ESM 不兼容，服务端用原生 require
+    if (isServer) {
+      config.externals = [...(config.externals || []), 'sql.js'];
+    }
+    return config;
+  },
 }
 
 const withMDX = createMDX({

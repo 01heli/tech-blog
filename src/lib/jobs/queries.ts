@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { getDb } from './db';
+import { getDb, execAll, execOne } from './db';
 import { cleanDescription } from './format';
 import type {
   JobItem,
@@ -18,11 +18,11 @@ import type {
 // 岗位列表（分页 + 多条件筛选）
 // ═══════════════════════════════════════════════════════════════
 
-export function getJobs(filters: JobFilters = {}): {
+export async function getJobs(filters: JobFilters = {}): Promise<{
   items: JobItem[];
   total: number;
-} {
-  const db = getDb();
+}> {
+  const db = await getDb();
   const {
     city,
     keyword,
@@ -59,41 +59,41 @@ export function getJobs(filters: JobFilters = {}): {
     params.push(salaryMax);
   }
   if (education) {
-    conditions.push('(c.education = ? OR c.education = \'不限\')');
+    conditions.push("(c.education = ? OR c.education = '不限')");
     params.push(education);
   }
   if (experienceMin != null && experienceMin > 0) {
-    conditions.push('(c.experience_years_min <= ? OR c.experience_years_min IS NULL OR c.experience_years_min = 0)');
+    conditions.push(
+      '(c.experience_years_min <= ? OR c.experience_years_min IS NULL OR c.experience_years_min = 0)'
+    );
     params.push(experienceMin);
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const offset = (page - 1) * pageSize;
 
-  // Count total
-  const countRow = db
-    .prepare(
-      `SELECT COUNT(*) as cnt FROM raw_jobs r
-       JOIN cleaned_jobs c ON c.raw_id = r.id
-       ${where}`
-    )
-    .get(...params) as { cnt: number };
+  const countRow = execOne(
+    db,
+    `SELECT COUNT(*) as cnt FROM raw_jobs r
+     JOIN cleaned_jobs c ON c.raw_id = r.id
+     ${where}`,
+    params
+  ) as { cnt: number };
 
-  // Fetch items
-  const rows = db
-    .prepare(
-      `SELECT r.id, r.title, r.company_raw, r.salary_raw, r.experience_raw,
-              r.education_raw, r.city, r.keyword, r.scraped_at,
-              c.salary_min, c.salary_max, c.salary_months,
-              c.experience_years_min, c.education, c.location,
-              c.company_short, c.tech_stack
-       FROM raw_jobs r
-       JOIN cleaned_jobs c ON c.raw_id = r.id
-       ${where}
-       ORDER BY r.scraped_at DESC
-       LIMIT ? OFFSET ?`
-    )
-    .all(...params, pageSize, offset) as any[];
+  const rows = execAll(
+    db,
+    `SELECT r.id, r.title, r.company_raw, r.salary_raw, r.experience_raw,
+            r.education_raw, r.city, r.keyword, r.scraped_at,
+            c.salary_min, c.salary_max, c.salary_months,
+            c.experience_years_min, c.education, c.location,
+            c.company_short, c.tech_stack
+     FROM raw_jobs r
+     JOIN cleaned_jobs c ON c.raw_id = r.id
+     ${where}
+     ORDER BY r.scraped_at DESC
+     LIMIT ? OFFSET ?`,
+    [...params, pageSize, offset]
+  ) as any[];
 
   const items: JobItem[] = rows.map(mapJobItem);
 
@@ -104,18 +104,18 @@ export function getJobs(filters: JobFilters = {}): {
 // 岗位详情
 // ═══════════════════════════════════════════════════════════════
 
-export function getJobById(id: number): JobDetail | null {
-  const db = getDb();
-  const row = db
-    .prepare(
-      `SELECT r.*, c.salary_min, c.salary_max, c.salary_months,
-              c.experience_years_min, c.education, c.location,
-              c.company_short, c.tech_stack
-       FROM raw_jobs r
-       JOIN cleaned_jobs c ON c.raw_id = r.id
-       WHERE r.id = ?`
-    )
-    .get(id) as any;
+export async function getJobById(id: number): Promise<JobDetail | null> {
+  const db = await getDb();
+  const row = execOne(
+    db,
+    `SELECT r.*, c.salary_min, c.salary_max, c.salary_months,
+            c.experience_years_min, c.education, c.location,
+            c.company_short, c.tech_stack
+     FROM raw_jobs r
+     JOIN cleaned_jobs c ON c.raw_id = r.id
+     WHERE r.id = ?`,
+    [id]
+  ) as any;
 
   if (!row) return null;
   return mapJobDetail(row);
@@ -125,53 +125,47 @@ export function getJobById(id: number): JobDetail | null {
 // 概览统计
 // ═══════════════════════════════════════════════════════════════
 
-export function getStats(): JobStats {
-  const db = getDb();
+export async function getStats(): Promise<JobStats> {
+  const db = await getDb();
 
   const totalJobs = (
-    db.prepare('SELECT COUNT(*) as cnt FROM raw_jobs').get() as any
+    execOne(db, 'SELECT COUNT(*) as cnt FROM raw_jobs') as any
   ).cnt;
 
   const totalCities = (
-    db
-      .prepare('SELECT COUNT(DISTINCT city) as cnt FROM raw_jobs')
-      .get() as any
+    execOne(db, 'SELECT COUNT(DISTINCT city) as cnt FROM raw_jobs') as any
   ).cnt;
 
-  const avgRow = db
-    .prepare(
-      `SELECT AVG((c.salary_min + c.salary_max) / 2.0) as avg_salary
-       FROM cleaned_jobs c
-       WHERE c.salary_min IS NOT NULL AND c.salary_max IS NOT NULL`
-    )
-    .get() as any;
+  const avgRow = execOne(
+    db,
+    `SELECT AVG((c.salary_min + c.salary_max) / 2.0) as avg_salary
+     FROM cleaned_jobs c
+     WHERE c.salary_min IS NOT NULL AND c.salary_max IS NOT NULL`
+  ) as any;
 
   // median via ordered rows
-  const medianRow = db
-    .prepare(
-      `SELECT (c.salary_min + c.salary_max) / 2.0 as mid
-       FROM cleaned_jobs c
-       WHERE c.salary_min IS NOT NULL AND c.salary_max IS NOT NULL
-       ORDER BY mid`
-    )
-    .all() as any[];
+  const medianRow = execAll(
+    db,
+    `SELECT (c.salary_min + c.salary_max) / 2.0 as mid
+     FROM cleaned_jobs c
+     WHERE c.salary_min IS NOT NULL AND c.salary_max IS NOT NULL
+     ORDER BY mid`
+  ) as any[];
   let medianSalary: number | null = null;
   if (medianRow.length > 0) {
     const mid = Math.floor(medianRow.length / 2);
     medianSalary = medianRow[mid].mid;
   }
 
-  const topCityRow = db
-    .prepare(
-      `SELECT city, COUNT(*) as cnt FROM raw_jobs GROUP BY city ORDER BY cnt DESC LIMIT 1`
-    )
-    .get() as any;
+  const topCityRow = execOne(
+    db,
+    'SELECT city, COUNT(*) as cnt FROM raw_jobs GROUP BY city ORDER BY cnt DESC LIMIT 1'
+  ) as any;
 
-  const topTechRow = db
-    .prepare(
-      `SELECT tech_stack FROM cleaned_jobs WHERE tech_stack IS NOT NULL`
-    )
-    .all() as any[];
+  const topTechRow = execAll(
+    db,
+    'SELECT tech_stack FROM cleaned_jobs WHERE tech_stack IS NOT NULL'
+  ) as any[];
 
   const techCounts = new Map<string, number>();
   for (const r of topTechRow) {
@@ -180,14 +174,17 @@ export function getStats(): JobStats {
       for (const t of arr) {
         techCounts.set(t, (techCounts.get(t) || 0) + 1);
       }
-    } catch { /* skip malformed JSON */ }
+    } catch {
+      /* skip malformed JSON */
+    }
   }
   const topTech =
     [...techCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
 
-  const latestRow = db
-    .prepare('SELECT MAX(scraped_at) as latest FROM raw_jobs')
-    .get() as any;
+  const latestRow = execOne(
+    db,
+    'SELECT MAX(scraped_at) as latest FROM raw_jobs'
+  ) as any;
 
   return {
     totalJobs,
@@ -208,17 +205,16 @@ export function getStats(): JobStats {
 // 薪资分布
 // ═══════════════════════════════════════════════════════════════
 
-export function getSalaryDistribution(
+export async function getSalaryDistribution(
   bucketSize: number = 5
-): SalaryBucket[] {
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT (c.salary_min + c.salary_max) / 2.0 as mid
-       FROM cleaned_jobs c
-       WHERE c.salary_min IS NOT NULL AND c.salary_max IS NOT NULL`
-    )
-    .all() as { mid: number }[];
+): Promise<SalaryBucket[]> {
+  const db = await getDb();
+  const rows = execAll(
+    db,
+    `SELECT (c.salary_min + c.salary_max) / 2.0 as mid
+     FROM cleaned_jobs c
+     WHERE c.salary_min IS NOT NULL AND c.salary_max IS NOT NULL`
+  ) as { mid: number }[];
 
   const buckets = new Map<number, number>();
   for (const { mid } of rows) {
@@ -244,11 +240,12 @@ export function getSalaryDistribution(
 // 技术栈排名
 // ═══════════════════════════════════════════════════════════════
 
-export function getTechRanking(limit: number = 15): TechRank[] {
-  const db = getDb();
-  const rows = db
-    .prepare('SELECT tech_stack FROM cleaned_jobs WHERE tech_stack IS NOT NULL')
-    .all() as { tech_stack: string }[];
+export async function getTechRanking(limit: number = 15): Promise<TechRank[]> {
+  const db = await getDb();
+  const rows = execAll(
+    db,
+    'SELECT tech_stack FROM cleaned_jobs WHERE tech_stack IS NOT NULL'
+  ) as { tech_stack: string }[];
 
   const counts = new Map<string, number>();
   let totalMentions = 0;
@@ -259,7 +256,9 @@ export function getTechRanking(limit: number = 15): TechRank[] {
         counts.set(t, (counts.get(t) || 0) + 1);
         totalMentions++;
       }
-    } catch { /* skip */ }
+    } catch {
+      /* skip */
+    }
   }
 
   return [...counts.entries()]
@@ -268,9 +267,10 @@ export function getTechRanking(limit: number = 15): TechRank[] {
     .map(([name, count]) => ({
       name,
       count,
-      percentage: totalMentions > 0
-        ? Math.round((count / totalMentions) * 1000) / 10
-        : 0,
+      percentage:
+        totalMentions > 0
+          ? Math.round((count / totalMentions) * 1000) / 10
+          : 0,
     }));
 }
 
@@ -278,19 +278,18 @@ export function getTechRanking(limit: number = 15): TechRank[] {
 // 城市统计
 // ═══════════════════════════════════════════════════════════════
 
-export function getCityStats(): CityStat[] {
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT r.city, COUNT(*) as cnt,
-              AVG((c.salary_min + c.salary_max) / 2.0) as avg_salary
-       FROM raw_jobs r
-       JOIN cleaned_jobs c ON c.raw_id = r.id
-       WHERE c.salary_min IS NOT NULL
-       GROUP BY r.city
-       ORDER BY cnt DESC`
-    )
-    .all() as any[];
+export async function getCityStats(): Promise<CityStat[]> {
+  const db = await getDb();
+  const rows = execAll(
+    db,
+    `SELECT r.city, COUNT(*) as cnt,
+            AVG((c.salary_min + c.salary_max) / 2.0) as avg_salary
+     FROM raw_jobs r
+     JOIN cleaned_jobs c ON c.raw_id = r.id
+     WHERE c.salary_min IS NOT NULL
+     GROUP BY r.city
+     ORDER BY cnt DESC`
+  ) as any[];
 
   return rows.map((r) => ({
     city: r.city,
@@ -303,16 +302,15 @@ export function getCityStats(): CityStat[] {
 // 学历分布
 // ═══════════════════════════════════════════════════════════════
 
-export function getEducationDistribution(): EducationStat[] {
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT c.education, COUNT(*) as cnt
-       FROM cleaned_jobs c
-       GROUP BY c.education
-       ORDER BY cnt DESC`
-    )
-    .all() as any[];
+export async function getEducationDistribution(): Promise<EducationStat[]> {
+  const db = await getDb();
+  const rows = execAll(
+    db,
+    `SELECT c.education, COUNT(*) as cnt
+     FROM cleaned_jobs c
+     GROUP BY c.education
+     ORDER BY cnt DESC`
+  ) as any[];
 
   const total = rows.reduce((sum, r) => sum + r.cnt, 0);
   return rows.map((r) => ({
@@ -326,19 +324,18 @@ export function getEducationDistribution(): EducationStat[] {
 // 经验 vs 薪资
 // ═══════════════════════════════════════════════════════════════
 
-export function getExperienceVsSalary(): ExperienceStat[] {
-  const db = getDb();
-  const rows = db
-    .prepare(
-      `SELECT c.experience_years_min,
-              AVG((c.salary_min + c.salary_max) / 2.0) as avg_salary,
-              COUNT(*) as cnt
-       FROM cleaned_jobs c
-       WHERE c.salary_min IS NOT NULL AND c.experience_years_min IS NOT NULL
-       GROUP BY c.experience_years_min
-       ORDER BY c.experience_years_min`
-    )
-    .all() as any[];
+export async function getExperienceVsSalary(): Promise<ExperienceStat[]> {
+  const db = await getDb();
+  const rows = execAll(
+    db,
+    `SELECT c.experience_years_min,
+            AVG((c.salary_min + c.salary_max) / 2.0) as avg_salary,
+            COUNT(*) as cnt
+     FROM cleaned_jobs c
+     WHERE c.salary_min IS NOT NULL AND c.experience_years_min IS NOT NULL
+     GROUP BY c.experience_years_min
+     ORDER BY c.experience_years_min`
+  ) as any[];
 
   return rows.map((r) => ({
     experienceYears: r.experience_years_min,
@@ -351,16 +348,18 @@ export function getExperienceVsSalary(): ExperienceStat[] {
 // 筛选选项
 // ═══════════════════════════════════════════════════════════════
 
-export function getFilterOptions(): FilterOptions {
-  const db = getDb();
+export async function getFilterOptions(): Promise<FilterOptions> {
+  const db = await getDb();
 
-  const cityRows = db
-    .prepare('SELECT DISTINCT city FROM raw_jobs ORDER BY city')
-    .all() as { city: string }[];
+  const cityRows = execAll(
+    db,
+    'SELECT DISTINCT city FROM raw_jobs ORDER BY city'
+  ) as { city: string }[];
 
-  const keywordRows = db
-    .prepare('SELECT DISTINCT keyword FROM raw_jobs ORDER BY keyword')
-    .all() as { keyword: string }[];
+  const keywordRows = execAll(
+    db,
+    'SELECT DISTINCT keyword FROM raw_jobs ORDER BY keyword'
+  ) as { keyword: string }[];
 
   return {
     cities: cityRows.map((r) => r.city),

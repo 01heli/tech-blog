@@ -2,8 +2,8 @@ import { getStats } from '@/lib/jobs/queries';
 import { formatSalary } from '@/lib/jobs/format';
 import { Briefcase, MapPin, TrendingUp, Database } from 'lucide-react';
 
-export function JobStatsBar() {
-  const stats = getStats();
+export async function JobStatsBar() {
+  const stats = await getStats();
 
   const items = [
     {

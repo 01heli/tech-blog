@@ -20,7 +20,7 @@ interface Props {
 }
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const job = getJobById(parseInt(params.id));
+  const job = await getJobById(parseInt(params.id));
   if (!job) return { title: '岗位未找到' };
   return {
     title: `${job.title} - ${job.companyShort || job.companyRaw}`,
@@ -28,11 +28,11 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
-export default function JobDetailPage({ params }: Props) {
+export default async function JobDetailPage({ params }: Props) {
   const id = parseInt(params.id);
   if (isNaN(id)) notFound();
 
-  const job = getJobById(id);
+  const job = await getJobById(id);
   if (!job) notFound();
 
   return (

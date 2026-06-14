@@ -20,7 +20,7 @@ export default async function JobsPage({
 }: {
   searchParams: { [key: string]: string | undefined };
 }) {
-  const options = getFilterOptions();
+  const options = await getFilterOptions();
 
   const filters = {
     city: searchParams.city,
@@ -33,7 +33,7 @@ export default async function JobsPage({
     pageSize: PER_PAGE,
   };
 
-  const { items: jobs, total } = getJobs(filters);
+  const { items: jobs, total } = await getJobs(filters);
   const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
 
   return (
