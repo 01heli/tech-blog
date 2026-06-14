@@ -1,0 +1,256 @@
+---
+title: '缓存配置：让网站快 10 倍'
+description: '配置 proxy_cache、fastcgi_cache 和浏览器缓存策略，掌握缓存层级及清除方法'
+order: 12
+---
+
+## 缓存的层次：从浏览器到服务器
+
+一个完整的缓存策略涉及多个层次：
+
+```
+用户浏览器
+    ↓ (Cache-Control, ETag, Expires)
+CDN（Cloudflare / 阿里云 CDN）
+    ↓ (缓存静态资源，离用户最近)
+Nginx (proxy_cache / fastcgi_cache)
+    ↓ (缓存后端响应，减少应用负载)
+后端应用 (Redis / Memcached)
+    ↓ (缓存数据库查询结果)
+数据库
+```
+
+每一层都能减少后面一层的压力。Nginx 处于中间位置，既能减少后端压力，又比 CDN 更灵活。
+
+## 浏览器缓存：从源头减少请求
+
+让用户浏览器缓存静态资源，是最有效的性能优化之一。
+
+```nginx
+location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+    expires 1y;                                    # 缓存 1 年
+    add_header Cache-Control "public, immutable";  # 告诉浏览器：这个文件永远不会变
+    add_header Vary "Accept-Encoding";             # 告诉 CDN：gzip 和 br 版本不同
+}
+```
+
+### expires vs Cache-Control
+
+| 指令 | 效果 |
+|------|------|
+| `expires 1y;` | 生成 `Expires` 头，日期为当前时间 + 1 年 |
+| `expires -1;` | 生成 `Expires` 为过去的时间，表示"立即过期" |
+| `expires epoch;` | 即 `Thu, 01 Jan 1970 00:00:01 GMT` |
+| `expires max;` | 即 `Thu, 31 Dec 2037 23:55:55 GMT` |
+
+`expires` 实际上就是简化版的 `Cache-Control`。现代浏览器认的是 `Cache-Control`：
+
+```
+Cache-Control: public, max-age=31536000, immutable
+```
+
+### 为什么静态资源可以缓存一年？
+
+因为你用了**文件名哈希**。Webpack/Vite 构建后，JS 文件名类似 `main.a1b2c3d4.js`。内容变了，哈希就变，文件名也变，浏览器自然会请求新文件。老文件在缓存里过期自动淘汰。这就是现代前端工程的"缓存破坏"策略。
+
+### HTML 文件不要缓存
+
+```nginx
+location / {
+    try_files $uri $uri/ /index.html;
+}
+
+# 对 HTML 页面禁用缓存
+location ~* \.html$ {
+    expires -1;
+    add_header Cache-Control "no-cache, must-revalidate";
+}
+```
+
+HTML 承载着对其他资源的引用，如果 HTML 被缓存了，用户可能拿到过期的 JS/CSS 文件名引用，导致页面白屏。
+
+## proxy_cache：缓存后端响应
+
+这是 Nginx 最有价值的缓存能力之一。如果你的后端服务每秒要处理 1000 个请求，其中 800 个返回一样的数据库查询结果，那用 Nginx 缓存可以减少 80% 的负载。
+
+### 基本配置
+
+```nginx
+http {
+    # 1. 定义缓存的存储位置和参数
+    proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=my_cache:10m
+                     max_size=1g inactive=60m use_temp_path=off;
+
+    server {
+        location /api/ {
+            proxy_pass http://backend/;
+            proxy_cache my_cache;
+            proxy_cache_valid 200 10m;       # 200 响应缓存 10 分钟
+            proxy_cache_valid 404 1m;        # 404 缓存 1 分钟
+            proxy_cache_key "$scheme$request_method$host$request_uri";
+
+            # 加一个头，方便调试时看到缓存状态
+            add_header X-Cache-Status $upstream_cache_status;
+        }
+    }
+}
+```
+
+### proxy_cache_path 参数详解
+
+| 参数 | 含义 |
+|------|------|
+| `/var/cache/nginx` | 缓存文件存放的目录 |
+| `levels=1:2` | 两级子目录（`1:2` = 取文件名最后 3 个字符，第 1 字符 1 级，后 2 字符 2 级） |
+| `keys_zone=my_cache:10m` | 内存中缓存键的共享区域名称 + 大小（10MB 约存 80000 个键） |
+| `max_size=1g` | 缓存最多占用 1GB 磁盘空间 |
+| `inactive=60m` | 60 分钟内未被访问的缓存内容会被删除 |
+| `use_temp_path=off` | 直接在缓存目录写文件（避免两次拷贝） |
+
+### proxy_cache_key
+
+缓存键决定了"什么请求是同一个请求"：
+
+```nginx
+# 默认缓存键
+proxy_cache_key "$scheme$request_method$host$request_uri";
+# 结果是: httpsGETapi.example.com/users?id=1
+```
+
+如果你的 API 用了 cookie 区分用户，不应该把 cookie 放进缓存键，否则缓存完全失去意义：
+
+```nginx
+# ❌ 不好：每个用户的缓存都不一样，缓存命中率 0
+proxy_cache_key "$scheme$request_method$host$request_uri$cookie_user";
+
+# ✅ 好：去掉 cookie，用请求路径和参数做键
+proxy_cache_key "$scheme$request_method$host$request_uri$args";
+```
+
+### 缓存状态调试
+
+`$upstream_cache_status` 告诉你这次请求有没有命中缓存：
+
+| 值 | 含义 |
+|------|------|
+| `MISS` | 没命中，去后端取了 |
+| `HIT` | 命中缓存 |
+| `EXPIRED` | 缓存过期了，去后端重新取了 |
+| `STALE` | 用了过期缓存（后端挂了时兜底） |
+| `UPDATING` | 在用过期缓存，同时在后台更新 |
+| `BYPASS` | 跳过了缓存（故意不缓存） |
+
+### 不缓存某些内容
+
+```nginx
+# 几种跳过缓存的方式
+
+# 方式 1：整个 location 不缓存
+location /api/realtime/ {
+    proxy_pass http://backend/;
+    proxy_cache off;
+}
+
+# 方式 2：特定响应码不缓存
+proxy_no_cache $cookie_nocache;      # cookie 中有 nocache 的不缓存
+proxy_cache_bypass $cookie_nocache;  # 同上但查缓存前就跳过
+
+# 方式 3：特定请求方法不缓存
+if ($request_method != GET) {
+    set $skip_cache 1;
+}
+proxy_no_cache $skip_cache;
+```
+
+## 缓存清除
+
+Nginx 免费版没有内置的清除缓存 API。有几种方法：
+
+### 方法 1：手动删文件（暴力）
+
+```bash
+# 停掉 Nginx，删除所有缓存文件
+sudo rm -rf /var/cache/nginx/*
+
+# 或者删特定缓存：先算出缓存文件名再删
+```
+
+### 方法 2：proxy_cache_purge（Nginx Plus / 第三方模块）
+
+```bash
+# 发出一个特殊的 PURGE 请求
+curl -X PURGE https://api.example.com/users?id=1
+```
+
+### 方法 3：短过期 + 主动刷新
+
+```nginx
+proxy_cache_valid 200 1m;  # 缓存只设 1 分钟
+```
+
+过期时间设短，让后端自己扛。对于多数场景，这是最简单的方案。
+
+## 完整缓存策略实战
+
+假设你的网站有这几种资源：
+
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=api_cache:10m
+                     max_size=1g inactive=30m;
+
+    server {
+        listen 443 ssl http2;
+
+        # 1. 静态资源：浏览器缓存 1 年
+        location /assets/ {
+            root /var/www/app;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # 2. 公开 API 数据：Nginx 缓存 5 分钟
+        location /api/public/ {
+            proxy_pass http://backend/;
+            proxy_cache api_cache;
+            proxy_cache_valid 200 5m;
+            proxy_cache_key "$scheme$request_method$host$request_uri$args";
+            add_header X-Cache-Status $upstream_cache_status;
+        }
+
+        # 3. 私人数据：不缓存
+        location /api/user/ {
+            proxy_pass http://backend/;
+            proxy_cache off;
+        }
+
+        # 4. HTML 页面：不缓存
+        location / {
+            try_files $uri /index.html;
+        }
+        location ~* \.html$ {
+            expires -1;
+            add_header Cache-Control "no-cache";
+        }
+    }
+}
+```
+
+## 小结
+
+这一章我们学到了：
+
+1. **浏览器缓存**：`expires` + `Cache-Control`，静态资源带哈希可以缓存一年
+2. **proxy_cache**：Nginx 作为缓存层减少后端负载
+3. **缓存键（cache_key）** 决定命中率，不要加 cookie
+4. **缓存状态（$upstream_cache_status）** 帮助调试
+5. 不同内容用不同策略：静态缓存一年、API 缓存几分钟、私人数据不缓存
+
+下一章，我们做性能调优——gzip、sendfile、worker 调参。
+
+---
+
+> **参考链接**
+> - ngx_http_proxy_module 缓存文档：https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache
+> - A Guide to Caching with Nginx：https://www.nginx.com/blog/nginx-caching-guide/
+> - Web Caching Basics：https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching

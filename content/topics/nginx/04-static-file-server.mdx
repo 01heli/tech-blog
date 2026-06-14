@@ -1,0 +1,250 @@
+---
+title: '搭建一个静态资源服务器'
+description: '用 Nginx 搭建静态网站，理解 root、alias、autoindex、try_files 的用法和区别'
+order: 4
+---
+
+## 目标：做一个能访问的网站
+
+到现在为止，你已经安装了 Nginx，也读懂了它的配置文件结构。现在我们来做一个真正能用的东西：**用 Nginx 托管一个静态网站**。
+
+静态网站就是纯 HTML、CSS、JS 文件的网站，没有后端代码。你写完这些文件后上传到服务器，Nginx 直接把它们发给浏览器。
+
+## 第一步：准备你的网站文件
+
+在服务器上创建一个目录，放几个 HTML 文件：
+
+```bash
+# 创建目录
+sudo mkdir -p /var/www/my-site
+
+# 创建一个简单的首页
+sudo tee /var/www/my-site/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>我的第一个 Nginx 站点</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 0 20px; }
+        h1 { color: #333; }
+    </style>
+</head>
+<body>
+    <h1>🎉 Nginx 运行成功！</h1>
+    <p>如果你看到这个页面，说明你的 Nginx 配置正确。</p>
+</body>
+</html>
+EOF
+
+# 再创建一个子目录
+sudo mkdir -p /var/www/my-site/about
+sudo tee /var/www/my-site/about/index.html << 'EOF'
+<h1>关于页面</h1>
+<p>这是 about 目录下的页面。</p>
+EOF
+```
+
+## 第二步：写站点配置
+
+在 `/etc/nginx/conf.d/` 下创建一个配置文件（如果这个目录不存在，检查你的 nginx.conf 有没有 include 它）：
+
+```nginx
+server {
+    listen 80;
+    server_name localhost;
+
+    # 网站根目录
+    root /var/www/my-site;
+
+    # 默认首页文件
+    index index.html index.htm;
+
+    location / {
+        # 尝试按顺序找文件：URI → 目录 → 404
+        try_files $uri $uri/ =404;
+    }
+}
+```
+
+保存后，先测试配置正确性，再重新加载：
+
+```bash
+sudo nginx -t
+sudo nginx -s reload
+```
+
+打开浏览器访问 `http://localhost`，你应该看到刚才写的 HTML 页面。
+
+## `root` vs `alias`：最容易搞混的两个指令
+
+这两个指令都用来指定文件路径，但行为不同。新手经常搞混，我们用一个例子彻底搞清楚。
+
+### `root` —— 拼接路径
+
+```nginx
+location /images/ {
+    root /var/www/static;
+}
+```
+
+当请求 `/images/logo.png` 时，Nginx 实际查找的路径是：
+
+```
+/var/www/static/images/logo.png
+```
+
+`root` 会把 `location` 后面的路径**原封不动地拼接**上去。
+
+### `alias` —— 替换路径
+
+```nginx
+location /images/ {
+    alias /var/www/static/;
+}
+```
+
+当请求 `/images/logo.png` 时，Nginx 实际查找的路径是：
+
+```
+/var/www/static/logo.png
+```
+
+`alias` 会把 `location` 匹配到的部分**替换为** `alias` 指定的路径。
+
+### 一张图看懂
+
+```
+请求: /images/logo.png
+
+root /data;      → 查找 /data/images/logo.png  (拼接)
+alias /data/;    → 查找 /data/logo.png          (替换)
+```
+
+**注意 `alias` 路径末尾的斜杠**：如果 `location` 以 `/` 结尾，`alias` 也最好以 `/` 结尾，保持一致避免路径错乱。
+
+### 什么时候用哪个？
+
+- **`root`**：绝大部分场景，推荐优先使用，直觉性好
+- **`alias`**：当你想把 URL 的某段路径映射到完全不同的目录时。比如 `/download/` 映射到 `/mnt/nas/files/`
+
+## 文件目录自动展示：`autoindex`
+
+有时候你想让用户看到某个目录下的文件列表（像一个简易的文件管理器），可以用 `autoindex`：
+
+```nginx
+location /files/ {
+    alias /var/www/downloads/;
+    autoindex on;              # 开启目录列表
+    autoindex_exact_size off;  # 文件大小显示为人类可读格式（KB/MB）
+    autoindex_localtime on;    # 时间显示为本地时间
+}
+```
+
+访问 `/files/` 时，Nginx 会返回一个漂亮的文件列表页面：
+
+```
+Index of /files/
+
+../
+report.pdf          03-Jun-2026 15:30    2.3M
+data.csv            02-Jun-2026 09:12     45K
+archive.zip         01-Jun-2026 22:05    120M
+```
+
+**安全提醒**：生产环境不建议把 `autoindex` 开在重要目录上，会暴露文件结构。
+
+## `try_files`：请求兜底
+
+`try_files` 是 Nginx 里最常用的指令之一，用来按顺序尝试找到文件，全找不到就执行最后一个参数。
+
+```nginx
+location / {
+    try_files $uri $uri/ =404;
+}
+```
+
+它的执行逻辑是：
+
+1. 先尝试 `$uri` —— 请求 URI 对应的文件
+2. 找不到文件，再尝试 `$uri/` —— 对应的目录（如果有 index 文件就返回）
+3. 目录也找不到，返回 404
+
+### SPA 应用的配置
+
+如果你部署的是一个单页面应用（React、Vue 等），需要把所有找不到的路径都指向 `index.html`：
+
+```nginx
+location / {
+    try_files $uri $uri/ /index.html;
+}
+```
+
+这样刷新 `/user/profile` 这种前端路由时，服务器不会返回 404，而是返回 `index.html`，然后前端路由自己解析 URL。
+
+## 配置自定义 404 页面
+
+```nginx
+# 在 server 块中
+error_page 404 /404.html;
+error_page 500 502 503 504 /50x.html;
+
+location = /404.html {
+    root /var/www/errors;
+    internal;  # 只能内部重定向，不能直接访问
+}
+
+location = /50x.html {
+    root /var/www/errors;
+    internal;
+}
+```
+
+`internal` 指令表示这些页面只能通过内部重定向（如 `error_page` 或 `try_files`）访问，直接输入 URL 是访问不到的。
+
+## 实际项目示例：托管一个 React 应用
+
+假设你用 `npm run build` 构建了一个 React 应用，产物在 `/var/www/react-app/dist/`，配置如下：
+
+```nginx
+server {
+    listen 80;
+    server_name app.example.com;
+    root /var/www/react-app/dist;
+    index index.html;
+
+    # JS/CSS 静态资源加长缓存
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # 其他路由交给前端
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # gzip 压缩（可选但推荐）
+    gzip on;
+    gzip_types text/css application/javascript image/svg+xml;
+}
+```
+
+## 小结
+
+这一章我们完成了：
+
+1. 创建了第一个可用的 Nginx 站点
+2. 搞懂了 `root` vs `alias` 的区别：拼接 vs 替换
+3. 学会了 `autoindex` 做简易文件管理器
+4. 掌握了 `try_files` 做请求兜底（对 SPA 尤其重要）
+5. 配置了自定义错误页面
+
+下一章，我们将学习如何用 `server_name` 在一台服务器上跑多个网站。
+
+---
+
+> **参考链接**
+> - Nginx root 和 alias 文档：https://nginx.org/en/docs/http/ngx_http_core_module.html#root
+> - try_files 详解：https://nginx.org/en/docs/http/ngx_http_core_module.html#try_files
+> - Nginx Pitfalls：https://www.nginx.com/resources/wiki/start/topics/tutorials/config_pitfalls/

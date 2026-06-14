@@ -1,4 +1,5 @@
 import { HeroSection } from '@/components/home/HeroSection';
+import { QuickNav } from '@/components/home/QuickNav';
 import { SiteStats } from '@/components/home/SiteStats';
 import { CategoryQuickLinks } from '@/components/home/CategoryQuickLinks';
 import { FeaturedArticle } from '@/components/home/FeaturedArticle';
@@ -19,6 +20,19 @@ export default async function Home() {
     <>
       <HeroSection />
 
+      {/* Quick Navigation Grid */}
+      <section className="section-padding pb-0">
+        <Container>
+          <AnimatedSection>
+            <p className="text-xs font-medium tracking-widest uppercase text-muted/60 mb-6">
+              快速导航
+            </p>
+          </AnimatedSection>
+          <QuickNav />
+        </Container>
+      </section>
+
+      {/* Stats + Categories */}
       <section className="section-padding">
         <Container>
           <AnimatedSection>

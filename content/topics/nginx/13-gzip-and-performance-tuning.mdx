@@ -1,0 +1,276 @@
+---
+title: 'Gzip 压缩与性能调优'
+description: '掌握 gzip 压缩、sendfile、worker 参数调优和 keepalive，全面优化 Nginx 性能'
+order: 13
+---
+
+## 性能优化的几个维度
+
+Nginx 的性能优化不是"改一个参数就快了 10 倍"，而是从多个维度累积效果：
+
+1. **网络层**：压缩、连接复用、缓冲区
+2. **文件层**：零拷贝、AIO
+3. **进程层**：worker 数量、连接数上限
+4. **应用层**：后端缓存、超时控制
+
+这一章我们逐个击破。
+
+## Gzip 压缩：减小传输体积
+
+压缩是性价最高的优化。开启 gzip 通常能让文本资源体积减小 60%-80%，代价只是消耗一点点 CPU。
+
+```nginx
+http {
+    # 1. 开启 gzip
+    gzip on;
+
+    # 2. 压缩级别（1-9，越大压缩率越高但越耗 CPU）
+    gzip_comp_level 6;
+
+    # 3. 最小压缩阈值（小于这个的不压缩，浪费 CPU）
+    gzip_min_length 256;
+
+    # 4. 要压缩的 MIME 类型
+    gzip_types
+        text/plain
+        text/css
+        text/javascript
+        application/javascript
+        application/json
+        application/xml
+        text/xml
+        image/svg+xml
+        application/rss+xml
+        font/ttf;
+
+    # 5. 不压缩已经很小的文件类型
+    gzip_types application/xml+rss application/atom+xml;
+
+    # 6. 在代理中也压缩
+    gzip_proxied any;
+
+    # 7. 响应头加 Vary，让 CDN 正确缓存
+    gzip_vary on;
+
+    # 8. 禁用 IE6 的 gzip（如果还需要支持的话）
+    gzip_disable "msie6";
+}
+```
+
+### 为什么 gzip_comp_level 不设 9？
+
+等级 6 和 9 的压缩率差距约 2-3%，但 CPU 消耗差距可达 50%。对于动态内容，6 是最佳平衡点。对于静态文件，你可以在构建时预压缩（webpack plugin 生成 `.gz` 文件），Nginx 直接用 `gzip_static on` 读取预压缩文件。
+
+### 预压缩静态文件（gzip_static）
+
+```nginx
+location /assets/ {
+    gzip_static on;  # 如果有 .gz 文件就直接用它
+    root /var/www/app;
+}
+```
+
+在构建时：
+```bash
+# 对所有文本文件生成 gzip 压缩版本
+find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' \) -exec gzip -kf9 {} \;
+```
+
+## sendfile 与零拷贝
+
+```nginx
+sendfile on;
+tcp_nopush on;
+```
+
+这两行在第 3 章提过，这里深入理解：
+
+### sendfile on
+
+正常的文件传输路径：
+```
+磁盘 → 内核读缓冲区 → 用户空间（Nginx 进程） → 内核 socket 缓冲区 → 网卡
+```
+
+开启 `sendfile on` 后：
+```
+磁盘 → 内核缓冲区 → 网卡
+```
+
+省略了"用户空间"这一步。这就是**零拷贝（Zero Copy）**——数据根本没到应用程序，直接在内核空间就发走了。
+
+**什么时候关掉**：如果你的 location 用了 `aio threads`（异步 IO），要关掉 sendfile，因为它们互斥。
+
+### tcp_nopush on
+
+只在 `sendfile on` 时有效。它的效果是：
+1. 攒够一个 TCP 包再发（而不是一点点数据就来一个包）
+2. 把 HTTP 响应头和文件内容打包在一个包中
+
+减少网络包数量 = 减少 TCP/IP 协议栈的开销。
+
+### tcp_nodelay on（它的"相反"兄弟）
+
+```nginx
+tcp_nodelay on;
+```
+
+`tcp_nopush` 是"攒一攒再发"，`tcp_nodelay` 是"有数据立刻发"。
+
+**最佳实践**：两者都开。`tcp_nopush` 在 sendfile 场景下打包发送，`tcp_nodelay` 在 keepalive 场景下保证小包不延迟。
+
+## Worker 参数调优
+
+```nginx
+# worker 数量
+worker_processes auto;
+
+# 每个 worker 的最大连接数
+events {
+    worker_connections 2048;
+    multi_accept on;
+    use epoll;
+}
+
+# 每个 worker 能打开的文件数上限
+worker_rlimit_nofile 65535;
+```
+
+### worker_connections 设多少？
+
+理论最大并发 = `worker_processes × worker_connections`
+
+但实际受限的是**操作系统的文件描述符上限**：
+
+```bash
+# 检查当前限制
+ulimit -n
+
+# 如果返回 1024，那即使 Nginx 设了 10000 也会被限制
+# 解决方法：修改系统限制
+sudo sysctl -w fs.file-max=65535
+echo "nginx soft nofile 65535" | sudo tee -a /etc/security/limits.conf
+```
+
+`worker_rlimit_nofile` 应该在 `worker_connections × 2` 左右（Nginx 每个连接需要 2 个文件描述符：客户端 + 代理）。
+
+### multi_accept on
+
+```nginx
+events {
+    multi_accept on;
+}
+```
+
+`on`：当一个新连接到来时，worker 一次性接受所有排队的连接。
+`off`（默认）：每次只接受一个新连接。
+
+高并发场景下建议 `on`，但会增加单个 worker 的瞬时负载。
+
+## keepalive 调优
+
+### 客户端 keepalive
+
+```nginx
+keepalive_timeout 65;
+keepalive_requests 100;
+```
+
+- `keepalive_timeout 65`：空闲 keepalive 连接保持 65 秒
+- `keepalive_requests 100`：一个 keepalive 连接最多处理 100 个请求，之后关闭
+
+为什么限制请求数？防止某个长连接占用太久，影响负载均衡。100 是合理的默认值。
+
+### 后端 keepalive（upstream）
+
+```nginx
+upstream backend {
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+location / {
+    proxy_pass http://backend;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+}
+```
+
+我们在第 8 章讲过，这里总结一下：后端 keepalive 避免每次代理都重新 TCP 握手。这个优化对高 QPS 场景效果显著。
+
+## 调优前后的对比检查表
+
+| 检查项 | 默认值 | 调优后 |
+|--------|--------|--------|
+| gzip | off | on + level 6 |
+| sendfile | 取决于版本 | on |
+| tcp_nopush | off | on |
+| tcp_nodelay | on | on（保持） |
+| worker_connections | 512 | 2048+ |
+| keepalive_timeout | 75 | 65 |
+| keepalive_requests | 1000 | 100-200 |
+| proxy buffer size | 4k/8k | 根据响应大小调大 |
+
+## 完整优化配置模板
+
+```nginx
+# nginx.conf 优化部分
+user nginx;
+worker_processes auto;
+worker_rlimit_nofile 65535;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 2048;
+    multi_accept on;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 日志
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" rt=$request_time';
+    access_log /var/log/nginx/access.log main buffer=32k flush=5s;
+    error_log /var/log/nginx/error.log warn;
+
+    # 性能核心
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 100;
+
+    # Gzip
+    gzip on;
+    gzip_comp_level 6;
+    gzip_min_length 256;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml image/svg+xml;
+    gzip_vary on;
+    gzip_proxied any;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+## 小结
+
+这一章我们学到了：
+
+1. **gzip** 是最简单高效的压缩方案，level 6 最佳平衡
+2. **sendfile + tcp_nopush** 实现零拷贝和打包发送
+3. **worker_connections** 和系统文件描述符要匹配
+4. **keepalive** 复用连接减少 TCP 开销
+5. 日志用 `buffer` 和 `flush` 参数减少磁盘 IO 频率
+
+下一章，我们将 Nginx 与 PHP-FPM 结合，部署一个动态 PHP 应用。
+
+---
+
+> **参考链接**
+> - Nginx Performance Tuning：https://www.nginx.com/blog/tuning-nginx/
+> - Linux sendfile 系统调用：https://man7.org/linux/man-pages/man2/sendfile.2.html
+> - Google Web Fundamentals - gzip：https://developers.google.com/web/fundamentals/performance/optimizing-content-efficiency/optimize-encoding-and-transfer

@@ -1,0 +1,144 @@
+---
+title: '什么是 Nginx？为什么人人都用它？'
+description: '了解 Nginx 的起源、核心特性、事件驱动架构，以及与 Apache 的对比'
+order: 1
+---
+
+## 从一个问题开始：当你在浏览器输入网址后发生了什么？
+
+先不急看 Nginx，我们从一个你每天都在做的事情开始：**打开浏览器，输入一个网址，按下回车**。
+
+在那一瞬间，浏览器做了很多事情：DNS 解析域名、建立 TCP 连接、发送 HTTP 请求……最终，你的请求到达了远程服务器。而站在服务器门口、第一个接待这个请求的，通常就是 Nginx。
+
+**Nginx 是什么？** 用一句话概括：Nginx（发音 "Engine-X"）是一个**高性能的 HTTP 服务器和反向代理服务器**。它还可以作为邮件代理服务器和通用的 TCP/UDP 代理服务器。
+
+但这只是定义。要真正理解 Nginx 为什么重要，我们需要回到 20 年前。
+
+## Nginx 的起源：C10K 问题
+
+2002 年左右，俄罗斯程序员 Igor Sysoev 遇到了一个难题：他当时为一家流量很高的俄罗斯网站工作（Rambler），网站每天要处理数亿次请求。那时的主流服务器是 **Apache**，而 Apache 在处理高并发请求时表现得非常吃力。
+
+问题的核心是：**Apache 默认使用"一个请求一个进程/线程"的模型**。当 10000 个用户同时访问时，Apache 会创建 10000 个进程（或线程）。每个进程都要消耗内存和 CPU 资源，操作系统还要不断地在这么多进程之间做上下文切换。这就叫 **C10K 问题**（处理 10000 个并发连接）。
+
+打个比方：Apache 就像一家餐馆，每来一位客人就专门派一个服务员去接待。当同时来了 10000 位客人时，你需要 10000 个服务员——这显然不现实。
+
+Igor 决定写一个新的服务器来解决这个问题。2004 年，Nginx 发布了第一个公开版本。
+
+## Nginx 的核心设计理念：事件驱动架构
+
+Nginx 是怎么解决 C10K 问题的？答案在于**事件驱动（Event-Driven）架构**。
+
+Nginx 启动时会创建一定数量的 **worker 进程**（通常等于 CPU 核心数），每个 worker 进程都是**单线程**的，但它可以同时处理成千上万个连接。
+
+这怎么做到的呢？关键在于：worker 进程不会为每个请求"傻等你"。它使用操作系统提供的 **I/O 多路复用** 机制（在 Linux 上是 `epoll`，FreeBSD 上是 `kqueue`），同时监听几千个连接上的事件。只有当某个连接上真的有数据需要处理时，worker 才会去处理它。处理完就立刻去处理下一个有数据的连接，没有空闲等待。
+
+还是用餐馆做比喻：Nginx 就像一个超级厉害的服务员，他同时照看所有桌子。他不站在任何一桌旁边等着客人点菜，而是不停扫视全场——看到有人举手（事件发生），立刻过去处理，处理完马上又去扫视全场。
+
+这就是 Nginx 为什么又快又省资源：
+- **内存占用低**：一个 worker 进程可能只占几十 MB 内存，但能处理数万个并发连接
+- **CPU 利用率高**：没有频繁的进程/线程切换开销
+- **不会雪崩**：即使流量暴增，Nginx 也不会创建更多进程，而是有序排队
+
+## Nginx vs Apache：一张表看懂
+
+| 特性 | Nginx | Apache |
+|------|-------|--------|
+| 架构 | 事件驱动、异步、非阻塞 | 进程/线程驱动、同步阻塞（部分 MPM 可改善） |
+| 并发能力 | 数万并发连接轻松 | 数百到数千并发需要大量资源 |
+| 内存消耗 | 低（每个连接只占很少内存） | 高（每个连接一个进程/线程） |
+| 静态文件 | 极快（直接 sendfile 系统调用） | 较快 |
+| 动态内容 | 不能独立处理（需配合 FastCGI 等） | 可通过模块直接处理（如 mod_php） |
+| 配置 | 简洁清晰，但学习曲线略陡 | 灵活强大，`.htaccess` 分布式配置 |
+| 模块系统 | 编译时决定（静态模块为主） | 可动态加载/卸载模块 |
+| 适用场景 | 反向代理、负载均衡、静态文件、高并发入口 | 共享主机、需要 `.htaccess` 的场景 |
+
+## Nginx 的实际应用场景
+
+在实际生产环境中，Nginx 不仅仅是"一个 Web 服务器"。它的角色多种多样：
+
+### 1. 静态资源服务器
+
+直接把 HTML、CSS、JS、图片、视频等静态文件返回给客户端。Nginx 做这件事非常高效，因为它可以直接调用 Linux 的 `sendfile()` 系统调用，数据从磁盘到网卡几乎零拷贝。
+
+```nginx
+server {
+    listen 80;
+    server_name static.example.com;
+    root /var/www/static;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+```
+
+### 2. 反向代理
+
+这是 Nginx 最常见的用途。Nginx 站在后端应用服务器（如 Node.js、Python、Go）前面，接收外部请求，转发给内部服务器，再把响应返回给客户端。这样做有很多好处：隐藏内部服务器、统一入口做日志和监控、缓存静态内容、SSL 终结等。
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+### 3. 负载均衡
+
+当你的服务实例有多个时（比如 3 台 Node.js 服务器），Nginx 可以把流量均匀分配到它们上面。
+
+```nginx
+upstream backend {
+    server 192.168.1.10:3000 weight=3;
+    server 192.168.1.11:3000;
+    server 192.168.1.12:3000;
+}
+
+location / {
+    proxy_pass http://backend;
+}
+```
+
+### 4. SSL/TLS 终结
+
+Nginx 在前面处理所有 HTTPS 加密和解密，让后端服务只需要处理 HTTP 请求。
+
+### 5. 微服务网关
+
+在微服务架构中，Nginx 作为 API 网关，根据请求路径把流量路由到不同的微服务。
+
+## 今天的 Nginx
+
+到今天，Nginx 是全球最流行的 Web 服务器之一。根据 Netcraft 和 W3Techs 的统计，Nginx 和 Apache 常年占据 Web 服务器市场份额的前两位。全球约三分之一的网站由 Nginx 提供服务。
+
+Nginx 的商业版本 **Nginx Plus** 由 F5 公司维护（F5 于 2019 年收购了 Nginx Inc.），提供更多企业级功能如主动健康检查、session 持久化、实时监控等。
+
+还有一个重要分支——**OpenResty**，它是基于 Nginx 和 LuaJIT 的 Web 平台，允许开发者用 Lua 脚本语言在 Nginx 层面编写业务逻辑，在性能敏感的场景（如 API 网关）中用得很多。
+
+## 在哪能看到 Nginx？
+
+你可能每天都在用 Nginx，只是不知道而已。很多知名公司都在用：
+- **Netflix**：用 Nginx 作为其 CDN 基础设施的一部分
+- **Dropbox**：用 Nginx 处理海量文件上传
+- **Airbnb**：Nginx 作为反向代理和负载均衡器
+- **国内的淘宝、京东、字节跳动**：也在大量使用 Nginx/OpenResty
+
+## 小结
+
+这一章我们了解了：
+
+1. Nginx 是一个高性能 HTTP 和反向代理服务器
+2. 它用事件驱动 + 异步非阻塞的架构解决了 C10K 问题
+3. 相比 Apache，Nginx 在高并发场景下有巨大优势
+4. Nginx 的实际角色：静态服务器、反向代理、负载均衡器、SSL 终结者、API 网关
+
+下一章，我们会在自己的电脑上安装 Nginx。
+
+---
+
+> **参考链接**
+> - Nginx 官方文档：https://nginx.org/en/docs/
+> - "The Architecture of Open Source Applications - Nginx"：https://aosabook.org/en/v2/nginx.html
+> - Igor Sysoev 访谈：https://web.archive.org/web/20160304032151/https://mindend.com/interview-with-igor-sysoev-author-of-apaches-competitor-nginx/
+> - C10K 问题（Dan Kegel）：http://www.kegel.com/c10k.html

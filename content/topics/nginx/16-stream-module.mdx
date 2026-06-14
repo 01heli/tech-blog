@@ -1,0 +1,216 @@
+---
+title: 'Stream 模块：代理 TCP/UDP 流量'
+description: '用 Nginx Stream 模块代理 MySQL、Redis 甚至整个 TCP 服务，实现四层负载均衡'
+order: 16
+---
+
+## 你不是只能代理 HTTP
+
+前面 15 章我们都在讨论 HTTP/HTTPS。但 Nginx 的能力不止于此。**Stream 模块**让你代理任意 TCP 和 UDP 流量——MySQL、Redis、PostgreSQL、SSH，甚至你自己的 TCP 协议。
+
+## HTTP 代理 vs TCP 代理：七层和四层的区别
+
+这是理解 Stream 模块的关键：
+
+| | HTTP 代理（七层） | Stream 代理（四层） |
+|------|------|------|
+| 理解的内容 | HTTP 请求、URL、Header、Body | 只看 IP 和端口，不理解内容 |
+| 能做的操作 | 路由到不同 location、改 Header、缓存 | 只能做简单转发、负载均衡 |
+| 性能 | 需要解析 HTTP 协议 | 更快，不做内容解析 |
+| 适用场景 | Web 应用 | 数据库、缓存、邮件、自定义协议 |
+
+打个比方：七层代理像一个懂中文的邮递员，他能看信的内容决定送到哪个部门。四层代理像转运中心，只看到包裹上的地址标签，不打开包裹。
+
+## 基本配置：代理 MySQL
+
+```nginx
+# Stream 配置独立于 http 块之外！
+# 一般写在 /etc/nginx/stream.conf.d/ 或 nginx.conf 最外层的 stream 块中
+
+stream {
+    # MySQL 代理
+    server {
+        listen 3306;
+        proxy_pass 10.0.1.50:3306;
+        proxy_connect_timeout 5s;
+    }
+}
+```
+
+就这么简单：所有连到 Nginx 3306 端口的 TCP 连接，直接转发到 `10.0.1.50:3306`。
+
+### 你需要确保 stream 配置被加载
+
+在 `nginx.conf` 的最外层（和 `http` 块同级）加上：
+
+```nginx
+http {
+    # ... 所有 HTTP 配置
+}
+
+# ⬇️ 和 http 平级
+stream {
+    include /etc/nginx/stream.conf.d/*.conf;
+}
+```
+
+## 负载均衡 MySQL 读库
+
+```nginx
+stream {
+    upstream mysql_read {
+        server 10.0.1.10:3306 weight=3;
+        server 10.0.1.11:3306 weight=1;
+        server 10.0.1.12:3306 backup;
+    }
+
+    server {
+        listen 3307;  # 对外开放 3307，转发到 MySQL 读库集群
+        proxy_pass mysql_read;
+        proxy_connect_timeout 3s;
+    }
+}
+```
+
+使用方式：应用连接 `mysql://nginx_host:3307`（读操作），`mysql://master:3306`（写操作）。
+
+## 代理 Redis
+
+```nginx
+stream {
+    upstream redis_cluster {
+        server 10.0.1.20:6379;
+        server 10.0.1.21:6379;
+        server 10.0.1.22:6379;
+    }
+
+    server {
+        listen 6379;
+        proxy_pass redis_cluster;
+        proxy_connect_timeout 2s;
+        proxy_timeout 10m;  # Redis 连接可能长时间空闲
+    }
+}
+```
+
+## SSL/TLS 透传
+
+有些场景下，你需要 Nginx 根据 TLS 握手中的 SNI（Server Name Indication）把流量路由到不同后端，但不解密内容：
+
+```nginx
+stream {
+    # 根据 SNI 域名路由（Nginx 1.11.5+）
+    map $ssl_preread_server_name $backend {
+        app1.example.com    app1_backend;
+        app2.example.com    app2_backend;
+        default             default_backend;
+    }
+
+    upstream app1_backend { server 10.0.1.10:443; }
+    upstream app2_backend { server 10.0.1.11:443; }
+    upstream default_backend { server 10.0.1.99:443; }
+
+    server {
+        listen 443;
+        ssl_preread on;           # 启用 SNI 预读
+        proxy_pass $backend;      # 根据 SNI 动态选择后端
+        proxy_connect_timeout 5s;
+    }
+}
+```
+
+这叫做 **TLS Passthrough**（透传）。Nginx 只看 SNI 中的域名，不解密 TLS 流量。后端服务器各自管理自己的证书。这在多租户平台中非常有用——每个用户有自己的后端和证书，Nginx 不需要持有他们的私钥。
+
+## 实用场景汇总
+
+| 场景 | 配置要点 |
+|------|----------|
+| MySQL 负载均衡 | `upstream` + 不同的读写端口 |
+| Redis 高可用 | `proxy_pass` + proxy_timeout 设长 |
+| SSH 跳板 | `listen 2222; proxy_pass internal_host:22;` |
+| 邮件服务器 | SMTP (25)、IMAP (143)、POP3 (110) |
+| 自定义 TCP 协议 | 各种 IoT、游戏服务器 |
+| K8s NodePort 替代 | 用 Nginx 做 TCP 入口 |
+
+## 日志记录
+
+Stream 模块有自己的访问日志格式：
+
+```nginx
+stream {
+    log_format stream_log '$remote_addr [$time_local] '
+                          '$protocol $status $bytes_sent $bytes_received '
+                          '$session_time "$upstream_addr"';
+
+    access_log /var/log/nginx/stream.log stream_log;
+
+    server {
+        listen 3306;
+        proxy_pass mysql_backend;
+        access_log /var/log/nginx/mysql.log stream_log;
+    }
+}
+```
+
+注意 Stream 日志的变量和 HTTP 不完全一样：
+
+| Stream 变量 | 含义 |
+|------------|------|
+| `$protocol` | TCP 还是 UDP |
+| `$status` | 连接状态（200 成功） |
+| `$bytes_sent` | 发送字节数 |
+| `$bytes_received` | 接收字节数 |
+| `$session_time` | 连接持续时间 |
+| `$upstream_addr` | 转发到的后端地址 |
+
+## HTTP 和 Stream 共存
+
+一个 Nginx 实例可以同时处理 HTTP 和 TCP 流量：
+
+```nginx
+# nginx.conf
+user nginx;
+worker_processes auto;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    # Web 服务
+    server {
+        listen 80;
+        server_name example.com;
+        # ...
+    }
+}
+
+stream {
+    # TCP 代理
+    server {
+        listen 3306;
+        proxy_pass 10.0.1.50:3306;
+    }
+}
+```
+
+同一个 worker 进程既处理 HTTP 也处理 TCP。配置清晰、资源高效。
+
+## 小结
+
+这一章我们学到了：
+
+1. Stream 模块做四层（TCP/UDP）代理，不理解应用协议内容
+2. `proxy_pass` + `upstream` 同样适用于 TCP 服务
+3. `ssl_preread` 实现 TLS 透传（SNI 路由）
+4. MySQL、Redis、SSH 都可以用 Nginx 做负载均衡和高可用
+5. Stream 日志记录了连接级别的信息（字节数、持续时间）
+
+下一章，我们把 Nginx 装进 Docker。
+
+---
+
+> **参考链接**
+> - ngx_stream_core_module：https://nginx.org/en/docs/stream/ngx_stream_core_module.html
+> - TCP Load Balancing with Nginx：https://www.nginx.com/blog/tcp-load-balancing-nginx/
+> - Nginx as MySQL Load Balancer：https://www.nginx.com/blog/mysql-load-balancing-with-nginx-and-proxysql/

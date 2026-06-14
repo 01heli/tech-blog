@@ -1,0 +1,266 @@
+---
+title: 'Nginx + PHP-FPM：部署 PHP 应用'
+description: '配置 FastCGI 连接 PHP-FPM，掌握 PHP 应用部署、常见问题排查和性能优化'
+order: 14
+---
+
+## 为什么 Nginx 不能直接运行 PHP？
+
+Nginx 本身不支持 PHP。Apache 有一个 `mod_php` 模块可以把 PHP 解释器嵌入 Apache 进程中，但 Nginx 选择了完全不同的路径：**把 PHP 的处理交给一个独立的外部服务**——PHP-FPM（FastCGI Process Manager）。
+
+这种分离设计有几个好处：
+- Nginx 和 PHP 可以独立扩展、独立升级
+- PHP 进程崩溃不影响 Nginx
+- 一个 PHP-FPM 池可以被多个 Nginx 实例共享
+
+## PHP-FPM 是什么？
+
+PHP-FPM 是一个 FastCGI 协议的实现。它的工作方式：
+
+1. 启动时创建一组 PHP worker 进程（进程池）
+2. 等待 Nginx 通过 Unix socket 或 TCP 发来请求
+3. Worker 进程执行 PHP 代码，把结果返回给 Nginx
+4. Nginx 把结果返回给客户端
+
+## 安装 PHP-FPM
+
+```bash
+# Ubuntu/Debian
+sudo apt install -y php-fpm php-mysql php-mbstring php-xml php-curl
+
+# CentOS/RHEL
+sudo yum install -y php-fpm php-mysql php-mbstring php-xml php-curl
+
+# 启动
+sudo systemctl start php-fpm
+sudo systemctl enable php-fpm
+```
+
+### 确认 PHP-FPM 的监听方式
+
+```bash
+# 查看 PHP-FPM 配置
+sudo grep -r "listen" /etc/php/
+```
+
+你会看到两种之一：
+
+```ini
+; Unix socket（推荐）
+listen = /run/php/php8.2-fpm.sock
+
+; TCP socket
+listen = 127.0.0.1:9000
+```
+
+**Unix socket 比 TCP 快**（没有 TCP/IP 协议栈的开销），但只能在同台机器上用。如果 Nginx 和 PHP-FPM 在不同服务器上，必须用 TCP。
+
+## 配置 Nginx 连接 PHP-FPM
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+    root /var/www/example;
+    index index.php index.html;
+
+    # PHP 文件的处理
+    location ~ \.php$ {
+        # 方式 1：Unix socket（推荐）
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+
+        # 方式 2：TCP socket
+        # fastcgi_pass 127.0.0.1:9000;
+
+        # 必须的参数
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    # 静态文件照常处理
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+```
+
+### SCRIPT_FILENAME 是最容易出错的参数
+
+`SCRIPT_FILENAME` 告诉 PHP-FPM"这个 PHP 文件在服务器的什么位置"。它必须指向文件系统中的实际文件路径。
+
+```nginx
+fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+# 结果：/var/www/example/index.php
+```
+
+**如果这个参数设错了**（比如路径不对），你会看到 "File not found." 错误。
+
+### fastcgi_params 包含了什么？
+
+`/etc/nginx/fastcgi_params`（或 `fastcgi.conf`）包含一组标准的 FastCGI 参数，如 `QUERY_STRING`、`REQUEST_METHOD`、`CONTENT_TYPE` 等。你要确保 include 了它，否则 PHP-FPM 拿不到请求信息。
+
+## 常见问题排查
+
+### 问题 1：502 Bad Gateway
+
+PHP-FPM 没有运行或者 socket 不对。
+
+```bash
+# 检查 PHP-FPM 是否在运行
+sudo systemctl status php-fpm
+
+# 检查 socket 文件是否存在
+ls -l /run/php/php8.2-fpm.sock
+
+# 检查 socket 权限
+# Nginx（通常以 nginx 用户运行）需要有读写权限
+sudo stat /run/php/php8.2-fpm.sock
+```
+
+### 问题 2：File not found.
+
+`SCRIPT_FILENAME` 路径拼错了，或者文件真的不存在。
+
+```bash
+# 加一行调试头
+add_header X-Debug-Path $document_root$fastcgi_script_name;
+# 访问页面后看响应头，确认路径是否正确
+```
+
+### 问题 3：上传文件太大
+
+```nginx
+client_max_body_size 50m;  # 允许上传 50MB 文件
+```
+
+### 问题 4：PHP 页面直接显示源码
+
+没有匹配到 PHP location，或者 PHP-FPM 没有运行。确保 `.php` 文件被 `location ~ \.php$` 匹配到。
+
+## PHP 应用的 URL 美化
+
+大多数 PHP 框架（Laravel、Symfony 等）都需要把所有请求路由到 `index.php`：
+
+```nginx
+location / {
+    try_files $uri $uri/ /index.php?$query_string;
+}
+
+location ~ \.php$ {
+    fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+```
+
+`try_files` 按顺序查找文件，全找不到就交给 `/index.php` 处理。`$query_string` 把原始查询参数传过去。
+
+### Laravel 专用配置
+
+```nginx
+server {
+    listen 80;
+    server_name app.example.com;
+    root /var/www/laravel/public;
+    index index.php;
+
+    # 禁止访问敏感文件
+    location ~ /\.(?!well-known).* {
+        deny all;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    # 静态资源加缓存
+    location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg|woff2?)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+```
+
+## PHP-FPM 池配置调优
+
+PHP-FPM 的配置在 `/etc/php/<version>/fpm/pool.d/www.conf`：
+
+```ini
+; 进程管理方式
+pm = dynamic
+
+; 最多子进程数
+pm.max_children = 50
+
+; 启动时创建的子进程数
+pm.start_servers = 5
+
+; 最小空闲进程数
+pm.min_spare_servers = 5
+
+; 最大空闲进程数
+pm.max_spare_servers = 10
+
+; 每个子进程处理多少请求后重启（防止内存泄漏）
+pm.max_requests = 500
+```
+
+**pm.max_children** 是最关键的参数。它取决于：
+- 每个 PHP 进程平均占用多少内存（比如 50MB）
+- 服务器可用内存有多少（比如 2GB）
+- max_children = 2000MB / 50MB = 40（留一些给系统和 Nginx）
+
+## 加 fastcgi_cache 提升性能
+
+和 `proxy_cache` 类似，PHP-FPM 也有 `fastcgi_cache`：
+
+```nginx
+http {
+    fastcgi_cache_path /var/cache/nginx/fastcgi levels=1:2 keys_zone=php_cache:10m
+                       max_size=500m inactive=30m;
+
+    server {
+        location ~ \.php$ {
+            fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            include fastcgi_params;
+
+            # 缓存
+            fastcgi_cache php_cache;
+            fastcgi_cache_valid 200 10m;
+            fastcgi_cache_key "$scheme$request_method$host$request_uri";
+
+            # 跳过 POST 请求
+            fastcgi_cache_methods GET HEAD;
+        }
+    }
+}
+```
+
+对于生成缓慢但又不频繁变化的 PHP 页面（如文章详情页），缓存效果立竿见影。
+
+## 小结
+
+这一章我们学到了：
+
+1. Nginx + PHP-FPM 是"代理模式"，PHP-FPM 做实际执行
+2. Unix socket 比 TCP 快（前提在同一台机器）
+3. `SCRIPT_FILENAME` 必须正确，否则 File not found
+4. `try_files` + `index.php` 实现 PHP 框架的 URL 美化
+5. `fastcgi_cache` 为 PHP 页面提供代理级缓存
+
+下一章，我们学习限流和安全防护。
+
+---
+
+> **参考链接**
+> - Nginx + PHP-FPM 官方指南：https://www.nginx.com/resources/wiki/start/topics/examples/phpfcgi/
+> - Laravel Nginx 配置：https://laravel.com/docs/deployment#nginx
+> - PHP-FPM 配置文档：https://www.php.net/manual/en/install.fpm.configuration.php
