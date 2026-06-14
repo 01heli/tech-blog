@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 
 /** boss_ai 项目的 SQLite 数据库路径，可通过环境变量 BOSS_DB_PATH 覆盖 */
@@ -13,13 +13,19 @@ let _initPromise: Promise<SqlJsDatabase> | null = null;
 
 async function initDb(): Promise<SqlJsDatabase> {
   const SQL = await initSqlJs();
-  const buffer = readFileSync(DB_PATH);
-  return new SQL.Database(buffer);
+  if (existsSync(DB_PATH)) {
+    const buffer = readFileSync(DB_PATH);
+    return new SQL.Database(buffer);
+  }
+  // DB 文件不存在（Docker 构建环境 / 未挂载 boss_ai 数据），返回空库
+  console.warn(`[jobs] boss_ai DB not found at ${DB_PATH}, using empty database`);
+  return new SQL.Database();
 }
 
 /**
  * 获取 boss_ai SQLite 数据库的单例连接。
  * sql.js 将整个 DB 加载到内存（~2MB），查询极快。
+ * 如果 DB 文件不存在，返回内存空库（所有查询返回空结果）。
  */
 export async function getDb(): Promise<SqlJsDatabase> {
   if (_db) return _db;

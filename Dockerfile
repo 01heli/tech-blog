@@ -1,8 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- 构建阶段 ----
-FROM node:20-alpine AS builder
+FROM node:20-slim AS builder
 WORKDIR /app
+
+# Prisma query engine 需要 libssl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
@@ -14,15 +19,18 @@ RUN npx prisma generate
 RUN npm run build
 
 # ---- 运行阶段 ----
-FROM node:20-alpine AS runner
-RUN apk add --no-cache openssl
+FROM node:20-slim AS runner
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-RUN addgroup --system --gid 1001 blog && \
-    adduser --system --uid 1001 blog
+RUN groupadd --system --gid 1001 blog && \
+    useradd --system --uid 1001 --gid blog blog
 
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/static ./.next/static
