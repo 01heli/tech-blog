@@ -1,0 +1,278 @@
+---
+title: '生产环境最佳实践：从上线到维护'
+description: '掌握配置模板化、监控策略、故障排查、热升级和生产安全清单'
+order: 18
+---
+
+## 你已经不是初学者了
+
+学完前面 17 章，你已经掌握了 Nginx 的核心能力。这最后一章是查漏补缺——把生产环境中真正重要但容易忽略的事情梳理一遍。
+
+## 1. 配置模板化
+
+写死的配置很难维护。用环境变量、include 和模板让配置可管理。
+
+### 使用 include 拆分配置
+
+```
+/etc/nginx/
+├── nginx.conf                          # 全局 + events
+├── conf.d/
+│   ├── blog.example.com.conf
+│   ├── api.example.com.conf
+│   └── admin.example.com.conf
+├── snippets/
+│   ├── proxy-params.conf
+│   ├── ssl-params.conf
+│   └── security-headers.conf
+└── upstreams/
+    ├── backend.conf
+    └── websocket.conf
+```
+
+```nginx
+# nginx.conf
+http {
+    # 公共 include
+    include /etc/nginx/upstreams/*.conf;
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+### 环境差异化
+
+通过环境变量或 `include` 区分环境：
+
+```nginx
+# conf.d/app.conf
+server {
+    listen 80;
+
+    # 开发环境和生产环境用不同的后端
+    location /api/ {
+        # 生产环境
+        # proxy_pass http://production-backend;
+
+        # 开发环境
+        proxy_pass http://staging-backend;
+    }
+}
+```
+
+更好的做法：用 Git 分支区分环境配置，CI/CD 部署时选择对应的分支。
+
+## 2. 监控：知道 Nginx 在做什么
+
+### stub_status：基本指标
+
+```nginx
+location = /nginx_status {
+    stub_status;
+    allow 127.0.0.1;
+    allow 10.0.0.0/8;
+    deny all;
+    access_log off;
+}
+```
+
+访问 `http://localhost/nginx_status` 输出：
+
+```
+Active connections: 291
+server accepts handled requests
+ 16630948 16630948 31070465
+Reading: 6 Writing: 179 Waiting: 106
+```
+
+| 字段 | 含义 |
+|------|------|
+| Active connections | 当前活跃连接数 |
+| accepts | 接受的连接总数 |
+| handled | 处理过的连接总数（accepts 和 handled 应该一样，否则说明资源不足丢了一些） |
+| requests | 处理的请求总数 |
+| Reading | 正在读请求头的连接数 |
+| Writing | 正在写响应的连接数 |
+| Waiting | 保持连接但空闲的连接数（keepalive） |
+
+### 集成 Prometheus + Grafana
+
+用 `nginx-prometheus-exporter` 把这些数据变成时间序列：
+
+```bash
+docker run -d \
+  --name nginx-exporter \
+  -p 9113:9113 \
+  nginx/nginx-prometheus-exporter:latest \
+  --nginx.scrape-uri=http://nginx/nginx_status
+```
+
+然后在 Grafana 中导入 Nginx Dashboard，就能看到连接数、QPS、状态码分布的实时图表。
+
+### 关键告警指标
+
+| 指标 | 告警条件 | 为什么重要 |
+|------|----------|-----------|
+| 5xx 错误率 | > 1% | 后端服务可能出了问题 |
+| Active connections 突然飙升 | 超过正常值 2 倍 | 可能正在遭受攻击或流量突增 |
+| Reading/Writing 比 Waiting 高很多 | 持续 | 后端响应太慢，请求堆积 |
+
+## 3. 故障排查
+
+### 日志是你的第一线索
+
+```bash
+# 实时跟踪错误日志
+tail -f /var/log/nginx/error.log
+
+# 查看最近 100 条错误
+tail -n 100 /var/log/nginx/error.log
+
+# 找出访问量异常大的 IP
+cat /var/log/nginx/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -20
+
+# 找出返回 502 的请求
+grep ' 502 ' /var/log/nginx/access.log | tail -20
+```
+
+### 调试模式：看 Nginx 怎么处理一个请求
+
+临时开启 debug 日志（需要编译时加了 `--with-debug`）：
+
+```nginx
+error_log /var/log/nginx/debug.log debug;
+
+# 只对特定 IP 开 debug
+events {
+    debug_connection 192.168.1.100;
+}
+```
+
+debug 日志非常详细，每秒可能产生几十 MB。**用完立刻关掉！**
+
+### 常见问题速查
+
+| 现象 | 可能原因 | 排查命令 |
+|------|----------|----------|
+| 502 Bad Gateway | 后端挂了 / 连不上 | `curl http://127.0.0.1:3000/health` |
+| 504 Gateway Timeout | 后端响应太慢 | `grep upstream_response_time access.log` |
+| 403 Forbidden | 权限问题 / `deny` 规则命中 | 检查文件权限 + `allow/deny` 配置 |
+| 404 Not Found | 路径不对 / 文件不存在 | `grep ' 404 ' access.log` |
+| 413 Request Entity Too Large | 上传文件超过 `client_max_body_size` | 调大限制 |
+| 499 Client Closed Request | 客户端主动断开（常见于超时取消） | 检查 `proxy_read_timeout` |
+
+### 用 tcpdump 抓包
+
+当你怀疑问题在 TCP 层面（比如连接被 RESET）：
+
+```bash
+# 抓 Nginx 与后端之间的流量
+sudo tcpdump -i lo port 3000 -A -s 0
+```
+
+## 4. Nginx 热升级（不用停服）
+
+你可以把 Nginx 从旧版本升级到新版本，完全不中断服务：
+
+```bash
+# 1. 编译/安装新版本 Nginx 到新路径
+# （假设新版本在 /usr/local/nginx-new/sbin/nginx）
+
+# 2. 查看旧版 PID
+cat /var/run/nginx.pid  # 假设是 12345
+
+# 3. 复制旧版可执行文件（备份）
+cp /usr/sbin/nginx /usr/sbin/nginx.old
+
+# 4. 启动新版（用 USR2 信号）
+kill -USR2 12345
+
+# 现在同时运行着新旧两个 Nginx
+# 旧 master (PID 12345) + 旧 workers
+# 新 master (PID 67890) + 新 workers
+
+# 5. 让旧 workers 优雅退出
+kill -WINCH 12345
+
+# 这时旧 master 还在，但旧 workers 都停了
+# 如果新版有问题，可以回滚：
+# kill -HUP 12345  # 旧版重新启动 workers
+# kill -QUIT 67890 # 新版退出
+
+# 6. 确认新版没问题后，彻底退出旧版
+kill -QUIT 12345
+```
+
+这个流程看起来很复杂，但思路很清晰：
+1. 让新旧并存
+2. 旧 workers 退出但 master 留着（以便回滚）
+3. 验证通过后关旧 master
+
+**Docker 场景不需要热升级**：直接构建新镜像，滚动更新容器。
+
+## 5. 生产安全检查清单
+
+```nginx
+# ✅ 已关闭 server_tokens
+server_tokens off;
+
+# ✅ 已配置安全响应头
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-XSS-Protection "1; mode=block" always;
+
+# ✅ 已禁用旧 TLS 版本
+ssl_protocols TLSv1.2 TLSv1.3;
+
+# ✅ 已限制请求大小
+client_max_body_size 10m;
+
+# ✅ 已配置限流
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+# ✅ 已隐藏敏感文件
+location ~ /\. { deny all; }
+
+# ✅ 日志不记录敏感信息（如 token）
+# 在 log_format 中去掉 $http_authorization 或 $cookie_*
+
+# ✅ worker 以非 root 用户运行
+user nginx;
+
+# ✅ 私钥文件权限正确
+# chmod 600 /etc/nginx/certs/*.key
+```
+
+## 6. 我在生产环境中的 Nginx 配置审查清单
+
+每当上线一个新站点，问自己这几个问题：
+
+1. **HTTP 自动跳转 HTTPS 了吗？**
+2. **静态资源有缓存策略吗？**（expires + Cache-Control）
+3. **proxy_set_header 传了 X-Real-IP 和 X-Forwarded-For 吗？**
+4. **超时时间设置合理吗？**（proxy_connect_timeout、proxy_read_timeout）
+5. **日志轮转配置了吗？**（logrotate）
+6. **敏感路径被保护了吗？**（.git、.env、配置文件）
+7. **限流保护关键接口了吗？**（登录、支付、API）
+8. **nginx -t 检查通过了吗？**（修改配置后必须做的）
+9. **改了配置后 reload 了吗？**（别改了配置文件忘了 reload）
+
+## 写在最后
+
+你从"什么是 Nginx"开始，一路学到了热升级和 Prometheus 监控。这个系列覆盖了 Nginx 的绝大多数生产场景。
+
+**几点建议：**
+
+- 不要一次性把所有配置都写进去，循序渐进——先能跑，再优化
+- 任何改动前先 `nginx -t`，再 `nginx -s reload`
+- 生产环境没有"试一下"——先在开发环境验证，再上生产
+- Nginx 官方文档非常详细，遇到问题第一时间查文档
+
+Nginx 的道路远不止于此。OpenResty（Nginx + Lua）、Nginx Unit（动态应用服务器）、Nginx Ingress Controller（Kubernetes 网关）都是值得深入的方向。
+
+---
+
+> **参考链接**
+> - Nginx Admin Guide：https://docs.nginx.com/nginx/admin-guide/
+> - Nginx Prometheus Exporter：https://github.com/nginxinc/nginx-prometheus-exporter
+> - Nginx Upgrading (no-downtime)：https://nginx.org/en/docs/control.html#upgrade
+> - Grafana Nginx Dashboard：https://grafana.com/grafana/dashboards/?search=nginx

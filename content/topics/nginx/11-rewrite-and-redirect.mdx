@@ -1,0 +1,281 @@
+---
+title: 'URL 重写与重定向：让老 URL 优雅地跳转'
+description: '掌握 rewrite、return、map 的用法，理解 if 的陷阱，学会正则匹配和旧链接迁移'
+order: 11
+---
+
+## 什么时候需要重写 URL？
+
+你会遇到这些场景：
+
+1. **网站改版**：老的链接 `/blog/old-post` 需要跳转到 `/articles/new-post`
+2. **SEO 规范化**：`http://` 跳 `https://`，`non-www` 跳 `www`（或反过来）
+3. **路径美化**：后端接收 `/api/v2/user?id=123`，但你希望前端用 `/api/v2/user/123` 访问
+4. **域名迁移**：从 `old-domain.com` 迁移到 `new-domain.com`
+5. **快捷跳转**：`/github` 直接跳转到你的 GitHub 主页
+
+Nginx 提供两个主要工具：`return` 和 `rewrite`。
+
+## return：最简单直接的重定向
+
+`return` 是最简洁的指令。你告诉 Nginx"别处理了，直接返回这个状态码和内容"。
+
+```nginx
+# 基本语法
+return <status_code> <content>;
+return <status_code> <URL>;
+```
+
+### 常见用法
+
+```nginx
+# 1. 域名迁移（301 永久重定向）
+server {
+    listen 80;
+    server_name old-domain.com;
+    return 301 https://new-domain.com$request_uri;
+}
+
+# 2. HTTP → HTTPS（301）
+server {
+    listen 80;
+    server_name example.com;
+    return 301 https://$host$request_uri;
+}
+
+# 3. 快捷跳转（302 临时重定向）
+location = /github {
+    return 302 https://github.com/yourname;
+}
+
+# 4. 阻止直接访问某个文件
+location = /secret-config.yml {
+    return 404;
+}
+
+# 5. 纯文本响应（如健康检查）
+location = /ping {
+    default_type text/plain;
+    return 200 'pong';
+}
+```
+
+### 301 vs 302：什么时候用哪个？
+
+| | 301 Moved Permanently | 302 Found |
+|------|------|------|
+| 含义 | 永久迁移 | 临时跳转 |
+| 浏览器行为 | **缓存**跳转，下次直接走新地址 | 不缓存，每次都问服务器 |
+| SEO | 搜索引擎把权重传给新 URL | 搜索引擎继续索引原 URL |
+| 适用场景 | 域名迁移、URL 规范改变 | 临时维护、A/B 测试 |
+
+**黄金法则**：不确定是否永久的跳转，先用 302。等确认后再改 301。
+
+## rewrite：URL 内部转换
+
+`rewrite` 比 `return` 强大得多——它支持**正则表达式**和**标志位**。
+
+```nginx
+# 基本语法
+rewrite <regex> <replacement> [flag];
+```
+
+### 最常见的例子：将带参数的老 URL 改成 RESTful 风格
+
+```nginx
+# /article.php?id=123 → /articles/123
+rewrite ^/article\.php\?id=(\d+)$ /articles/$1 permanent;
+```
+
+### rewrite 的四种 flag
+
+| Flag | 行为 |
+|------|------|
+| `last` | **重新开始** location 匹配（类似 Apache 的 `[L]`） |
+| `break` | 停止当前 location 的 rewrite，继续处理请求（不过不再匹配其他 location） |
+| `redirect` | 返回 **302** 临时重定向 |
+| `permanent` | 返回 **301** 永久重定向 |
+
+### last vs break 的区别（最容易搞混的地方）
+
+```nginx
+location /a/ {
+    rewrite ^/a/(.*) /b/$1 last;   # 去匹配 /b/ 的 location
+    return 200 'this is /a/';
+}
+
+location /b/ {
+    rewrite ^/b/(.*) /c/$1 break;  # 在 /b/ 的 location 内完成 rewrite，不再匹配其他
+    return 200 'rewritten to /c/$1';
+}
+```
+
+- `last`：rewrite 后，Nginx 拿着新的 URI **重新执行 location 查找**
+- `break`：rewrite 后，**就在当前 location 内继续处理**，不重新查找 location
+
+**推荐：能不用 rewrite 就不用**。`return` 更简单更快。只有在需要正则匹配时才用 `rewrite`。
+
+## 正则匹配快速参考
+
+`rewrite` 和很多 `location` 指令都用到正则。这些是最常用的模式：
+
+| 模式 | 匹配 |
+|------|------|
+| `^/` | 以 `/` 开头 |
+| `\.php$` | 以 `.php` 结尾 |
+| `\.(jpg\|png\|gif)$` | 图片扩展名 |
+| `^/user/(\d+)/?$` | `/user/123` 或 `/user/123/`，捕获数字 |
+| `^/year/(\d{4})/month/(\d{2})/` | `/year/2026/month/06/` |
+| `^/([a-z0-9-]+)$` | 匹配 slug |
+
+捕获组 `()` 中的内容可以用 `$1`、`$2` 引用。
+
+## 批量旧链接迁移（map 指令）
+
+如果你有几十个旧链接需要一一对应跳转，一个个写 `location` 很繁琐。用 `map` 指令：
+
+```nginx
+http {
+    # 定义映射表
+    map $uri $new_uri {
+        /old-blog          /articles;
+        /about-us          /about;
+        /contact-us        /contact;
+        /products/item-1   /shop/product/1;
+        /products/item-2   /shop/product/2;
+        /download/win      /downloads?platform=windows;
+        /download/mac      /downloads?platform=mac;
+        default            '';   # 没匹配到的返回空
+    }
+
+    server {
+        location / {
+            if ($new_uri != '') {
+                return 301 $new_uri;
+            }
+            try_files $uri $uri/ =404;
+        }
+    }
+}
+```
+
+`map` 会高效地查表，比几十个 `if` 或 `rewrite` 快得多。而且映射关系一目了然，好维护。
+
+## 避免 `if` 陷阱
+
+Nginx 的 `if` 指令有一个著名的坑。看看这个例子：
+
+```nginx
+# ❌ 坏的写法（代理在这个 if 里会出问题）
+location /api/ {
+    if ($http_authorization = '') {
+        return 401;
+    }
+    proxy_pass http://backend;
+}
+```
+
+问题在于：当 `if` 和 `proxy_pass` 在同一层级时，Nginx 的行为会变得不可预测。官方文档承认：**"if is evil"**。
+
+**解决方案**：把需要判断的逻辑放到单独的 location 里：
+
+```nginx
+# ✅ 好的写法
+location /api/ {
+    error_page 418 = @need_auth;   # 418 是一个无意义的码，用作跳板
+    if ($http_authorization = '') {
+        return 418;
+    }
+    proxy_pass http://backend;
+}
+
+location @need_auth {
+    return 401 '{"error": "Authorization required"}';
+}
+```
+
+更优雅的方式：
+
+```nginx
+set $auth_missing '';
+
+location /api/ {
+    if ($http_authorization = '') {
+        set $auth_missing 1;
+    }
+    if ($auth_missing) {
+        return 401;
+    }
+    proxy_pass http://backend;
+}
+```
+
+底线：**能不用 if 就不用 if**。用 `location` 的匹配、`map` 的查表、`try_files` 来替代。
+
+## 常见场景全套方案
+
+### 场景 1：non-www → www（或反过来）
+
+```nginx
+# blog.com → www.blog.com
+server {
+    listen 80;
+    server_name blog.com;
+    return 301 https://www.blog.com$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name blog.com;
+    # SSL cert for blog.com
+    return 301 https://www.blog.com$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name www.blog.com;
+    # 主站点配置
+}
+```
+
+### 场景 2：API 版本迁移
+
+```nginx
+# /api/v1/* → /api/v2/*（告知客户端已废弃）
+location /api/v1/ {
+    add_header X-API-Deprecated "Please migrate to v2";
+    proxy_pass http://backend/api/v1/;
+}
+```
+
+### 场景 3：免费下载链接保护
+
+```nginx
+# 只有从本站点过去的请求才允许下载
+location /downloads/ {
+    valid_referers none blocked example.com *.example.com;
+    if ($invalid_referer) {
+        return 403;
+    }
+    root /var/www;
+}
+```
+
+## 小结
+
+这一章我们学到了：
+
+1. `return` 是最简单的重定向指令，能用它就不用 `rewrite`
+2. `rewrite` 支持正则替换，有 `last`/`break`/`redirect`/`permanent` 四种 flag
+3. 301 永久 vs 302 临时：不确定时先用 302
+4. `map` 做批量映射，比一堆 `if` 快且清晰
+5. `if` 有坑，尽量用 location/match 替代
+
+下一章，我们学习 Nginx 的缓存配置。
+
+---
+
+> **参考链接**
+> - ngx_http_rewrite_module：https://nginx.org/en/docs/http/ngx_http_rewrite_module.html
+> - Nginx map 指令：https://nginx.org/en/docs/http/ngx_http_map_module.html
+> - "If is Evil"：https://www.nginx.com/resources/wiki/start/topics/depth/ifisevil/

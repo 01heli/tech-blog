@@ -1,0 +1,214 @@
+---
+title: '虚拟主机：一台服务器跑多个网站'
+description: '掌握 server_name 匹配规则，基于域名、IP、端口区分不同站点'
+order: 5
+---
+
+## 一台服务器 ≠ 一个网站
+
+在云服务器很便宜的今天，你可能觉得"一个网站买一台服务器"没什么问题。但即使是 1 核 1G 的小服务器，也能轻松跑几十个静态网站。
+
+Nginx 用**虚拟主机（Virtual Host）**来实现这个能力。原理很简单：Nginx 根据请求中的某些信息（域名、端口、IP）决定由哪个 `server` 块来处理请求。每个 `server` 块就是一个虚拟主机。
+
+## 基于域名的虚拟主机（最常用）
+
+假设你有两个网站：`blog.example.com` 和 `shop.example.com`，都指向同一台服务器 IP。你想让访问不同域名的人看到不同的内容。
+
+```nginx
+# 博客站
+server {
+    listen 80;
+    server_name blog.example.com;
+    root /var/www/blog;
+}
+
+# 商城站
+server {
+    listen 80;
+    server_name shop.example.com;
+    root /var/www/shop;
+}
+```
+
+当浏览器发送 HTTP 请求时，会在请求头里带上 `Host: blog.example.com`。Nginx 根据这个头匹配 `server_name`，决定用哪个 `server` 块处理。
+
+### server_name 匹配规则
+
+`server_name` 支持三种写法：
+
+```nginx
+# 1. 精确域名
+server_name example.com;
+
+# 2. 通配符
+server_name *.example.com;      # 匹配 a.example.com, b.example.com
+server_name www.example.*;      # 匹配 www.example.com, www.example.cn
+
+# 3. 正则表达式（以 ~ 开头）
+server_name ~^api\d+\.example\.com$;  # 匹配 api1.example.com, api2.example.com
+```
+
+**匹配优先级**（从高到低）：
+1. 精确域名 `example.com`
+2. 以 `*` 开头的最长通配符 `*.example.com`
+3. 以 `*` 结尾的最长通配符 `mail.*`
+4. 第一个匹配的正则表达式
+
+### 默认服务器：没匹配到怎么办？
+
+如果所有 `server_name` 都没匹配上，Nginx 用哪个 `server` 块？答案是第一个定义的 `server` 块，或者明确标记了 `default_server` 的那个：
+
+```nginx
+# 这个就是默认服务器
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;  # Nginx 特有的：直接关闭连接，不返回任何内容
+}
+```
+
+`server_name _` 是一个惯用写法，`_` 只是一个占位符，没有特殊意义，但约定俗成地表示"我不关心域名"。
+
+`return 444`：444 不是标准 HTTP 状态码，是 Nginx 私有的，意思是"直接关闭连接，不发任何响应"。用于应对恶意扫描。
+
+## 基于端口的虚拟主机
+
+同一个域名，不同端口显示不同内容：
+
+```nginx
+# 主站在 80 端口
+server {
+    listen 80;
+    server_name example.com;
+    root /var/www/main;
+}
+
+# 管理后台在 8080 端口
+server {
+    listen 8080;
+    server_name example.com;
+    root /var/www/admin;
+}
+```
+
+访问 `http://example.com:8080` 就会看到管理后台。
+
+## 基于 IP 的虚拟主机
+
+如果你的服务器有多个 IP 地址（比如多个网卡），可以每个 IP 绑定不同网站：
+
+```nginx
+server {
+    listen 192.168.1.10:80;
+    server_name example.com;
+    root /var/www/site-a;
+}
+
+server {
+    listen 192.168.1.11:80;
+    server_name example.com;
+    root /var/www/site-b;
+}
+```
+
+这种现在比较少见，因为云服务器通常只有一个内网 IP，但理解这种能力很重要。
+
+## `server_name` 匹配实战
+
+假设有下面这些 server 块：
+
+```nginx
+server { listen 80; server_name example.com; root /var/www/a; }
+server { listen 80; server_name *.example.com; root /var/www/b; }
+server { listen 80; server_name ~^api\.example\.com$; root /var/www/c; }
+server { listen 80 default_server; root /var/www/default; }
+```
+
+对于不同的请求，匹配结果：
+
+| 请求 Host | 匹配的 server_name | 原因 |
+|-----------|-------------------|------|
+| `example.com` | `example.com` | 精确匹配优先 |
+| `api.example.com` | `api.example.com`（正则） | 正则优先级高于通配符 |
+| `www.example.com` | `*.example.com` | 通配符匹配 |
+| `other.com` | default_server | 全都没匹配到 |
+
+## 最佳实践：组织多站点配置
+
+当网站数量从 2 个变成 20 个时，把所有配置写在一个文件里就是灾难。推荐的组织方式：
+
+```
+/etc/nginx/
+├── nginx.conf                          # 主配置，包含 include
+├── conf.d/
+│   ├── blog.example.com.conf          # 每个站点一个文件
+│   ├── shop.example.com.conf
+│   └── api.example.com.conf
+└── snippets/                           # 可复用的配置片段
+    ├── ssl-params.conf                 # 通用 SSL 参数
+    ├── security-headers.conf           # 安全头
+    └── proxy-params.conf               # 反向代理通用参数
+```
+
+在主配置中引入：
+
+```nginx
+http {
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+`snippets/` 中的内容可以用 `include` 引入到任意 server 块中：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+    
+    include snippets/ssl-params.conf;
+    include snippets/security-headers.conf;
+    
+    location / {
+        proxy_pass http://backend;
+        include snippets/proxy-params.conf;
+    }
+}
+```
+
+**优点**：
+- 每个站点的配置独立，互不影响
+- 下掉一个站点只需 `mv site.conf site.conf.disabled` + reload
+- 公共配置一处修改，全部生效
+
+## 启用/停用一个站点
+
+如果你用的是上面这种 include 方式，停用站点非常简单：
+
+```bash
+# 停用（改名让 include 不匹配）
+sudo mv /etc/nginx/conf.d/shop.conf /etc/nginx/conf.d/shop.conf.disabled
+sudo nginx -s reload
+
+# 重新启用
+sudo mv /etc/nginx/conf.d/shop.conf.disabled /etc/nginx/conf.d/shop.conf
+sudo nginx -s reload
+```
+
+`sites-available` 和 `sites-enabled` 是另一种常见模式（Ubuntu/Debian 传统），原理相同：`sites-enabled` 中放的是 `sites-available` 中配置文件的**符号链接**，要停用就删链接，启用就创建链接。但 `conf.d/*.conf` 模式更简洁，推荐使用。
+
+## 小结
+
+这一章我们学到了：
+
+1. **虚拟主机**让一台服务器承载多个网站
+2. `server_name` 有精确、通配符、正则三种匹配方式，有明确的优先级
+3. 用 `default_server` 处理未匹配的请求
+4. 多站点时用 `conf.d/` + `snippets/` 组织配置，做到模块化
+
+下一章，我们学习访问控制和日志配置——理解谁在访问你的网站，以及对不速之客说"不"。
+
+---
+
+> **参考链接**
+> - server_name 官方文档：https://nginx.org/en/docs/http/server_names.html
+> - How nginx processes a request：https://nginx.org/en/docs/http/request_processing.html

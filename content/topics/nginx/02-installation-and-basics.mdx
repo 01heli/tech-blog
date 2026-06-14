@@ -1,0 +1,234 @@
+---
+title: '安装 Nginx 与基本命令'
+description: '在 Linux、Windows、macOS 上安装 Nginx，掌握启动、停止、重载等基本命令'
+order: 2
+---
+
+## 安装前你需要知道的事
+
+Nginx 有两个版本分支：
+- **稳定版（Stable）**：经过充分测试，适合生产环境
+- **主线版（Mainline）**：包含最新功能，但可能有 bug，适合测试环境
+
+对于学习来说，用哪个版本都可以。本系列使用 **稳定版**。
+
+另外，Nginx 有一种特殊的二进制文件叫 **"sbin/nginx"**，它既用来启动服务器，也用来管理已经运行的服务器（发送信号）。理解这一点很重要，因为后面你会频繁用到 `nginx -s reload` 这样的命令。
+
+## Linux 下安装（Ubuntu/Debian）
+
+如果你用的是 Ubuntu 或 Debian，推荐从 Nginx 官方仓库安装，这样你能获得比系统自带更新一些的版本。
+
+```bash
+# 1. 安装依赖
+sudo apt update
+sudo apt install -y curl gnupg2 ca-certificates lsb-release
+
+# 2. 配置官方 apt 仓库
+curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor \
+    | sudo tee /usr/share/keyrings/nginx-archive-keyring.gpg > /dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
+    | sudo tee /etc/apt/sources.list.d/nginx.list
+
+# 3. 安装
+sudo apt update
+sudo apt install -y nginx
+```
+
+对于 CentOS/RHEL，使用 yum：
+
+```bash
+sudo yum install -y epel-release
+sudo yum install -y nginx
+```
+
+### 验证安装
+
+```bash
+nginx -v
+# 输出类似: nginx version: nginx/1.24.0
+```
+
+### 安装后，Nginx 在哪儿？
+
+理解 Nginx 的目录结构很重要：
+
+| 路径 | 作用 |
+|------|------|
+| `/etc/nginx/nginx.conf` | 主配置文件 |
+| `/etc/nginx/conf.d/` | 额外配置（被主配置 include） |
+| `/usr/sbin/nginx` | Nginx 可执行文件 |
+| `/var/log/nginx/` | 日志目录（access.log + error.log） |
+| `/usr/share/nginx/html/` | 默认网站根目录 |
+
+## macOS 下安装
+
+macOS 下用 Homebrew 最简单：
+
+```bash
+brew install nginx
+```
+
+Homebrew 安装后的路径与 Linux 不同：
+
+| 路径 | 作用 |
+|------|------|
+| `/usr/local/etc/nginx/nginx.conf` | 主配置文件 |
+| `/usr/local/var/log/nginx/` | 日志目录 |
+| `/usr/local/bin/nginx` | 可执行文件 |
+
+### 启动和停止
+
+```bash
+brew services start nginx   # 启动并设为开机自启
+brew services stop nginx    # 停止
+brew services restart nginx # 重启
+```
+
+## Windows 下安装
+
+Windows 用户下载官方提供的 zip 包即可：
+
+1. 访问 https://nginx.org/en/download.html
+2. 下载 `nginx-x.x.x.zip`（选择稳定版）
+3. 解压到你喜欢的目录，比如 `C:\nginx`
+4. 进入解压目录，打开 cmd 或 PowerShell
+
+**注意**：Windows 版 Nginx 主要用于开发测试，生产环境建议用 Linux。
+
+## 核心命令：启动、停止、重载
+
+这是你最常用的一组命令（Linux/macOS 在终端执行，Windows 在解压目录的 cmd 中执行）：
+
+### 启动 Nginx
+
+```bash
+# 直接启动（Linux/macOS）
+sudo nginx
+
+# Windows（在 nginx 解压目录中）
+nginx.exe
+```
+
+如果看到什么输出都没有，那恭喜你——Nginx 就在后台运行了。可以用浏览器访问 `http://localhost`，你应该看到 Nginx 的默认欢迎页面。
+
+### 检查配置是否正确
+
+在修改配置文件之后、重新加载之前，**一定要先检查**，避免因为配置错误导致服务中断：
+
+```bash
+nginx -t
+```
+
+输出应该像这样：
+```
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+```
+
+### 重新加载配置
+
+修改配置后，让 Nginx 平滑地加载新配置而不中断服务：
+
+```bash
+nginx -s reload
+```
+
+"s" 代表 "signal"，reload 是信号名。
+
+**平滑重载的原理**：当你执行 `nginx -s reload` 时，Nginx 会启动新的 worker 进程使用新配置，同时旧的 worker 进程会继续处理当前请求，处理完后优雅地退出。整个过程不会有请求丢失。
+
+### 停止 Nginx
+
+有两种停止方式：
+
+```bash
+# 优雅停止 —— 等当前请求处理完再退出
+nginx -s quit
+
+# 立即停止 —— 立刻断开所有连接
+nginx -s stop
+```
+
+生产环境记得用 `quit`，避免用户请求被截断。
+
+### 重新打开日志文件
+
+```bash
+nginx -s reopen
+```
+
+这在日志轮转时很有用。当你的日志管理工具（如 logrotate）把旧日志改名后，Nginx 默认还会往旧文件名写。执行 `reopen` 让 Nginx 重新打开新的日志文件。
+
+## 理解信号（Signal）
+
+前面说了 `-s` 参数发送的是"信号"。实际上，你可以直接用 Linux 的 `kill` 命令给 Nginx 的 master 进程发信号：
+
+```bash
+# 找到 Nginx master 进程的 PID
+cat /var/run/nginx.pid    # 或者
+ps aux | grep nginx
+
+# 发送信号
+kill -HUP  <pid>    # 等同于 nginx -s reload
+kill -QUIT <pid>    # 等同于 nginx -s quit
+kill -TERM <pid>    # 等同于 nginx -s stop
+kill -USR1 <pid>    # 等同于 nginx -s reopen
+```
+
+| 信号 | 作用 |
+|------|------|
+| `HUP` | 平滑重载配置 |
+| `QUIT` | 优雅退出 |
+| `TERM` | 立即退出 |
+| `USR1` | 重新打开日志文件 |
+| `USR2` | 平滑升级（热升级时用） |
+| `WINCH` | 优雅退出 worker 进程（热升级时用） |
+
+了解信号机制对你后面理解 Nginx 热升级会很有帮助。
+
+## 开箱体验：看看默认配置
+
+安装完 Nginx 后，打开默认配置文件看一眼（Linux 上是 `/etc/nginx/nginx.conf`）。不用看懂每一行，先感受一下 Nginx 配置的"样子"：
+
+```nginx
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    access_log  /var/log/nginx/access.log;
+
+    sendfile    on;
+    keepalive_timeout 65;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+你会发现 Nginx 配置有一个很明显的特征：**分层次结构**，用花括号 `{}` 嵌套。从外到内，每个层次会继承外层设置，同时可以覆盖。
+
+## 小结
+
+本章我们完成了：
+
+1. 在自己的操作系统上安装了 Nginx
+2. 理解了 Nginx 的目录分布
+3. 掌握了常用命令：`nginx -t`（检查配置）、`nginx -s reload`（重载）、`nginx -s quit`（停止）
+4. 初步认识了信号机制
+5. 看了一眼默认配置长什么样
+
+下一章，我们将深入读 Nginx 的配置文件，逐个指令理解它的含义。
+
+---
+
+> **参考链接**
+> - Nginx 官方安装指南：https://nginx.org/en/docs/install.html
+> - Nginx 命令行参数文档：https://nginx.org/en/docs/switches.html
+> - Nginx Beginner's Guide：https://nginx.org/en/docs/beginners_guide.html

@@ -1,0 +1,248 @@
+---
+title: '访问控制与日志：谁在访问你的网站？'
+description: '配置 access_log 和 error_log，学会自定义日志格式，用 allow/deny 做 IP 级别的访问控制'
+order: 6
+---
+
+## 日志是你的眼睛
+
+没有日志的服务器就像蒙着眼睛开车。日志告诉你三件事：
+1. **谁**访问了你的网站（access_log）
+2. 访问过程中**出了什么问题**（error_log）
+3. 访问的**模式**是怎样的（事后分析）
+
+## access_log：记录每一次请求
+
+默认情况下，Nginx 已经在记录访问日志了：
+
+```nginx
+access_log /var/log/nginx/access.log;
+```
+
+每一行是一条请求记录，用我们之前介绍过的 `main` 格式：
+
+```
+192.168.1.1 - - [03/Jun/2026:14:30:00 +0800] "GET /index.html HTTP/1.1"
+200 2326 "https://google.com" "Mozilla/5.0 ..."
+```
+
+让我们拆开这一行：
+
+| 部分 | 含义 | 示例 |
+|------|------|------|
+| `192.168.1.1` | 客户端 IP | 访问者的 IP 地址 |
+| `-` | 远程用户名 | HTTP Basic Auth 的用户名（一般没有） |
+| `[03/Jun/2026:14:30:00 +0800]` | 时间戳 | 请求时间 |
+| `"GET /index.html HTTP/1.1"` | 请求行 | 方法 + URI + 协议版本 |
+| `200` | 状态码 | 200 = 成功 |
+| `2326` | 响应字节数 | 发给客户端的响应体大小 |
+| `"https://google.com"` | Referer | 从哪个页面跳过来的 |
+| `"Mozilla/5.0 ..."` | User-Agent | 浏览器标识 |
+
+### 自定义日志格式
+
+默认的 `main` 格式有些信息没有，比如**响应时间**。我们来定制一个更实用的格式：
+
+```nginx
+http {
+    # 自定义日志格式，包含响应时间
+    log_format detailed '$remote_addr - $remote_user [$time_local] '
+                        '"$request" $status $body_bytes_sent '
+                        '"$http_referer" "$http_user_agent" '
+                        'rt=$request_time uct=$upstream_connect_time '
+                        'uht=$upstream_header_time urt=$upstream_response_time';
+
+    # 在某个 server 中使用这个格式
+    server {
+        access_log /var/log/nginx/access.log detailed;
+    }
+}
+```
+
+新增的关键变量：
+
+| 变量 | 含义 |
+|------|------|
+| `$request_time` | 从收到客户端第一个字节到发送完最后一个字节的时间（秒） |
+| `$upstream_connect_time` | Nginx 与后端服务器建立连接的时间 |
+| `$upstream_header_time` | 从后端收到响应头的时间 |
+| `$upstream_response_time` | 后端总的响应时间 |
+
+这些时间变量是**性能分析**的核心数据。发现某个接口 `$request_time` 突然变大？说明要么后端慢了，要么网络出了问题。
+
+### 条件日志：不记录某些请求
+
+有些请求你不想记在日志里——比如健康检查、静态资源，或者内网 IP：
+
+```nginx
+# 不记录来自内网 IP 的请求
+map $remote_addr $loggable {
+    ~^192\.168\.   0;
+    ~^10\.         0;
+    ~^127\.        0;
+    default        1;
+}
+
+server {
+    access_log /var/log/nginx/access.log detailed if=$loggable;
+}
+```
+
+`map` 指令创建了一个变量映射：如果 `$remote_addr` 匹配内网 IP 模式，`$loggable` 就是 0（不记录），否则是 1（记录）。
+
+你也可以不记录健康检查请求和特定文件：
+
+```nginx
+location = /health {
+    access_log off;
+    return 200 'ok';
+}
+
+# 或者：不记录 favicon 和静态资源的日志
+location ~* \.(ico|css|js|gif|jpe?g|png|svg|woff2?)$ {
+    access_log off;
+    expires 1y;
+}
+```
+
+### 日志轮转
+
+日志会不断增长，一个高流量网站一天就能产生几个 GB 的 access_log。如果不做管理，磁盘很快就会满。
+
+Linux 上一般用 `logrotate` 来处理：
+
+```bash
+# /etc/logrotate.d/nginx
+/var/log/nginx/*.log {
+    daily                    # 每天轮转
+    missingok                # 日志不存在也不报错
+    rotate 14                # 保留 14 天
+    compress                 # 压缩旧日志
+    delaycompress            # 推迟一天压缩（让最后一天的内容可读）
+    notifempty               # 空日志不轮转
+    create 640 nginx adm
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 `cat /var/run/nginx.pid`
+    endscript
+}
+```
+
+关键在于 `postrotate` 中的 `kill -USR1`：旋转后通知 Nginx 重新打开日志文件（还记得第 2 章讲的信号吗？）。
+
+## error_log：出问题时的线索
+
+error_log 记录了 Nginx 运行过程中遇到的所有问题：
+
+```nginx
+error_log /var/log/nginx/error.log warn;
+```
+
+日志级别从低到高：
+
+| 级别 | 用途 |
+|------|------|
+| `debug` | 极度详细，用于调试（编译时需要 `--with-debug`） |
+| `info` | 一般信息，如配置加载 |
+| `notice` | 需要注意但不紧急的事件 |
+| `warn` | 警告，如客户端超时 |
+| `error` | 真正的错误，如后端连接失败 |
+| `crit` | 严重问题 |
+| `alert` | 需要立即关注 |
+| `emerg` | 系统级紧急状况 |
+
+**生产环境建议**：默认 `warn` 级别。出问题时临时降到 `notice` 或 `info` 调试，调完后记得改回来，否则日志量会暴增。
+
+## 访问控制：allow 和 deny
+
+Nginx 可以在 IP 层面做访问控制。最常见的使用场景是：
+
+- 管理后台只允许办公室 IP 访问
+- API 接口只允许内网调用
+- 封禁恶意 IP
+
+```nginx
+location /admin/ {
+    allow 192.168.1.0/24;   # 允许局域网
+    allow 10.0.0.0/8;       # 允许另一个局域网
+    deny all;                 # 拒绝其他所有人
+}
+```
+
+**匹配规则**：Nginx 按顺序检查，第一个匹配的规则生效。如果上面写 `deny all` 放第一行，那谁都访问不了——后面的 `allow` 永远不会被检查到。
+
+### IP 白名单实用示例
+
+```nginx
+# 只有公司 IP 能访问管理后台
+location /admin/ {
+    allow 203.0.113.5;     # 公司公网 IP
+    allow 198.51.100.0/24;  # VPN 子网
+    deny all;
+}
+
+# 只有内网能访问 API
+location /api/internal/ {
+    allow 10.0.0.0/8;
+    allow 172.16.0.0/12;
+    allow 192.168.0.0/16;
+    deny all;
+}
+```
+
+### 配合变量做更灵活的控制
+
+```nginx
+# 封禁特定 User-Agent（如爬虫）
+if ($http_user_agent ~* "Bytespider|YisouSpider|SemrushBot") {
+    return 403;
+}
+
+# 封禁没有 Referer 的请求（简单防盗链）
+location ~* \.(jpg|png|gif)$ {
+    valid_referers none blocked example.com *.example.com;
+    if ($invalid_referer) {
+        return 403;
+    }
+}
+```
+
+**注意 `if` 陷阱**：Nginx 的 `if` 不是编程语言里的 if，有些 `if` 搭配 `proxy_pass` 等指令会有奇怪的行为。能用 `location` 解决的问题尽量不用 `if`。
+
+## 实操：给日志加一个分析视角
+
+光看日志文件本身很枯燥。试试用命令行快速分析：
+
+```bash
+# 访问量 Top 10 的 IP
+cat /var/log/nginx/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -10
+
+# 访问量 Top 10 的 URL
+cat /var/log/nginx/access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head -10
+
+# 统计状态码分布
+cat /var/log/nginx/access.log | awk '{print $9}' | sort | uniq -c | sort -rn
+
+# 找出响应时间 > 1 秒的慢请求（假设日志格式中有 $request_time 在最后一列）
+cat /var/log/nginx/access.log | awk '{if ($NF > 1) print $0}'
+```
+
+这些一行命令能帮你快速发现异常流量、慢接口、错误爆发。
+
+## 小结
+
+这一章我们学到了：
+
+1. **access_log** —— 记录每一次请求的完整信息，可自定义格式和条件
+2. **error_log** —— 从 debug 到 emerg，不同级别应对不同场景
+3. **日志轮转** —— logrotate + USR1 信号，防止磁盘被撑爆
+4. **allow/deny** —— IP 级别的黑白名单，顺序很重要
+5. 简单的命令行日志分析，快速洞察流量模式
+
+下一章我们要进入 Nginx 的**核心场景**——反向代理。
+
+---
+
+> **参考链接**
+> - ngx_http_log_module：https://nginx.org/en/docs/http/ngx_http_log_module.html
+> - ngx_http_access_module：https://nginx.org/en/docs/http/ngx_http_access_module.html
+> - Nginx if is evil：https://www.nginx.com/resources/wiki/start/topics/depth/ifisevil/

@@ -1,0 +1,307 @@
+---
+title: 'Nginx 配置文件结构详解'
+description: '逐行读懂 nginx.conf，掌握指令、上下文、include 机制，学会如何组织配置'
+order: 3
+---
+
+## 先读一份"解剖图"
+
+打开 `/etc/nginx/nginx.conf`，你看到的是这样一个结构：
+
+```nginx
+# 1. 全局块 —— 在 events 和 http 之外
+user  nginx;
+worker_processes  auto;
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+# 2. events 块 —— 控制连接处理
+events {
+    worker_connections  1024;
+}
+
+# 3. http 块 —— 所有 Web 流量相关的配置
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # 日志格式
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    # 引入其他配置文件
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+Nginx 的配置是严格的**层级结构**。我们从外到内一层层看。
+
+## 第一层：全局块
+
+最外层的指令，不在任何 `{...}` 里面，作用于整个 Nginx 进程。
+
+### `user` —— 以什么身份运行
+
+```nginx
+user nginx;
+```
+
+Nginx 的 master 进程通常以 root 运行（因为要绑定 80/443 这种特权端口），但 **worker 进程必须以普通用户运行**。这是安全的基本原则：即使 Nginx 被攻破，攻击者也只能获得一个普通用户的权限。
+
+如果写 `user nobody`，worker 就用 nobody 用户运行。
+
+### `worker_processes` —— 开几个 worker
+
+```nginx
+worker_processes auto;
+```
+
+这是 Nginx 性能调优的第一个关键参数。`auto` 让 Nginx 自动设为 CPU 核心数——这几乎总是最佳选择。
+
+为什么设为 CPU 核心数最优？因为每个 worker 都是单线程的，一个 worker 同一时刻只能在一个 CPU 核心上运行。设为 4 核时开 8 个 worker，4 个核要来回切换 8 个进程，反而增加上下文切换开销。
+
+如果你想手动设置：`worker_processes 4;`
+
+### `error_log` —— 错误日志
+
+```nginx
+error_log /var/log/nginx/error.log warn;
+```
+
+`warn` 是日志级别。可选级别从低到高：`debug`、`info`、`notice`、`warn`、`error`、`crit`、`alert`、`emerg`。生产环境一般用 `warn` 或 `error`。调试问题时可以临时改到 `notice` 或 `info`。
+
+### `pid` —— 进程 ID 文件
+
+```nginx
+pid /var/run/nginx.pid;
+```
+
+把 master 进程的 PID 写在这个文件里，管理脚本通过读这个文件知道给哪个进程发信号。
+
+## 第二层：events 块
+
+`events` 块只控制一件事：**网络连接的处理方式**。
+
+### `worker_connections` —— 每个 worker 能同时处理多少连接
+
+```nginx
+events {
+    worker_connections 1024;
+}
+```
+
+这表示**每个** worker 进程最多同时维持 1024 个连接。Nginx 能处理的最大并发连接数是：
+
+```
+max_clients = worker_processes × worker_connections
+```
+
+如果你有 4 核 CPU，`worker_processes auto` 会开 4 个 worker，那么总的最大并发连接数就是 4 × 1024 = 4096。
+
+但注意，如果你用了反向代理，每个客户端连接会占用 Nginx 两个连接（一个客户端→Nginx，一个 Nginx→后端），所以实际能服务的客户端数要除以 2。
+
+### `use` —— 选择事件处理模型
+
+```nginx
+events {
+    use epoll;
+}
+```
+
+正常情况下不需要手动设置这个，Nginx 会自动选择最优的。可选项：
+- Linux: `epoll`
+- FreeBSD: `kqueue`
+- Solaris: `eventport`
+
+## 第三层：http 块
+
+`http` 块是所有 HTTP 相关配置的容器。它内部的指令可以被 `server` 块继承。
+
+### 文件类型映射
+
+```nginx
+include /etc/nginx/mime.types;
+default_type application/octet-stream;
+```
+
+`mime.types` 这个文件把所有文件扩展名映射到了 MIME 类型。没有它，浏览器不知道该如何渲染服务器返回的内容。
+
+你可以看看这个文件的内容：
+
+```
+types {
+    text/html                             html htm shtml;
+    text/css                              css;
+    application/javascript                js;
+    image/png                             png;
+    image/jpeg                            jpeg jpg;
+    ...
+}
+```
+
+`default_type` 是兜底：遇到未知扩展名时，就当二进制文件处理（浏览器会提示下载）。
+
+### 日志格式与位置
+
+```nginx
+log_format main '...';
+access_log /var/log/nginx/access.log main;
+```
+
+`log_format` 定义了一种叫 `main` 的日志格式模板。格式字符串中的每个 `$variable` 都是 Nginx 内置变量：
+
+| 变量 | 含义 |
+|------|------|
+| `$remote_addr` | 客户端 IP |
+| `$time_local` | 本地时间 |
+| `$request` | 完整的请求行（如 `GET /index.html HTTP/1.1`） |
+| `$status` | 响应状态码 |
+| `$body_bytes_sent` | 发送给客户端的字节数 |
+| `$http_referer` | 来源页面 |
+| `$http_user_agent` | 浏览器标识 |
+
+### 性能相关
+
+```nginx
+sendfile on;
+tcp_nopush on;
+keepalive_timeout 65;
+```
+
+这三行非常重要：
+
+- **`sendfile on`**：启用 Linux 的 `sendfile()` 系统调用。正常读取文件需要"磁盘→内核缓冲区→用户空间→内核 socket 缓冲区→网卡"这样多次拷贝。`sendfile()` 实现了"磁盘→内核缓冲区→网卡"的**零拷贝**，大幅提升静态文件传输性能。
+
+- **`tcp_nopush on`**：在 `sendfile` 开启时才生效。它让 Nginx 尽可能把 HTTP 响应头和数据打包在一个 TCP 包里发送，减少网络包数量。
+
+- **`keepalive_timeout 65`**：一个 TCP 连接在完成一个请求后，保持 65 秒不断开，以便复用传输后续请求（HTTP Keep-Alive）。这避免了反复的 TCP 三次握手。
+
+### `include` —— 组织配置的秘密武器
+
+```nginx
+include /etc/nginx/conf.d/*.conf;
+```
+
+这是 Nginx 配置管理的核心智慧：**不要把所有东西写在一个文件里**。
+
+通常的配置组织方式是：
+```
+/etc/nginx/
+  nginx.conf              # 主配置：全局 + events + http 块的公共部分
+  conf.d/
+    example.com.conf      # 站点 A 的配置
+    api.example.com.conf  # 站点 B 的配置
+```
+
+每个站点一个文件，互不影响。想下掉一个站点？把对应的 `.conf` 文件改名或移走，reload 即可。
+
+## server 块与 location 块
+
+上面我们看了 `nginx.conf` 主配置，但它没有定义任何网站。真正的网站配置在 `server` 块里，一般写在 `/etc/nginx/conf.d/` 下。
+
+让我们看一个典型的站点配置文件：
+
+```nginx
+server {
+    listen       80;
+    server_name  example.com www.example.com;
+
+    root   /var/www/example;
+    index  index.html index.htm;
+
+    # 精确匹配
+    location = /health {
+        return 200 'ok';
+    }
+
+    # 前缀匹配
+    location /static/ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # 正则匹配
+    location ~ \.php$ {
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    # 兜底匹配
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+```
+
+我们来拆解每个指令：
+
+### `listen` —— 监听哪个端口
+
+```nginx
+listen 80;
+listen 443 ssl http2;
+listen [::]:80;   # IPv6
+listen 127.0.0.1:8080;  # 只监听本地的 8080
+```
+
+### `server_name` —— 匹配哪个域名
+
+```nginx
+server_name example.com www.example.com;
+server_name *.example.com;        # 通配符
+server_name ~^api\.example\.com$; # 正则（以 ~ 开头）
+```
+
+当请求到达 Nginx 时，Nginx 根据 `Host` 头来决定交给哪个 `server` 块处理。这就是**虚拟主机**的基础。
+
+### `root` —— 网站根目录
+
+```nginx
+root /var/www/example;
+```
+
+如果一个请求是 `GET /images/logo.png`，Nginx 会去找文件 `/var/www/example/images/logo.png`。
+
+### `location` —— 根据 URL 路径做不同处理
+
+`location` 是 Nginx 配置中最灵活也最容易出错的指令。它有几种匹配方式：
+
+| 语法 | 类型 | 优先级 |
+|------|------|--------|
+| `= /path` | 精确匹配 | 最高 |
+| `^~ /path` | 前缀匹配（优先） | 高 |
+| `~ regex` | 区分大小写的正则匹配 | 中 |
+| `~* regex` | 不区分大小写的正则匹配 | 中 |
+| `/path` | 普通前缀匹配 | 低 |
+
+**匹配逻辑**：Nginx 先找出所有前缀匹配中的最长匹配，然后再检查正则匹配。如果有正则命中就用正则的，否则用最长前缀匹配。
+
+## 小结
+
+这一章我们拆解了 Nginx 配置的层级结构：
+
+1. **全局块** —— 进程运行参数（user, worker_processes, pid）
+2. **events 块** —— 连接处理模型和并发上限
+3. **http 块** —— HTTP 层面的公共设置
+4. **server 块** —— 一个虚拟主机的完整配置
+5. **location 块** —— URL 路径级别的精确控制
+
+另外记住两个关键机制：
+- `include` 让配置模块化
+- `location` 的匹配优先级决定了请求最终怎么被处理
+
+下一章，我们将实际搭建一个静态资源服务器。
+
+---
+
+> **参考链接**
+> - Nginx 配置文档：https://nginx.org/en/docs/http/ngx_http_core_module.html
+> - 理解 sendfile：https://www.nginx.com/blog/performance-tuning-tips-tricks/
+> - Nginx location 匹配规则：https://nginx.org/en/docs/http/ngx_http_core_module.html#location

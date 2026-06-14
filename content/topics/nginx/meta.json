@@ -1,0 +1,5 @@
+{
+  "title": "从零开始掌握 Nginx",
+  "description": "从基础概念到生产部署，系统学习 Nginx 反向代理、负载均衡、HTTPS 配置、性能优化等核心能力，由浅入深，覆盖真实生产场景",
+  "icon": "server"
+}

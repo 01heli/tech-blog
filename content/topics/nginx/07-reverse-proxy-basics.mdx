@@ -1,0 +1,232 @@
+---
+title: '反向代理基础：Nginx 最重要的技能'
+description: '理解正向代理与反向代理的区别，掌握 proxy_pass、proxy_set_header 及超时配置'
+order: 7
+---
+
+## 正向代理 vs 反向代理：先搞清楚概念
+
+很多人刚开始学 Nginx 时被"正/反向代理"绕晕。其实理解起来很简单：
+
+### 正向代理：你借助别人上网
+
+你（客户端） → 代理服务器 → 目标网站
+
+**典型场景**：VPN 翻墙。你知道你要访问 Google，但你不能直接访问，于是你让代理服务器替你访问。**你主动选择代理，你知道目标在哪**。
+
+### 反向代理：别人替你接待访客
+
+用户 → Nginx（反向代理）→ 后端服务器
+
+**典型场景**：用户访问 `api.example.com`，请求先到 Nginx，Nginx 转发给后端的 Node.js 服务器，Node.js 处理完返回，Nginx 再返回给用户。**用户不知道后端服务器在哪，甚至不知道有几个后端服务器**。
+
+### 一句话总结
+
+- **正向代理**：你找别人替你去 —— 你主动
+- **反向代理**：别人替你接客 —— 被访问方主动
+
+## 为什么需要反向代理？
+
+运行一个真实的 Web 应用，你一定会遇到这些需求：
+
+1. **统一入口**：你有 3 个后端服务（用户服务、订单服务、商品服务），各跑在不同的端口上。你不想让用户记住 `api.com:3001`、`api.com:3002`、`api.com:3003`。反向代理把它们统一到一个域名和端口下。
+
+2. **SSL 终结**：HTTPS 加密解密很耗 CPU。与其每个后端服务各自处理 HTTPS，不如让 Nginx 在前面处理完所有加密，后面都走 HTTP。后端服务不需要关心证书。
+
+3. **安全隔离**：后端服务不直接暴露给公网，只监听 `127.0.0.1`。公网只能访问到 Nginx。即使后端服务有安全漏洞，攻击者也必须先过 Nginx 这关。
+
+4. **缓存和压缩**：Nginx 可以在代理层缓存响应，给返回内容做 gzip 压缩，减轻后端压力。
+
+5. **灰度发布和 A/B 测试**：Nginx 可以把一部分流量导向新版本服务，不影响大多数用户。
+
+## proxy_pass：反向代理的核心指令
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000;
+}
+```
+
+这就完成了一个最简单的反向代理。所有 `/api/` 开头的请求，Nginx 都会转发到 `http://127.0.0.1:3000`。
+
+### proxy_pass 加不加斜杠很重要
+
+这是新手最容易踩的坑。`proxy_pass` 末尾的 `/` 决定了 URI 是否被替换：
+
+**情况 1：proxy_pass 不带路径（没有 `/api` 之类的）**
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000;      # 末尾没有 /
+}
+```
+
+请求 `/api/users` → 转发到 `http://127.0.0.1:3000/api/users`
+请求 `/api/users?id=1` → 转发到 `http://127.0.0.1:3000/api/users?id=1`
+
+URI **原样传递**。
+
+**情况 2：proxy_pass 带路径**
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000/;     # 末尾有 /
+}
+```
+
+请求 `/api/users` → 转发到 `http://127.0.0.1:3000/users`
+请求 `/api/users?id=1` → 转发到 `http://127.0.0.1:3000/users?id=1`
+
+`/api/` 被替换成了 `/`。
+
+**记住这个规则**：`proxy_pass` 包含路径组件时，匹配到的 location 部分会被替换。不含路径时，原始 URI 原样追加。
+
+### 典型场景
+
+后端服务通常不关心 Nginx 的路由前缀。你应该去掉 `/api/` 前缀：
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000/;  # 有斜杠，去掉 /api
+}
+```
+
+## proxy_set_header：把重要信息传给后端
+
+默认情况下，Nginx 转发请求时不会把客户端的原始信息传过去。后端看到的是 Nginx 自己的 IP，而不是用户 IP。你必须手动设置一些头：
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:3000/;
+
+    # 传客户端的真实 IP
+    proxy_set_header X-Real-IP $remote_addr;
+
+    # 传代理链（如果前面还有 CDN/负载均衡器）
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+    # 传原始域名
+    proxy_set_header Host $host;
+
+    # 传原始协议（http 还是 https）
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+这些头对后端应用来说非常重要：
+
+| 头 | 后端用来做什么 |
+|------|---------------|
+| `X-Real-IP` | 获取用户真实 IP（做 IP 限流、审计日志） |
+| `X-Forwarded-For` | 获取完整的代理链（用户 → CDN → Nginx → 后端） |
+| `Host` | 知道用户用哪个域名访问（生成正确的绝对 URL） |
+| `X-Forwarded-Proto` | 知道原始请求是 http 还是 https（重定向时用） |
+
+### 简化版：把常用头提取成 snippet
+
+```nginx
+# /etc/nginx/snippets/proxy-params.conf
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+
+# 然后在 location 中引用
+location /api/ {
+    proxy_pass http://127.0.0.1:3000/;
+    include snippets/proxy-params.conf;
+}
+```
+
+## 超时与缓冲配置
+
+反向代理中，超时控制至关重要。没有合理超时，一个卡住的后端请求可能耗尽 Nginx 的连接数。
+
+```nginx
+location /api/ {
+    proxy_pass http://backend/;
+
+    # 连接后端服务器的超时时间
+    proxy_connect_timeout 5s;
+
+    # 从后端读取响应的超时时间（两次读操作之间的间隔）
+    proxy_read_timeout 30s;
+
+    # 向后端发送请求的超时时间
+    proxy_send_timeout 30s;
+
+    # 缓冲相关
+    proxy_buffering on;
+    proxy_buffer_size 4k;
+    proxy_buffers 8 4k;
+    proxy_busy_buffers_size 8k;
+}
+```
+
+**`proxy_connect_timeout`** 是最关键的：你不能让 Nginx 一直等后端启动。通常设 3-5 秒。
+
+**缓冲（buffering）** 也很重要：Nginx 从后端收完响应后，一次性发给客户端。如果后端响应很快，这是最优的。但如果后端是一个流式响应（如 ChatGPT 那种逐字输出），就需要关闭缓冲：
+
+```nginx
+location /stream/ {
+    proxy_pass http://backend/;
+    proxy_buffering off;  # 实时转发，不缓冲
+    proxy_cache off;      # 当然也不能缓存
+}
+```
+
+## 实战：一套常见的反向代理配置
+
+假设你有一个 Node.js 应用跑在 `127.0.0.1:3000`，下面是生产级的配置：
+
+```nginx
+upstream node_app {
+    server 127.0.0.1:3000;
+    keepalive 32;  # 连接池（减少 TCP 握手）
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    # SSL 证书配置（后面章节会详讲）
+    ssl_certificate     /etc/nginx/certs/api.example.com.pem;
+    ssl_certificate_key /etc/nginx/certs/api.example.com.key;
+
+    location / {
+        proxy_pass http://node_app/;
+        include snippets/proxy-params.conf;
+
+        # 超时
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 60s;
+
+        # 缓冲
+        proxy_buffering on;
+    }
+
+    # 健康检查端点不记日志
+    location = /health {
+        proxy_pass http://node_app/health;
+        access_log off;
+    }
+}
+```
+
+## 小结
+
+这一章我们学到了：
+
+1. **正向代理**是你找代理访问外网，**反向代理**是别人通过代理访问你的服务
+2. `proxy_pass` 末尾的 `/` 决定 URI 是否被替换
+3. `proxy_set_header` 把用户的真实 IP、域名等信息传给后端（**不设的话后端什么都不知道**）
+4. 合理设置超时防止资源耗尽
+5. 把常用代理头提取成 snippet 是成熟的做法
+
+下一章，我们让多个后端服务器协同工作——学习**负载均衡**。
+
+---
+
+> **参考链接**
+> - ngx_http_proxy_module：https://nginx.org/en/docs/http/ngx_http_proxy_module.html
+> - Understanding Nginx proxy_pass：https://dev.to/danielkun/nginx-everything-about-proxypass-2ona
