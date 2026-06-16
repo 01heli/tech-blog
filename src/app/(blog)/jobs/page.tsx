@@ -15,6 +15,9 @@ export const metadata: Metadata = {
 
 const PER_PAGE = 20;
 
+// 依赖外部 boss_ai SQLite 数据库（sql.js WASM），构建期不可用
+export const dynamic = 'force-dynamic';
+
 export default async function JobsPage({
   searchParams,
 }: {
