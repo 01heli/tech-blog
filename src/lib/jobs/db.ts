@@ -13,13 +13,13 @@ let _initPromise: Promise<SqlJsDatabase> | null = null;
 
 async function initDb(): Promise<SqlJsDatabase> {
   const SQL = await initSqlJs({
-    // 在 Docker build / Next.js 构建环境中，sql.js 需要显式指定 .wasm 文件路径
-    locateFile: (file: string) => {
-      // 优先检查环境变量指定的路径
+    // sql.js 的 locateFile 接收 (filename, scriptDir)，
+    // scriptDir 是 sql-wasm.js 所在的目录（即 node_modules/sql.js/dist/）
+    locateFile: (file: string, scriptDir: string) => {
       if (process.env.SQLJS_WASM_PATH) {
         return process.env.SQLJS_WASM_PATH;
       }
-      return file;
+      return scriptDir + file;
     },
   });
   if (existsSync(DB_PATH)) {
