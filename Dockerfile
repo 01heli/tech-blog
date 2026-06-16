@@ -15,7 +15,10 @@ RUN npm ci
 
 COPY . .
 
+ENV DATABASE_URL="file:./data/build.db"
+
 RUN npx prisma generate
+RUN mkdir -p prisma/data && npx prisma db push --skip-generate
 RUN npm run build
 
 # ---- 运行阶段 ----

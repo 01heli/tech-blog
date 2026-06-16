@@ -12,7 +12,16 @@ let _db: SqlJsDatabase | null = null;
 let _initPromise: Promise<SqlJsDatabase> | null = null;
 
 async function initDb(): Promise<SqlJsDatabase> {
-  const SQL = await initSqlJs();
+  const SQL = await initSqlJs({
+    // 在 Docker build / Next.js 构建环境中，sql.js 需要显式指定 .wasm 文件路径
+    locateFile: (file: string) => {
+      // 优先检查环境变量指定的路径
+      if (process.env.SQLJS_WASM_PATH) {
+        return process.env.SQLJS_WASM_PATH;
+      }
+      return file;
+    },
+  });
   if (existsSync(DB_PATH)) {
     const buffer = readFileSync(DB_PATH);
     return new SQL.Database(buffer);
@@ -59,17 +68,23 @@ export function execAll(
   sql: string,
   params: (string | number | null | undefined)[] = []
 ): any[] {
-  const formatted = sqlFormat(sql, params);
-  const results = db.exec(formatted);
-  if (!results.length) return [];
-  const [table] = results;
-  return table.values.map((row) => {
-    const obj: any = {};
-    table.columns.forEach((col, j) => {
-      obj[col] = row[j];
+  try {
+    const formatted = sqlFormat(sql, params);
+    const results = db.exec(formatted);
+    if (!results.length) return [];
+    const [table] = results;
+    return table.values.map((row) => {
+      const obj: any = {};
+      table.columns.forEach((col, j) => {
+        obj[col] = row[j];
+      });
+      return obj;
     });
-    return obj;
-  });
+  } catch (err) {
+    // 空库（Docker 构建环境）查不存在的表会抛异常，返回空数组
+    console.warn('[jobs] execAll failed:', (err as Error).message);
+    return [];
+  }
 }
 
 /** 执行查询并返回第一行（等同于 better-sqlite3 .get()） */
@@ -78,14 +93,19 @@ export function execOne(
   sql: string,
   params: (string | number | null | undefined)[] = []
 ): any | null {
-  const formatted = sqlFormat(sql, params);
-  const results = db.exec(formatted);
-  if (!results.length || !results[0].values.length) return null;
-  const table = results[0];
-  const row = table.values[0];
-  const obj: any = {};
-  table.columns.forEach((col, j) => {
-    obj[col] = row[j];
-  });
-  return obj;
+  try {
+    const formatted = sqlFormat(sql, params);
+    const results = db.exec(formatted);
+    if (!results.length || !results[0].values.length) return null;
+    const table = results[0];
+    const row = table.values[0];
+    const obj: any = {};
+    table.columns.forEach((col, j) => {
+      obj[col] = row[j];
+    });
+    return obj;
+  } catch (err) {
+    console.warn('[jobs] execOne failed:', (err as Error).message);
+    return null;
+  }
 }

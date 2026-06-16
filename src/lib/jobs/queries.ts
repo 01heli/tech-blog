@@ -78,7 +78,7 @@ export async function getJobs(filters: JobFilters = {}): Promise<{
      JOIN cleaned_jobs c ON c.raw_id = r.id
      ${where}`,
     params
-  ) as { cnt: number };
+  ) as { cnt: number } | null;
 
   const rows = execAll(
     db,
@@ -97,7 +97,7 @@ export async function getJobs(filters: JobFilters = {}): Promise<{
 
   const items: JobItem[] = rows.map(mapJobItem);
 
-  return { items, total: countRow.cnt };
+  return { items, total: countRow?.cnt ?? 0 };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -130,11 +130,11 @@ export async function getStats(): Promise<JobStats> {
 
   const totalJobs = (
     execOne(db, 'SELECT COUNT(*) as cnt FROM raw_jobs') as any
-  ).cnt;
+  )?.cnt ?? 0;
 
   const totalCities = (
     execOne(db, 'SELECT COUNT(DISTINCT city) as cnt FROM raw_jobs') as any
-  ).cnt;
+  )?.cnt ?? 0;
 
   const avgRow = execOne(
     db,
