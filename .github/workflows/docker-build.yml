@@ -5,7 +5,7 @@ on:
     branches: [master, main]
 
 env:
-  REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  REGISTRY: crpi-j44ew35plnwei3j6.cn-hangzhou.personal.cr.aliyuncs.com
   NAMESPACE: tech-blog
 
 jobs:
