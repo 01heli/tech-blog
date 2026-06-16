@@ -1,6 +1,7 @@
 
 services:
   blog:
+    build: .
     image: ghcr.io/01heli/tech-blog:latest
     container_name: tech-blog-app
     expose:
