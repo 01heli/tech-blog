@@ -1,0 +1,294 @@
+---
+title: "安装 Ansible 与编写主机清单（Inventory）"
+description: "手把手安装 Ansible 控制节点，编写静态和动态 Inventory，配置 SSH 免密登录，理解主机分组和变量继承。"
+order: 2
+---
+
+## 安装 Ansible
+
+Ansible 只需要安装在**控制节点**（你用来管理其他服务器的机器）上。被管理节点不需要安装任何东西。
+
+### 在 Linux 上安装
+
+```bash
+# Ubuntu / Debian
+sudo apt update
+sudo apt install -y ansible
+
+# CentOS / RHEL / Fedora
+sudo dnf install -y ansible   # 或 yum install -y ansible
+
+# 验证安装
+ansible --version
+```
+
+输出类似：
+
+```
+ansible [core 2.17.0]
+  config file = /etc/ansible/ansible.cfg
+  configured module search path = ['/home/user/.ansible/plugins/modules']
+  python version = 3.12.3
+```
+
+### 在 macOS 上安装
+
+```bash
+brew install ansible
+```
+
+### 在 Windows 上安装
+
+Ansible 控制节点**不能直接运行在 Windows 上**。你需要在 Windows 上通过 WSL2（Windows Subsystem for Linux）或虚拟机运行 Ansible：
+
+```bash
+# 在 WSL2 的 Ubuntu 终端中
+sudo apt update && sudo apt install -y ansible
+```
+
+> **注意**：Ansible **可以管理 Windows 被管理节点**（通过 WinRM 协议），但控制节点必须在 Linux/macOS 上。
+
+### 用 pip 安装（获取最新版本）
+
+如果你想要最新版本，或需要隔离 Python 环境：
+
+```bash
+python3 -m venv ansible-env
+source ansible-env/bin/activate
+pip install ansible
+```
+
+---
+
+## 做实验的"被管理节点"怎么来？
+
+你需要至少一台"被管理节点"来做实验。推荐三种低成本方案：
+
+| 方案 | 成本 | 适合 |
+|------|------|------|
+| **本地虚拟机（VirtualBox / UTM）** | 免费 | 一台电脑搞定全部实验 |
+| **云服务器（阿里云 / AWS 免费套餐）** | 低（按量付费或免费试用） | 体验真实网络环境 |
+| **Docker 容器** | 免费 | 最轻量，秒级创建销毁 |
+
+最推荐的方式是用 Docker 快速拉起几台"被管理节点"：
+
+```bash
+# 创建 3 台 Ubuntu 容器当作"被管理节点"
+docker run -d --name node1 ubuntu:22.04 tail -f /dev/null
+docker run -d --name node2 ubuntu:22.04 tail -f /dev/null
+docker run -d --name node3 ubuntu:22.04 tail -f /dev/null
+
+# 在每台容器里安装 Python 和 SSH（容器默认没有）
+docker exec -it node1 bash -c "apt update && apt install -y python3 openssh-server && service ssh start"
+docker exec -it node2 bash -c "apt update && apt install -y python3 openssh-server && service ssh start"
+docker exec -it node3 bash -c "apt update && apt install -y python3 openssh-server && service ssh start"
+```
+
+---
+
+## 第一步：配置 SSH 免密登录
+
+Ansible 通过 SSH 连接被管理节点。每次执行任务都要输入密码？那自动化就没意义了。我们要先配好**SSH 密钥免密登录**。
+
+```bash
+# 1. 在控制节点上生成 SSH 密钥对（如果还没有）
+ssh-keygen -t ed25519 -C "ansible-control" -f ~/.ssh/id_ed25519_ansible
+
+# 2. 将公钥复制到被管理节点
+ssh-copy-id -i ~/.ssh/id_ed25519_ansible.pub root@192.168.1.101
+ssh-copy-id -i ~/.ssh/id_ed25519_ansible.pub root@192.168.1.102
+ssh-copy-id -i ~/.ssh/id_ed25519_ansible.pub root@192.168.1.103
+
+# 3. 验证免密登录是否成功
+ssh -i ~/.ssh/id_ed25519_ansible root@192.168.1.101 "echo 连接成功"
+```
+
+---
+
+## 第二步：编写 Inventory（主机清单）
+
+Inventory 是 Ansible 最重要的配置文件之一。它告诉 Ansible：**你要管理哪些服务器**。
+
+### 最简单的 Inventory：INI 格式
+
+```ini
+# inventory.ini
+192.168.1.101
+192.168.1.102
+192.168.1.103
+```
+
+这表示 Ansible 可以管理这 3 台服务器。你可以用 `ansible` 命令测试连接：
+
+```bash
+# -i 指定 Inventory 文件，-m ping 使用 ping 模块测试连接
+ansible all -i inventory.ini -m ping
+```
+
+输出：
+
+```
+192.168.1.101 | SUCCESS => { "ping": "pong" }
+192.168.1.102 | SUCCESS => { "ping": "pong" }
+192.168.1.103 | SUCCESS => { "ping": "pong" }
+```
+
+**"ping" 返回 "pong"**——这是 Ansible 的"hello world"，表示控制节点能正常 SSH 连接被管理节点。
+
+### 分组：让管理更有条理
+
+在实际场景中，服务器有不同的角色。Inventory 支持给主机分组：
+
+```ini
+# inventory.ini
+[webservers]
+web-01 ansible_host=192.168.1.101
+web-02 ansible_host=192.168.1.102
+
+[dbservers]
+db-01 ansible_host=192.168.1.201
+db-02 ansible_host=192.168.1.202
+
+[monitoring]
+monitor-01 ansible_host=192.168.1.254
+```
+
+每个主机可以有一个**别名**（如 `web-01`），`ansible_host` 指定它的真实 IP。
+
+现在你可以针对特定组来执行操作：
+
+```bash
+ansible webservers -i inventory.ini -m ping    # 只对 web 组操作
+ansible dbservers -i inventory.ini -m ping     # 只对 db 组操作
+ansible all -i inventory.ini -m ping           # 对所有组操作
+```
+
+### 组的嵌套
+
+你还可以把多个组组合成一个更大的组：
+
+```ini
+# inventory.ini
+
+[webservers]
+web-01 ansible_host=192.168.1.101
+web-02 ansible_host=192.168.1.102
+
+[dbservers]
+db-01 ansible_host=192.168.1.201
+db-02 ansible_host=192.168.1.202
+
+[production:children]
+webservers
+dbservers
+```
+
+`production:children` 表示 `production` 是 `webservers` 和 `dbservers` 的父组。对 `production` 执行操作，等于对所有子组执行。
+
+### YAML 格式的 Inventory
+
+除了 INI 格式，Ansible 也支持 YAML 格式的 Inventory，结构更清晰：
+
+```yaml
+# inventory.yml
+all:
+  children:
+    webservers:
+      hosts:
+        web-01:
+          ansible_host: 192.168.1.101
+        web-02:
+          ansible_host: 192.168.1.102
+    dbservers:
+      hosts:
+        db-01:
+          ansible_host: 192.168.1.201
+        db-02:
+          ansible_host: 192.168.1.202
+```
+
+### 在 Inventory 中定义变量
+
+你可以在 Inventory 中为每个主机或每个组定义变量：
+
+```ini
+# inventory.ini
+[webservers]
+web-01 ansible_host=192.168.1.101 ansible_user=deploy ansible_ssh_private_key_file=~/.ssh/id_ed25519_ansible
+web-02 ansible_host=192.168.1.102 ansible_user=deploy ansible_ssh_private_key_file=~/.ssh/id_ed25519_ansible
+
+[webservers:vars]
+http_port=80
+max_clients=200
+```
+
+常用的连接变量：
+
+| 变量 | 说明 |
+|------|------|
+| `ansible_host` | 目标 IP 或域名 |
+| `ansible_user` | SSH 登录用户名 |
+| `ansible_port` | SSH 端口（默认 22） |
+| `ansible_ssh_private_key_file` | SSH 私钥路径 |
+| `ansible_python_interpreter` | Python 解释器路径 |
+
+---
+
+## 第三步：配置 ansible.cfg
+
+除了命令行的 `-i` 参数，你还可以在项目根目录放一个 `ansible.cfg`，设定默认值：
+
+```ini
+# ansible.cfg
+[defaults]
+inventory = ./inventory.ini        # 默认 Inventory 文件
+remote_user = root                 # 默认 SSH 用户
+private_key_file = ~/.ssh/id_ed25519_ansible  # 默认私钥
+host_key_checking = False          # 首次连接时不询问指纹确认（仅在实验环境！）
+forks = 5                          # 并发执行数
+```
+
+配置好 `ansible.cfg` 后，你就可以省略 `-i inventory.ini` 和 `-u root` 参数了：
+
+```bash
+# 不需要 -i 和 -u，ansible.cfg 里已经定义好了
+ansible all -m ping
+```
+
+---
+
+## 动态 Inventory：云环境必备
+
+如果你的服务器在云上（AWS、阿里云、GCP），手动维护 Inventory 文件会是一场噩梦——机器频繁创建销毁，IP 一直在变。
+
+Ansible 支持**动态 Inventory**——从云厂商 API 实时拉取主机列表。
+
+```bash
+# AWS 动态 Inventory 示例（使用 aws_ec2 插件）
+ansible-inventory -i aws_ec2.yml --list
+```
+
+在初学阶段，先用静态 Inventory 理解概念。动态 Inventory 的细节在实战章节会展开。
+
+---
+
+## 常见报错排查
+
+| 报错 | 原因 | 解决 |
+|------|------|------|
+| `UNREACHABLE: Failed to connect` | SSH 不通 | 检查 IP 是否正确、22 端口是否开放、防火墙是否放行 |
+| `Permission denied (publickey)` | 密钥未配置 | 确认 `ssh-copy-id` 已执行，或 `ansible_user` 和 `ansible_ssh_private_key_file` 正确 |
+| `MODULE FAILURE: /bin/python: not found` | 被管理节点没有 Python | `apt install python3`，然后设置 `ansible_python_interpreter=/usr/bin/python3` |
+| `Host key verification failed` | 首次连接指纹确认 | 在 `ansible.cfg` 里设置 `host_key_checking = False` |
+
+---
+
+## 小结
+
+到这一步，你已经有了：
+- 一台安装了 Ansible 的控制节点
+- 一个 Inventory 文件，列出了要管理的服务器
+- 配置好了 SSH 免密登录
+- 用 `ansible all -m ping` 验证了连接
+
+这是 Ansible 的"地基"。下一章，我们要真正开始"干活"——用 Ad-hoc 命令执行单次任务，感受 Ansible 远程执行的力量。

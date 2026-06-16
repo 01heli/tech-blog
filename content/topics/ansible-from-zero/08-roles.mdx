@@ -1,0 +1,393 @@
+---
+title: "Roles 角色化：把 Playbook 拆成乐高积木"
+description: "理解 Ansible Roles 的目录结构和设计理念，用 ansible-galaxy 创建和共享 Roles，构建模块化、可复用的自动化代码库。"
+order: 8
+---
+
+## 从"一个巨大 Playbook"到"乐高积木"
+
+当一个 Playbook 只有 50 行时，写在一个文件里没问题。当它增长到 500 行——包含安装 Nginx、配置 MySQL、部署 Node.js 应用、设置防火墙——一个文件就变成了灾难。
+
+你开始复制粘贴。项目 A 的 Playbook 里有一段"安装 Docker"的代码，项目 B 也要用，于是复制过去。一个月后，Docker 版本要升级，你改了项目 A 的代码，忘了项目 B 的——线上版本不一致。
+
+**Roles 就是解决这个问题的。**
+
+> Role = 把一个"职责"（比如"装 Nginx"）的所有文件按约定组织到一个目录里。用的时候，一句话 `roles: [nginx]` 就搞定。像乐高积木一样，拆开是独立模块，拼起来是完整应用。
+
+---
+
+## Role 的标准目录结构
+
+一个 Role 是一个有固定结构的目录：
+
+```
+roles/
+└── nginx/                     ← Role 名
+    ├── tasks/                 ← 核心：这个 Role 要执行的任务
+    │   └── main.yml           ← Ansible 自动加载这个文件
+    ├── handlers/              ← 这个 Role 专用的 Handler
+    │   └── main.yml
+    ├── templates/             ← Jinja2 模板文件
+    │   └── nginx.conf.j2
+    ├── files/                 ← 静态文件（copy 模块用）
+    │   └── index.html
+    ├── vars/                  ← 高优先级变量（用户一般不改）
+    │   └── main.yml
+    ├── defaults/              ← 低优先级默认变量（用户推荐覆盖这里）
+    │   └── main.yml
+    ├── meta/                  ← Role 元信息（依赖、Galaxy 信息）
+    │   └── main.yml
+    ├── tasks/                 ← 也可能有子目录
+    │   ├── main.yml
+    │   ├── install.yml
+    │   └── configure.yml
+    └── README.md              ← 给团队看的文档
+```
+
+不需要每个子目录都创建——没有用到的可以省掉。但 `tasks/main.yml` 是必须的。
+
+---
+
+## 创建你的第一个 Role
+
+用 `ansible-galaxy` 自动生成骨架：
+
+```bash
+ansible-galaxy init nginx
+```
+
+输出：
+
+```
+- Role nginx was created successfully
+```
+
+不出一秒，一个完整的目录结构就建好了。改名为你需要的名字即可。
+
+---
+
+## 动手：写一个 nginx Role
+
+### defaults/main.yml —— 定义可覆盖的默认值
+
+```yaml
+---
+# nginx 的默认配置，用户可以在 Playbook 中覆盖
+nginx_port: 80
+nginx_user: www-data
+nginx_worker_processes: auto
+nginx_worker_connections: 1024
+nginx_server_name: "{{ ansible_hostname }}"
+```
+
+### tasks/main.yml —— 核心任务
+
+```yaml
+---
+- name: 安装 Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: 创建 Web 根目录
+  ansible.builtin.file:
+    path: /var/www/{{ nginx_server_name }}
+    state: directory
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+    mode: "0755"
+
+- name: 部署默认首页
+  ansible.builtin.template:
+    src: index.html.j2
+    dest: /var/www/{{ nginx_server_name }}/index.html
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+
+- name: 复制 Nginx 主配置文件
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+  notify: 重载 Nginx
+
+- name: 复制站点配置
+  ansible.builtin.template:
+    src: site.conf.j2
+    dest: /etc/nginx/sites-available/{{ nginx_server_name }}
+  notify: 启用站点并重载
+
+- name: 禁用默认站点
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: 重载 Nginx
+
+- name: 确保 Nginx 正在运行
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+```
+
+### handlers/main.yml —— 响应式操作
+
+```yaml
+---
+- name: 启用站点并重载
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/{{ nginx_server_name }}
+    dest: /etc/nginx/sites-enabled/{{ nginx_server_name }}
+    state: link
+  notify: 重载 Nginx
+
+- name: 重载 Nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
+```
+
+### templates/ —— 配置文件模板
+
+```nginx
+# templates/nginx.conf.j2
+user  {{ nginx_user }};
+worker_processes  {{ nginx_worker_processes }};
+
+events {
+    worker_connections  {{ nginx_worker_connections }};
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    access_log  /var/log/nginx/access.log;
+    error_log   /var/log/nginx/error.log;
+
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+```
+
+```html
+{# templates/index.html.j2 #}
+<!DOCTYPE html>
+<html>
+<head><title>{{ nginx_server_name }}</title></head>
+<body>
+  <h1>{{ nginx_server_name }} 运行正常</h1>
+  <p>部署时间: {{ ansible_date_time.iso8601 }}</p>
+</body>
+</html>
+```
+
+### 使用这个 Role
+
+在 Playbook 中一行引用：
+
+```yaml
+---
+- name: 部署 Web 服务器
+  hosts: webservers
+  become: true
+  roles:
+    - nginx
+```
+
+或者带参数覆盖默认值：
+
+```yaml
+- name: 部署 Web 服务器
+  hosts: webservers
+  become: true
+  roles:
+    - role: nginx
+      nginx_port: 8080
+      nginx_worker_processes: 8
+```
+
+---
+
+## 组织复杂 Role：拆分 tasks 文件
+
+当 Role 的任务越来越多时，把任务按"阶段"拆成多个文件：
+
+```
+roles/nginx/tasks/
+├── main.yml
+├── install.yml
+├── configure.yml
+├── firewall.yml
+└── monitoring.yml
+```
+
+`main.yml` 用 `import_tasks` 或 `include_tasks` 把它们串联起来：
+
+```yaml
+# tasks/main.yml
+---
+- name: 第一步：安装
+  ansible.builtin.import_tasks: install.yml
+
+- name: 第二步：配置
+  ansible.builtin.import_tasks: configure.yml
+
+- name: 第三步：防火墙
+  ansible.builtin.import_tasks: firewall.yml
+  when: configure_firewall | default(true)
+
+- name: 第四步：监控
+  ansible.builtin.include_tasks: monitoring.yml
+  when: enable_monitoring | default(false)
+```
+
+### `import_tasks` vs `include_tasks` 的区别
+
+| 特性 | `import_tasks` | `include_tasks` |
+|------|---------------|-----------------|
+| 加载时机 | **解析时**（Playbook 开始前） | **运行时**（执行到它时） |
+| 条件判断 | `when` 作用在每个子任务上 | `when` 作用在整个 include 上 |
+| 循环 | 不支持 | 支持 `loop` |
+| 从外部传变量 | 不支持 | 支持 `vars` |
+| 性能 | 更快（一次性解析） | 稍慢（每次执行时解析） |
+
+**简单规则**：默认用 `import_tasks`；当你需要**根据执行结果动态决定是否加载**时才用 `include_tasks`。
+
+---
+
+## Role 依赖：meta/main.yml
+
+如果一个 Role 依赖另一个 Role（比如你的应用 Role 依赖 Nginx Role），在 `meta/main.yml` 中声明：
+
+```yaml
+# roles/myapp/meta/main.yml
+---
+dependencies:
+  - role: nginx
+    nginx_port: 8080
+  - role: nodejs
+    node_version: 20
+```
+
+当 Playbook 中只写了 `roles: [myapp]` 时，Ansible 会自动先执行依赖的 `nginx` 和 `nodejs` Role。
+
+---
+
+## 项目级目录结构
+
+一个使用 Roles 的生产级项目通常长这样：
+
+```
+project/
+├── ansible.cfg
+├── inventory/
+│   ├── production/
+│   │   ├── hosts
+│   │   ├── group_vars/
+│   │   │   ├── all.yml
+│   │   │   ├── webservers.yml
+│   │   │   └── dbservers.yml
+│   │   └── host_vars/
+│   └── staging/
+│       ├── hosts
+│       └── group_vars/
+├── playbooks/
+│   ├── site.yml                ← 主入口，组装所有 Role
+│   ├── webservers.yml
+│   └── dbservers.yml
+├── roles/
+│   ├── common/                 ← 所有主机都用的基础 Role
+│   ├── nginx/
+│   ├── nodejs/
+│   ├── mysql/
+│   └── monitoring/
+└── requirements.yml            ← 外部 Role 依赖声明
+```
+
+### site.yml —— 主 Playbook，把 Role 拼装起来
+
+```yaml
+---
+- name: 所有主机的基础配置
+  hosts: all
+  become: true
+  roles:
+    - common
+
+- name: Web 服务器
+  hosts: webservers
+  become: true
+  roles:
+    - nginx
+    - nodejs
+    - { role: monitoring, when: enable_monitoring }
+
+- name: 数据库服务器
+  hosts: dbservers
+  become: true
+  roles:
+    - mysql
+```
+
+---
+
+## Ansible Galaxy：社区 Role 仓库
+
+Galaxy 是 Ansible 的公共 Role 仓库（https://galaxy.ansible.com），类似 Docker Hub。你可以下载别人写好的 Role，也可以发布自己的。
+
+### 安装社区 Role
+
+```bash
+# 搜索
+ansible-galaxy search nginx
+
+# 安装（默认放到 ~/.ansible/roles/）
+ansible-galaxy install geerlingguy.nginx
+
+# 指定版本
+ansible-galaxy install geerlingguy.nginx,3.3.0
+
+# 安装到项目的 roles/ 目录
+ansible-galaxy install -p ./roles geerlingguy.nginx
+```
+
+### 用 requirements.yml 声明依赖
+
+```yaml
+# requirements.yml
+---
+roles:
+  - name: geerlingguy.nginx
+    version: 3.3.0
+
+  - name: geerlingguy.nodejs
+    version: 6.2.0
+
+  - name: geerlingguy.mysql
+    version: 4.3.0
+```
+
+安装所有声明的 Role：
+
+```bash
+ansible-galaxy install -r requirements.yml -p ./roles
+```
+
+> **提示**：社区 Role 虽然方便，但建议先完整阅读它的 `defaults/main.yml` 和 `tasks/main.yml`，了解它到底改了哪些参数。不要把不审核的第三方代码直接跑在生产环境。
+
+---
+
+## 小结
+
+Roles 是 Ansible 项目从"能跑"到"可维护"的分水岭。对于一个需要长期迭代和团队协作的项目，Roles 是必经之路。
+
+三个要点：
+1. **一个 Role 做一件事**——Nginx、MySQL、Node.js 各成一个 Role，不要写"万能 Role"
+2. **defaults 放默认值，vars 放固定值**——让使用者能方便覆盖
+3. **不要重复造轮子**——先查 Galaxy 有没有成熟的社区 Role，再决定是否自己写
+
+下一章，我们要解决一个安全问题：数据库密码、API 密钥这些敏感信息，怎么安全地存到 Git 里？

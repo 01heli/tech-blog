@@ -1,0 +1,330 @@
+---
+title: "Jinja2 模板：动态生成配置文件"
+description: "掌握 Ansible template 模块和 Jinja2 模板语法，用变量、循环、条件和过滤器动态生成 Nginx/系统配置文件。"
+order: 7
+---
+
+## 为什么需要模板？
+
+假设你要给 50 台服务器配置 Nginx。这些机器配置基本一样，但有些细节不同：
+
+- 有的机器有 4 核 CPU，有的有 8 核——`worker_processes` 应该不一样
+- 有的机器跑在 8080 端口，有的跑在 80——`listen` 指令不一样
+- server_name 每台机器不同
+
+如果用 `copy` 模块，你需要为每台机器准备一份单独的配置文件。50 台机器 = 50 个配置文件——这完全违背了自动化的初衷。
+
+**模板的作用**：写一份"骨架"配置文件，里面嵌入变量和逻辑。Ansible 渲染时，根据每台机器的实际情况填入对应的值。
+
+```
+模板文件（一份）                 实际生成（每台不同）
+┌──────────────────┐            ┌──────────────────┐
+│ worker_processes │            │ worker_processes  │
+│ {{ cpu_count }}; │  ──→ web-01│ 4;               │
+│                  │            └──────────────────┘
+│ listen {{ port }}│            ┌──────────────────┐
+│                  │  ──→ web-02│ worker_processes  │
+│                  │            │ 8;               │
+└──────────────────┘            └──────────────────┘
+```
+
+---
+
+## template 模块基本用法
+
+```yaml
+- name: 从模板生成 Nginx 配置
+  ansible.builtin.template:
+    src: nginx.conf.j2          # 模板文件（控制节点上的路径）
+    dest: /etc/nginx/nginx.conf # 生成的目标文件（被管理节点上的路径）
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true                # 如果目标已存在，先备份
+  notify: 重载 Nginx
+```
+
+模板文件通常放在 Playbook 同目录的 `templates/` 子目录下：
+
+```
+project/
+├── templates/
+│   └── nginx.conf.j2          ← .j2 后缀是约定俗成（Jinja2）
+├── site.yml
+└── inventory.ini
+```
+
+---
+
+## Jinja2 语法速成
+
+Jinja2 是 Python 世界里最流行的模板引擎，Ansible 直接用它。你只需要掌握三种语法：
+
+| 语法 | 用途 | 示例 |
+|------|------|------|
+| `{{ 变量 }}` | 输出变量的值 | `{{ http_port }}` |
+| `{% 控制 %}` | 条件/循环等控制语句 | `{% if %}...{% endif %}` |
+| `{# 注释 #}` | 注释，渲染时会被忽略 | `{# 这是注释 #}` |
+
+---
+
+## 实战：一个生产级 Nginx 配置模板
+
+模板文件 `templates/nginx.conf.j2`：
+
+```nginx
+{# 由 Ansible 管理，请勿手动修改 #}
+# 生成时间: {{ ansible_date_time.iso8601 }}
+# 目标主机: {{ ansible_hostname }}
+
+user {{ nginx_user | default('www-data') }};
+worker_processes {{ nginx_worker_processes | default(ansible_processor_vcpus) }};
+pid /run/nginx.pid;
+
+events {
+    worker_connections {{ nginx_worker_connections | default(1024) }};
+    use epoll;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+
+    keepalive_timeout {{ nginx_keepalive_timeout | default(65) }};
+
+    # gzip 压缩
+    gzip on;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css application/json application/javascript text/xml;
+
+    {% if nginx_enable_access_log | default(true) %}
+    access_log /var/log/nginx/access.log;
+    {% else %}
+    access_log off;
+    {% endif %}
+
+    error_log /var/log/nginx/error.log;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+对应的 Playbook：
+
+```yaml
+- name: 配置 Nginx
+  hosts: webservers
+  vars:
+    nginx_worker_processes: "{{ ansible_processor_vcpus * 2 }}"
+    nginx_worker_connections: 2048
+  tasks:
+    - name: 生成 Nginx 主配置文件
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+      notify: 重载 Nginx
+
+  handlers:
+    - name: 重载 Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+```
+
+关键细节：
+
+- `{{ nginx_user | default('www-data') }}`——如果变量 `nginx_user` 未定义，使用默认值 `www-data`
+- `{{ ansible_processor_vcpus }}`——直接使用 Ansible 自动收集的 Facts
+- `{% if nginx_enable_access_log | default(true) %}`——条件控制，可以按环境开关日志
+- `{# 由 Ansible 管理，请勿手动修改 #}`——注释，渲染后会被删除
+
+---
+
+## 循环在模板中的应用
+
+模板里的循环特别适合"我有一组相似的数据要展开"的场景：
+
+### 生成 upstream 服务器列表
+
+```nginx
+# templates/site.conf.j2
+upstream app_backend {
+    {% for server in backend_servers %}
+    server {{ server.ip }}:{{ server.port | default(80) }} weight={{ server.weight | default(1) }};
+    {% endfor %}
+}
+
+server {
+    listen {{ http_port }};
+    server_name {{ server_name }};
+
+    location / {
+        proxy_pass http://app_backend;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+配合变量定义：
+
+```yaml
+vars:
+  http_port: 80
+  server_name: api.example.com
+  backend_servers:
+    - { ip: "10.0.1.11", port: 3000, weight: 3 }
+    - { ip: "10.0.1.12", port: 3000, weight: 1 }
+    - { ip: "10.0.1.13", port: 3000, weight: 1 }
+```
+
+渲染后的结果：
+
+```nginx
+upstream app_backend {
+    server 10.0.1.11:3000 weight=3;
+    server 10.0.1.12:3000 weight=1;
+    server 10.0.1.13:3000 weight=1;
+}
+
+server {
+    listen 80;
+    server_name api.example.com;
+
+    location / {
+        proxy_pass http://app_backend;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+### 生成 /etc/hosts 条目
+
+```jinja2
+{# templates/hosts.j2 #}
+127.0.0.1   localhost
+::1         localhost
+
+# 自动生成的服务列表
+{% for host in groups['all'] %}
+{{ hostvars[host].ansible_default_ipv4.address }}  {{ hostvars[host].ansible_hostname }}
+{% endfor %}
+```
+
+`hostvars` 是一个特殊的变量，你能用它访问**任意**主机的变量和 Facts，不只是当前正在渲染的那台。
+
+---
+
+## 常用 Jinja2 过滤器
+
+过滤器用 `|` 管道符连接，对变量值进行加工：
+
+### 默认值
+
+```jinja2
+{{ db_port | default(3306) }}
+{{ app_version | default('1.0.0') }}
+{{ some_var | default(omit) }}     {# omit 表示"如果没定义就别渲染这个参数" #}
+```
+
+### 字符串操作
+
+```jinja2
+{{ app_name | upper }}             {# "MY-APP" #}
+{{ app_name | lower }}             {# "my-app" #}
+{{ description | title }}          {# "Hello World" #}
+{{ long_text | truncate(50) }}     {# 截断到50个字符 #}
+{{ config_value | trim }}          {# 去除首尾空格 #}
+```
+
+### 类型转换
+
+```jinja2
+{{ "8080" | int }}                 {# 字符串转整数 #}
+{{ 42 | string }}                  {# 整数转字符串 #}
+{{ config | to_json }}             {# 字典转 JSON #}
+{{ config | to_nice_json }}        {# 字典转格式化 JSON #}
+{{ config | to_yaml }}             {# 字典转 YAML #}
+```
+
+### 列表操作
+
+```jinja2
+{{ packages | join(', ') }}        {# 列表转逗号分隔的字符串 #}
+{{ packages | first }}             {# 第一个元素 #}
+{{ packages | last }}              {# 最后一个元素 #}
+{{ packages | length }}            {# 列表长度 #}
+{{ packages | sort }}              {# 排序 #}
+{{ packages | unique }}            {# 去重 #}
+{{ packages | min }}               {# 最小值 #}
+{{ packages | max }}               {# 最大值 #}
+```
+
+### 路径操作
+
+```jinja2
+{{ path_str | basename }}          {# 文件名 #}
+{{ path_str | dirname }}           {# 目录名 #}
+{{ path_str | expanduser }}        {# ~ 展开为主目录 #}
+```
+
+### 实战组合过滤
+
+```jinja2
+{# 链式过滤：取列表的第一个，转大写 #}
+{{ tags | first | upper }}
+
+{# 复杂的默认值逻辑 #}
+{{ mysql_host | default(ansible_default_ipv4.address | default('127.0.0.1')) }}
+
+{# 条件表达式（三元运算符） #}
+{{ "production" if env == "prod" else "development" }}
+```
+
+---
+
+## 模板调试技巧
+
+### 1. 用 debug 模块验证变量值
+
+```yaml
+- name: 调试变量
+  ansible.builtin.debug:
+    msg:
+      - "http_port: {{ http_port }}"
+      - "backend_servers: {{ backend_servers | to_nice_json }}"
+```
+
+### 2. 用 `--check --diff` 预览模板变化
+
+```bash
+# 不真执行，但显示模板会产生的变化
+ansible-playbook site.yml --check --diff
+```
+
+这会在输出中显示模板文件渲染后和目标文件的 diff——你能提前看到模板会改什么。
+
+### 3. 用 `template` lookup 手动调试
+
+```yaml
+- name: 在控制节点上预览模板渲染结果
+  ansible.builtin.copy:
+    content: "{{ lookup('template', 'nginx.conf.j2') }}"
+    dest: /tmp/rendered-nginx.conf
+  delegate_to: localhost
+```
+
+---
+
+## 小结
+
+Jinja2 模板是 Ansible 配置管理的灵魂。它让"管理配置文件差异"从"维护 N 份手动修改的文件"变成了"维护一份模板 + 一组变量"。
+
+关键习惯：
+- 模板文件后缀用 `.j2`——团队里谁看一眼就知道"这个文件不是最终的配置"
+- 善用 `default()` 过滤器——变量未定义时不会渲染出丑陋的空白或报错
+- 用 `hostvars` 跨主机引用——在模板中渲染其他主机的信息
+
+下一章，我们要把分散的 Task 组织成可复用的 Roles。

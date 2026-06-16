@@ -1,0 +1,5 @@
+{
+  "title": "从零开始学 Ansible",
+  "description": "零基础入门 Ansible 自动化运维，从架构原理到实战项目，手把手教你用代码管理服务器。涵盖 Inventory、Playbook、Variables、Jinja2 模板、Roles 角色化、Ansible Vault 和 AWX 企业级方案。",
+  "icon": "terminal"
+}

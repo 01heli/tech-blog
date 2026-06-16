@@ -1,0 +1,611 @@
+---
+title: "实战项目：用 Ansible 从零部署一套 Web 服务集群"
+description: "综合运用 1-9 章的知识，从零构建一个生产可用的 Ansible 项目：部署 Nginx + Node.js + MySQL + Redis，包含安全加固、监控和 CI/CD 集成。"
+order: 10
+---
+
+## 我们要做什么
+
+这个实战项目会部署一套典型的 Web 服务架构：
+
+```
+              互联网
+                │
+          ┌─────┴─────┐
+          │   Nginx   │  反向代理 + 静态文件
+          └─────┬─────┘
+                │
+          ┌─────┴─────┐
+          │  Node.js  │  应用服务器 (2 台)
+          │  App      │
+          └─────┬─────┘
+                │
+        ┌───────┼───────┐
+  ┌─────┴─────┐  ┌──────┴─────┐
+  │   MySQL   │  │   Redis    │
+  │  (主库)    │  │  (缓存)     │
+  └───────────┘  └────────────┘
+```
+
+目标：**一条命令完成全部部署**。
+
+```bash
+ansible-playbook -i inventory/production playbooks/site.yml
+```
+
+---
+
+## 项目目录结构
+
+```
+myapp-ansible/
+├── ansible.cfg
+├── .gitignore
+├── requirements.yml
+├── inventory/
+│   ├── production/
+│   │   ├── hosts
+│   │   ├── group_vars/
+│   │   │   ├── all/
+│   │   │   │   ├── vars           ← 明文变量
+│   │   │   │   └── vault          ← 加密敏感变量
+│   │   │   ├── webservers.yml
+│   │   │   ├── appservers.yml
+│   │   │   └── dbservers.yml
+│   │   └── host_vars/
+│   └── staging/
+│       └── ...
+├── playbooks/
+│   ├── site.yml                   ← 主入口
+│   └── deploy-app.yml             ← 应用部署专用 Playbook
+└── roles/
+    ├── common/                    ← 所有主机的通用配置
+    ├── nginx/                     ← 反向代理
+    ├── nodejs/                    ← Node.js 运行时
+    ├── mysql/                     ← MySQL 数据库
+    ├── redis/                     ← Redis 缓存
+    └── myapp/                     ← 应用本身
+```
+
+---
+
+## 第 1 步：基础配置
+
+### ansible.cfg
+
+```ini
+[defaults]
+inventory = inventory/production
+remote_user = deploy
+private_key_file = ~/.ssh/id_ed25519_ansible
+host_key_checking = False
+forks = 10
+retry_files_enabled = False
+nocows = True
+stdout_callback = yaml
+
+[ssh_connection]
+pipelining = True
+```
+
+### .gitignore
+
+```gitignore
+# 密码文件绝不提交
+.vault-pass
+*-vault-password.sh
+
+# 临时和缓存文件
+*.retry
+__pycache__/
+.ansible/
+
+# 角色：如果用 galaxy install 安装外部 Role
+roles/external/
+```
+
+### requirements.yml
+
+```yaml
+---
+roles:
+  - name: geerlingguy.nodejs
+    version: 6.2.0
+  - name: geerlingguy.mysql
+    version: 4.3.0
+```
+
+---
+
+## 第 2 步：Inventory 设计
+
+```ini
+# inventory/production/hosts
+
+[proxies]
+proxy-01 ansible_host=203.0.113.10
+
+[appservers]
+app-01 ansible_host=10.0.1.11
+app-02 ansible_host=10.0.1.12
+
+[dbservers]
+db-01 ansible_host=10.0.1.101
+
+[redisservers]
+redis-01 ansible_host=10.0.1.201
+
+[production:children]
+proxies
+appservers
+dbservers
+redisservers
+```
+
+### group_vars 拆分
+
+```yaml
+# group_vars/all/vars
+app_name: myapp
+app_version: "1.3.0"
+app_user: app
+app_group: app
+app_home: "/opt/{{ app_name }}"
+app_port: 3000
+
+# 联系人
+admin_email: admin@example.com
+```
+
+```yaml
+# group_vars/all/vault（加密文件）
+vault_mysql_root_password: "change-me-root-password"
+vault_mysql_app_password: "change-me-app-password"
+vault_redis_password: "change-me-redis-password"
+vault_app_secret_key: "change-me-secret-key-64-chars"
+```
+
+```yaml
+# group_vars/webservers.yml
+nginx_server_name: "{{ inventory_hostname }}"
+nginx_client_max_body_size: 10m
+nginx_enable_gzip: true
+```
+
+```yaml
+# group_vars/appservers.yml
+node_version: 20
+app_repo: "https://github.com/your-org/myapp.git"
+app_processes: "{{ ansible_processor_vcpus * 2 }}"
+```
+
+```yaml
+# group_vars/dbservers.yml
+mysql_databases:
+  - name: "{{ app_name }}"
+    encoding: utf8mb4
+    collation: utf8mb4_unicode_ci
+mysql_users:
+  - name: "{{ app_name }}"
+    host: "%"
+    password: "{{ vault_mysql_app_password }}"
+    priv: "{{ app_name }}.*:ALL"
+```
+
+---
+
+## 第 3 步：编写 Roles
+
+### Role: common（所有主机的基础配置）
+
+```yaml
+# roles/common/tasks/main.yml
+---
+- name: 设置时区
+  ansible.builtin.timezone:
+    name: Asia/Shanghai
+
+- name: 安装基础包
+  ansible.builtin.package:
+    name: "{{ common_packages }}"
+    state: present
+  vars:
+    common_packages:
+      - htop
+      - curl
+      - vim
+      - unzip
+      - ntp
+      - ufw
+
+- name: 配置 NTP 时间同步
+  ansible.builtin.service:
+    name: ntp
+    state: started
+    enabled: true
+
+- name: SSHD 安全加固
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+  loop:
+    - { regexp: "^PermitRootLogin", line: "PermitRootLogin no" }
+    - { regexp: "^PasswordAuthentication", line: "PasswordAuthentication no" }
+    - { regexp: "^X11Forwarding", line: "X11Forwarding no" }
+  notify: 重载 SSHD
+
+- name: 基础防火墙规则
+  ansible.builtin.ufw:
+    rule: "{{ item.rule }}"
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+  loop:
+    - { rule: allow, port: "22",  proto: tcp }
+    - { rule: allow, port: "80",  proto: tcp }
+    - { rule: allow, port: "443", proto: tcp }
+  when: configure_firewall | default(true)
+
+- name: 启用 UFW
+  ansible.builtin.ufw:
+    state: enabled
+    policy: deny
+  when: configure_firewall | default(true)
+
+handlers:
+  - name: 重载 SSHD
+    ansible.builtin.service:
+      name: sshd
+      state: reloaded
+```
+
+### Role: nginx（反向代理）
+
+```yaml
+# roles/nginx/tasks/main.yml
+---
+- name: 安装 Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: 复制 Nginx 主配置
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+  notify: 重载 Nginx
+
+- name: 复制反向代理配置
+  ansible.builtin.template:
+    src: reverse-proxy.conf.j2
+    dest: /etc/nginx/sites-available/{{ nginx_server_name }}
+  notify: 启用站点并重载
+
+- name: 禁用默认站点
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: 重载 Nginx
+
+- name: 启动 Nginx
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+```
+
+反向代理模板：
+
+```nginx
+# roles/nginx/templates/reverse-proxy.conf.j2
+upstream app_cluster {
+    {% for host in groups['appservers'] %}
+    server {{ hostvars[host].ansible_default_ipv4.address }}:{{ hostvars[host].app_port | default(3000) }};
+    {% endfor %}
+}
+
+server {
+    listen 80;
+    server_name {{ nginx_server_name }};
+
+    client_max_body_size {{ nginx_client_max_body_size }};
+
+    {% if nginx_enable_gzip %}
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml;
+    {% endif %}
+
+    location / {
+        proxy_pass http://app_cluster;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 60s;
+    }
+
+    location /health {
+        proxy_pass http://app_cluster/health;
+        access_log off;
+    }
+}
+```
+
+### Role: myapp（应用部署）
+
+```yaml
+# roles/myapp/tasks/main.yml
+---
+- name: 创建应用用户
+  ansible.builtin.user:
+    name: "{{ app_user }}"
+    shell: /bin/bash
+    create_home: true
+    system: true
+
+- name: 创建应用目录
+  ansible.builtin.file:
+    path: "{{ app_home }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode: "0755"
+
+- name: 拉取应用代码
+  ansible.builtin.git:
+    repo: "{{ app_repo }}"
+    dest: "{{ app_home }}/current"
+    version: "v{{ app_version }}"
+    force: true
+  notify: 重启应用
+
+- name: 安装 npm 依赖
+  ansible.builtin.command:
+    cmd: npm ci --production
+    chdir: "{{ app_home }}/current"
+  register: npm_result
+  changed_when: "'added' in npm_result.stdout"
+
+- name: 从模板生成 .env 文件
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ app_home }}/current/.env"
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode: "0600"
+  notify: 重启应用
+
+- name: 复制 systemd 服务文件
+  ansible.builtin.template:
+    src: app.service.j2
+    dest: /etc/systemd/system/{{ app_name }}.service
+  notify: 重载 systemd 并重启应用
+
+- name: 启动并启用服务
+  ansible.builtin.systemd:
+    name: "{{ app_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+```
+
+应用的环境变量模板：
+
+```jinja2
+{# roles/myapp/templates/env.j2 #}
+NODE_ENV=production
+APP_NAME={{ app_name }}
+APP_PORT={{ app_port }}
+DB_HOST={{ hostvars[groups['dbservers'][0]].ansible_default_ipv4.address }}
+DB_PORT=3306
+DB_NAME={{ app_name }}
+DB_USER={{ app_name }}
+DB_PASSWORD={{ vault_mysql_app_password }}
+REDIS_HOST={{ hostvars[groups['redisservers'][0]].ansible_default_ipv4.address }}
+REDIS_PORT=6379
+REDIS_PASSWORD={{ vault_redis_password }}
+SECRET_KEY={{ vault_app_secret_key }}
+```
+
+Systemd 服务模板：
+
+```ini
+{# roles/myapp/templates/app.service.j2 #}
+[Unit]
+Description={{ app_name }} Application
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user }}
+Group={{ app_group }}
+WorkingDirectory={{ app_home }}/current
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+EnvironmentFile={{ app_home }}/current/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 第 4 步：组装 Playbook
+
+```yaml
+# playbooks/site.yml
+---
+- name: 所有主机基础配置
+  hosts: all
+  become: true
+  roles:
+    - common
+
+- name: 数据库服务器
+  hosts: dbservers
+  become: true
+  roles:
+    - mysql
+
+- name: Redis 服务器
+  hosts: redisservers
+  become: true
+  roles:
+    - redis
+
+- name: 应用服务器（依赖 Node.js）
+  hosts: appservers
+  become: true
+  roles:
+    - nodejs
+    - myapp
+  # 注意：由于部署了真实应用，必须先部署 DB 和 Redis
+  # 可以通过 serial 做蓝绿部署
+
+- name: 反向代理
+  hosts: proxies
+  become: true
+  roles:
+    - nginx
+```
+
+---
+
+## 第 5 步：部署
+
+### 首次部署
+
+```bash
+# 1. 安装外部依赖 Role
+ansible-galaxy install -r requirements.yml -p ./roles/external
+
+# 2. 检查模式——先看看会发生什么
+ansible-playbook playbooks/site.yml --check
+
+# 3. 正式执行
+ansible-playbook playbooks/site.yml --vault-password-file .vault-pass
+
+# 4. 验证
+curl http://203.0.113.10/health
+```
+
+### 后续更新应用
+
+```bash
+# 只部署应用，不动数据库和 Nginx
+ansible-playbook playbooks/site.yml \
+  --tags myapp \
+  --vault-password-file .vault-pass
+```
+
+你可以在 Playbook 中使用 `tags` 来精细控制：
+
+```yaml
+# roles/myapp/tasks/main.yml
+- name: 拉取应用代码
+  ansible.builtin.git:
+    ...
+  tags:
+    - deploy
+    - app-code
+
+- name: 安装 npm 依赖
+  ansible.builtin.command:
+    ...
+  tags:
+    - deploy
+    - app-deps
+```
+
+然后按需执行：
+
+```bash
+# 只更新代码（跳过依赖安装，团队里最常用的场景）
+ansible-playbook playbooks/site.yml --tags app-code
+
+# 完全重新部署
+ansible-playbook playbooks/site.yml --tags deploy
+```
+
+---
+
+## 进阶：滚动更新（避免服务中断）
+
+如果要更新应用而保持服务在线，可以结合 `serial` 和预先摘除流量的策略：
+
+```yaml
+# playbooks/deploy-app.yml
+- name: 滚动更新应用（一次一台）
+  hosts: appservers
+  become: true
+  serial: 1                         # ← 一次只更新一台
+  max_fail_percentage: 0            # ← 任何一台失败就停止
+
+  pre_tasks:
+    - name: 从 Nginx 摘除流量
+      ansible.builtin.shell: |
+        sed -i '/server {{ ansible_default_ipv4.address }}/s/^/#/' /etc/nginx/sites-enabled/*
+      delegate_to: "{{ groups['proxies'][0] }}"
+      notify: 重载 Nginx
+
+  roles:
+    - nodejs
+    - myapp
+
+  post_tasks:
+    - name: 验证健康检查
+      ansible.builtin.uri:
+        url: http://localhost:{{ app_port }}/health
+        status_code: 200
+      retries: 10
+      delay: 2
+
+    - name: 恢复 Nginx 流量
+      ansible.builtin.shell: |
+        sed -i '/#server {{ ansible_default_ipv4.address }}/s/^#//' /etc/nginx/sites-enabled/*
+      delegate_to: "{{ groups['proxies'][0] }}"
+      notify: 重载 Nginx
+```
+
+---
+
+## 整个系列学完后你可以做什么
+
+从第 1 章到现在，你掌握的能力已经可以覆盖绝大多数运维自动化场景：
+
+| 场景 | 用到的知识 |
+|------|-----------|
+| 给 100 台新服务器初始化环境 | Inventory + Group Vars + Common Role |
+| 部署一套 Web 服务集群 | 全部 10 章知识 |
+| Nginx 配置变更 + 灰度发布 | Jinja2 模板 + Handler + `serial` 滚动 |
+| 定期安全合规检查 | Facts 收集 + `when` 条件 + `loop` |
+| 多环境管理（dev/staging/prod） | Inventory 环境分离 + group_vars 拆分 + Vault 多密码 |
+| CI/CD 流水线集成 | Vault + `ansible-playbook` + GitHub Actions / GitLab CI |
+
+你可以把这个项目作为模板，替换为自己的应用、添加自己的 Role，不断扩展。
+
+---
+
+> **这也许是最重要的一条建议**：不要一口气追求完美覆盖所有场景。从最痛的点开始——比如"每次手动部署应用太烦了"——把那个流程写成 Playbook。尝到"一行命令部署完成"的甜头后，你会自然地把更多东西自动化起来。
+
+---
+
+## 参考资料
+
+- [Ansible 官方文档](https://docs.ansible.com/)（最权威的参考，包含所有模块文档和用户指南）
+- [Ansible Galaxy](https://galaxy.ansible.com/)（社区 Role 仓库，找现成的 Role 加速开发）
+- [Ansible AWX GitHub](https://github.com/ansible/awx)（Automation Controller 的上游开源项目，Web UI + REST API + 任务引擎）
+- [JumpServer 开源堡垒机](https://github.com/jumpserver/jumpserver)（结合 Ansible 使用，提供会话审计和 4A 权限管控）
+- [ansible-lint 官方文档](https://ansible.readthedocs.io/projects/lint/)（Ansible Playbook 静态检查和最佳实践强制执行工具）
+- [Molecule 官方文档](https://ansible.readthedocs.io/projects/molecule/)（Ansible Role 测试框架，支持多平台隔离测试）
+- [geerlingguy's Ansible Roles](https://github.com/geerlingguy)（Jeff Geerling 维护的高质量社区 Role 合集，覆盖 Nginx/MySQL/Node.js/Docker 等）
+- [Ansible for DevOps (Leanpub)](https://leanpub.com/ansible-for-devops)（Jeff Geerling 写的 Ansible 畅销书，从入门到生产级别实践）
+- [Ansible Best Practices (官方)](https://docs.ansible.com/ansible/latest/tips_tricks/ansible_tips_tricks.html)（官方推荐的项目结构、变量管理、安全性建议）
+- [Red Hat Ansible Automation Platform](https://www.redhat.com/en/technologies/management/ansible)（Ansible 的企业级产品，包含 Lightspeed AI 助手和 Insights 分析）
+- [Ansible Cheat Sheet (Spacelift)](https://spacelift.io/blog/ansible-cheat-sheet)（常用命令和模块速查表）
+- [Ansible Tutorial for Beginners (Rocky Linux Docs)](https://docs.rockylinux.org/latest/zh/books/learning_ansible/01-basic/)（面向初学者的 Ansible 系列教程，含中文版）

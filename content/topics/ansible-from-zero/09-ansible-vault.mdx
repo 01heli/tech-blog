@@ -1,0 +1,283 @@
+---
+title: "Ansible Vault：把密码和密钥安全地放进 Git"
+description: "掌握 Ansible Vault 加密敏感数据的方法，学习 vars+vault 分离模式、加密字符串、多密码管理和 CI/CD 中的最佳实践。"
+order: 9
+---
+
+## 一个老问题：敏感信息放哪里？
+
+你的 Playbook 里迟早要用到这些信息：
+
+- 数据库密码
+- API 密钥
+- SSL 证书私钥
+- 云服务 Access Key
+
+**把它们写在 Playbook 里？**——代码提交到 Git，所有人都能看到。
+
+**放在环境变量里？**——写进 `.bashrc` 或 CI/CD Secret 变量里，但 Playbook 怎么可靠地引用到？
+
+**`.gitignore` 掉但放在本地？**——新同事入职怎么拿到？换电脑怎么办？
+
+Ansible 的标准答案是 **Ansible Vault**——把敏感信息加密后直接放在 Git 仓库里，和代码一起版本管理。
+
+> **类比**：Vault 就像一个加密的 ZIP 文件。任何人 `git clone` 之后都能看到加密文件，但只有知道密码的人才能解密使用。
+
+---
+
+## 基础用法
+
+### 创建加密文件
+
+```bash
+# 创建一个新的加密 YAML 文件
+ansible-vault create secrets.yml
+```
+
+会提示你输入密码。然后打开编辑器，像普通 YAML 一样编辑：
+
+```yaml
+# secrets.yml（加密存储）
+db_password: "SuperSecret123!"
+api_key: "sk-abc123xyz"
+stripe_secret: "sk_live_xxxxx"
+```
+
+保存退出后，文件内容会变成类似这样：
+
+```
+$ANSIBLE_VAULT;1.1;AES256
+63386132363736353462373763303536313433313764643163383764323334623530616562653837
+3038633334316331636165326135313937326561663263360a363639636265326235316266626563
+...
+```
+
+### 编辑已有加密文件
+
+```bash
+ansible-vault edit secrets.yml
+```
+
+### 重新加密（修改密码）
+
+```bash
+ansible-vault rekey secrets.yml
+```
+
+### 查看加密文件的内容
+
+```bash
+ansible-vault view secrets.yml
+```
+
+### 加密已存在的明文文件
+
+```bash
+# 把已有的明文 YAML 文件加密
+ansible-vault encrypt vars/production.yml
+```
+
+解密回来：
+
+```bash
+ansible-vault decrypt vars/production.yml
+```
+
+---
+
+## 运行带 Vault 的 Playbook
+
+在执行 Playbook 时，你需要告诉 Ansible Vault 密码：
+
+```bash
+# 方式 1：交互式输入密码
+ansible-playbook site.yml --ask-vault-pass
+
+# 方式 2：从文件读取密码
+ansible-playbook site.yml --vault-password-file .vault-pass
+
+# 方式 3：从脚本动态获取密码（如从 AWS Secrets Manager 查出）
+ansible-playbook site.yml --vault-password-file get-vault-pass.sh
+```
+
+`.vault-pass` 文件的内容很简单——一个纯文本密码：
+
+```
+my-secret-vault-password-do-not-share
+```
+
+**务必把 `.vault-pass` 加入 `.gitignore`**：
+
+```gitignore
+# .gitignore
+.vault-pass
+vault-password.sh
+```
+
+---
+
+## vars + vault 分离模式（推荐）
+
+直接把变量文件整个加密有个问题：其他团队成员想看你定义了哪些变量（变量名和结构）时，需要解密才能看到——这很不方便。
+
+更好的做法是**分离变量定义和变量值**：
+
+```
+group_vars/all/
+├── vars           ← 明文，定义变量结构，引用 vault 中的值
+└── vault          ← 加密，只存敏感值
+```
+
+`vars` 文件（明文，提交到 Git）：
+
+```yaml
+# group_vars/all/vars
+db_host: "10.0.1.100"
+db_port: 3306
+db_user: "app_user"
+db_password: "{{ vault_db_password }}"      # ← 引用 vault 中的值
+api_key: "{{ vault_api_key }}"
+```
+
+`vault` 文件（加密，提交到 Git）：
+
+```yaml
+# group_vars/all/vault
+vault_db_password: "SuperSecret123!"
+vault_api_key: "sk-abc123xyz"
+```
+
+加密 vault 文件：
+
+```bash
+ansible-vault encrypt group_vars/all/vault
+```
+
+这样团队成员拉下代码后，一眼就能看到有哪些变量、变量结构是什么样子。只有需要加密的值在 vault 文件中。新同事要加一个敏感变量时，只需要 `ansible-vault edit` 修改 vault 文件。
+
+---
+
+## 加密单个字符串（encrypt_string）
+
+有时候你不需要加密整个文件，只想加密一个值。比如你的变量都定义在 `group_vars/webservers.yml` 里，其中只有 `db_password` 是敏感的：
+
+```bash
+ansible-vault encrypt_string 'SuperSecret123!' --name 'db_password'
+```
+
+输出：
+
+```yaml
+db_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          39626138626435653036303737646262353838643463383361353333303037376336623462303134
+          3833323961393238316230383134356136653138313837360a643935636164383861643836306638
+          61313833656562646633356238383536323739646465643538323765303931643734646431383363
+          6634306263366564360a376637626534613765393437633932316461653335393936393834633338
+          6462
+```
+
+把这段输出粘贴到你的变量文件里就行了。然后这个 `group_vars/webservers.yml` 文件不需要整体加密，只有 `db_password` 这一个值是加密的。
+
+---
+
+## 多环境多密码
+
+如果你的团队需要管理多套环境（staging / production），每组环境使用不同的 Vault 密码是更强的隔离方式：
+
+```bash
+# 给生产环境单独加密
+ansible-vault encrypt --vault-id production@prompt \
+  group_vars/production/vault
+
+# 给预发布环境单独加密
+ansible-vault encrypt --vault-id staging@prompt \
+  group_vars/staging/vault
+```
+
+执行时指定对应的密码：
+
+```bash
+# 生产环境部署
+ansible-playbook -i inventory/production site.yml \
+  --vault-id production@prompt
+
+# 预发布环境部署
+ansible-playbook -i inventory/staging site.yml \
+  --vault-id staging@prompt
+```
+
+这样即使有人知道了 staging 环境的 Vault 密码，也解不开生产环境的加密内容。
+
+---
+
+## CI/CD 中使用 Vault
+
+在 CI/CD 流水线中，显然不能每次部署都让一个人坐在电脑前输入密码。标准做法是：
+
+```bash
+# 1. 将 Vault 密码存入 CI 的 Secret 变量（如 GitHub Secrets）
+# 2. 在流水线中写入临时密码文件
+
+echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault-pass
+
+# 3. 执行 Playbook
+ansible-playbook -i inventory/production site.yml \
+  --vault-password-file .vault-pass
+
+# 4. 管道结束后立即删除密码文件
+rm .vault-pass
+```
+
+> **安全警示**：Vault 密码本身是"所有加密数据的钥匙"，在 CI/CD 中必须通过平台级的 Secret 机制（GitHub Secrets、GitLab CI Variables）注入，绝不能写在代码或配置文件里。
+
+---
+
+## 怎么管理 Vault 密码本身？
+
+这大概是 Vault 使用中最实际的难题：**Vault 密码本身怎么安全地共享给团队成员？**
+
+几种常见做法：
+
+| 方案 | 适用场景 |
+|------|---------|
+| **1Password / LastPass 共享** | 小团队（< 20 人），手动分发 |
+| **HashiCorp Vault / AWS Secrets Manager** | 中大型团队，自动获取密码 |
+| **内部 Wiki / 加密聊天** | 临时方案，不太推荐 |
+| **GPG 加密** | 用每个开发者的公钥加密同一份密码 |
+
+对于 5-10 人的小团队，用 1Password 共享最实际。当团队规模大到几十人时，应该考虑用 AWS Secrets Manager 或 HashiCorp Vault 做自动化的密码获取。
+
+一个简单的"从 AWS Secrets Manager 获取 Vault 密码"的脚本：
+
+```bash
+#!/bin/bash
+# get-vault-pass.sh —— Ansible 的 vault-password-file 脚本
+# 从 AWS Secrets Manager 动态获取 Vault 密码
+
+export AWS_REGION=us-east-1
+
+aws secretsmanager get-secret-value \
+  --secret-id "ansible-vault-password" \
+  --query "SecretString" \
+  --output text
+```
+
+使用：
+
+```bash
+ansible-playbook site.yml --vault-password-file get-vault-pass.sh
+```
+
+---
+
+## 小结
+
+Ansible Vault 让"把密码放进 Git"这件事从"绝对不行"变成了"安全可用"。核心要点：
+
+1. **vars + vault 分离模式**是默认推荐——明文变量名和加密变量值分开
+2. **`.vault-pass` 文件必须 `.gitignore`**——密码文件进 Git 是安全事故
+3. **多环境用不同的 Vault 密码**——限制密码泄露的爆炸半径
+4. **CI/CD 通过平台 Secret 注入 Vault 密码**——不能硬编码
+
+下一章，我们把前面学到的所有知识串起来，完整地走一遍"从零到生产"的实战项目。

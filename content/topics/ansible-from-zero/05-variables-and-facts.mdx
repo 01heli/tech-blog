@@ -1,0 +1,345 @@
+---
+title: "变量与事实（Variables & Facts）：让 Playbook 活起来"
+description: "掌握 Ansible 变量优先级体系、Facts 自动收集机制、register/set_fact 动态赋值，以及 group_vars/host_vars 的目录结构。"
+order: 5
+---
+
+## 为什么需要变量？
+
+回顾上一章的 Playbook，有一段这样的代码：
+
+```yaml
+- name: 安装 Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+```
+
+这段代码有什么问题？`nginx` 是硬编码的。如果你的 Web 服务器组要装 `nginx`，但数据库组要装 `mysql-server`，你就得写两个几乎一模一样的 Playbook。
+
+变量的作用就是**让 Playbook 从"写死"变成"可配置"**：
+
+```yaml
+- name: 安装服务包
+  ansible.builtin.apt:
+    name: "{{ service_package }}"
+    state: present
+```
+
+`{{ service_package }}` 是一个变量占位符。对于 Web 组，它是 `nginx`；对于 DB 组，它是 `mysql-server`。同一个 Playbook，不同的目标组，不同的行为。
+
+---
+
+## 变量从哪来？Ansible 的 10 层变量来源
+
+Ansible 的变量可以从很多地方来，而且有一个**严格的优先级**。理解这个优先级是避免"变量被覆盖了还不知道"的关键：
+
+```
+优先级从低到高（数字越大越优先）：
+ 1. command line values (-e 参数)
+ 2. role defaults (roles/x/defaults/main.yml)
+ 3. inventory file or script group vars
+ 4. inventory group_vars/all
+ 5. playbook group_vars/all
+ 6. inventory group_vars/*
+ 7. playbook group_vars/*
+ 8. inventory file or script host vars
+ 9. inventory host_vars/*
+10. playbook host_vars/*
+11. host facts / cached set_facts
+12. play vars
+13. play vars_prompt
+14. play vars_files
+15. role vars (roles/x/vars/main.yml)
+16. block vars (only for tasks in block)
+17. task vars (only for the task)
+18. include_vars
+19. set_facts / registered vars
+20. role (and include_role) params
+21. include params
+22. extra vars (-e on command line) ← 最高优先级！
+```
+
+> **记住一个简单的规则**：命令行 `-e` 能覆盖一切；任务级别的变量能覆盖 Play 级别的；role defaults 是最容易被覆盖的默认值。
+
+---
+
+## 定义变量的 5 种方式
+
+### 1. 在 Playbook 中直接定义
+
+```yaml
+- name: 配置 Web 服务器
+  hosts: webservers
+  vars:
+    http_port: 8080
+    app_version: "2.1.0"
+  tasks:
+    - name: 显示变量
+      ansible.builtin.debug:
+        msg: "端口: {{ http_port }}, 版本: {{ app_version }}"
+```
+
+### 2. 在 Inventory 中定义
+
+```ini
+# inventory.ini
+[webservers]
+web-01 ansible_host=192.168.1.101
+
+[webservers:vars]
+http_port=80
+environment=production
+```
+
+```yaml
+# inventory.yml
+all:
+  children:
+    webservers:
+      hosts:
+        web-01:
+          ansible_host: 192.168.1.101
+      vars:
+        http_port: 80
+        environment: production
+```
+
+### 3. 使用 group_vars 和 host_vars 目录（推荐）
+
+这是大中型项目最推荐的方式。Ansible 会自动加载与 Inventory 同目录的 `group_vars/` 和 `host_vars/`：
+
+```
+project/
+├── inventory.ini
+├── group_vars/
+│   ├── all.yml               ← 所有主机都生效
+│   ├── webservers.yml        ← webservers 组生效
+│   └── dbservers.yml         ← dbservers 组生效
+├── host_vars/
+│   └── web-01.yml            ← 仅 web-01 生效
+└── site.yml
+```
+
+示例内容：
+
+```yaml
+# group_vars/webservers.yml
+http_port: 80
+app_version: "2.1.0"
+nginx_worker_processes: 4
+
+# group_vars/dbservers.yml
+mysql_port: 3306
+mysql_max_connections: 200
+
+# host_vars/web-01.yml（只对 web-01 生效，覆盖组变量）
+http_port: 8080                # 这台机器特殊，Nginx 跑在 8080
+```
+
+### 4. 通过外部文件引入 vars_files
+
+```yaml
+- name: 配置服务器
+  hosts: all
+  vars_files:
+    - vars/common.yml
+    - vars/{{ environment }}.yml    # 根据环境变量动态加载
+  tasks: ...
+```
+
+### 5. 命令行 `-e`（extra vars）
+
+```bash
+# 直接传 key=value
+ansible-playbook site.yml -e "app_version=3.0.0 environment=staging"
+
+# 传 JSON
+ansible-playbook site.yml -e '{"app_version":"3.0.0","environment":"staging"}'
+
+# 从 JSON 文件读
+ansible-playbook site.yml -e @vars.json
+```
+
+命令行 `-e` 拥有最高优先级，任何其他地方定义的变量都会被它覆盖。这在 CI/CD 流水线中非常有用——构建系统可以用 `-e` 传递构建版本号。
+
+---
+
+## Facts（事实）：Ansible 自动帮你收集的系统信息
+
+每次执行 Playbook，Ansible 默认会先执行 `Gathering Facts`——通过 `setup` 模块收集被管理节点的系统信息。
+
+```yaml
+# 可以直接在 Playbook 和模板中使用 Facts
+- name: 在不同系统上安装对应包
+  ansible.builtin.package:
+    name: "{{ 'httpd' if ansible_os_family == 'RedHat' else 'nginx' }}"
+    state: present
+```
+
+最常用的 Facts：
+
+| Fact | 含义 | 示例值 |
+|------|------|--------|
+| `ansible_hostname` | 主机名 | `web-01` |
+| `ansible_distribution` | 发行版 | `Ubuntu` |
+| `ansible_distribution_version` | 发行版版本 | `22.04` |
+| `ansible_os_family` | 系统家族 | `Debian` / `RedHat` |
+| `ansible_architecture` | CPU 架构 | `x86_64` |
+| `ansible_memtotal_mb` | 总内存 (MB) | `7982` |
+| `ansible_processor_vcpus` | CPU 核心数 | `4` |
+| `ansible_default_ipv4.address` | 默认 IPv4 地址 | `192.168.1.101` |
+| `ansible_kernel` | 内核版本 | `5.15.0-91-generic` |
+
+查看某台主机的全部 Facts：
+
+```bash
+ansible web-01 -m ansible.builtin.setup
+ansible web-01 -m ansible.builtin.setup -a "filter=ansible_mem*"   # 只看内存相关
+```
+
+如果不需要收集 Facts（比如只是执行一个简单命令），可以关闭以节省时间：
+
+```yaml
+- name: 快速任务
+  hosts: all
+  gather_facts: false
+  tasks: ...
+```
+
+### 自定义 Facts：/etc/ansible/facts.d/
+
+你可以在被管理节点上放自定义 Facts 文件。Ansible 会自动读取 `/etc/ansible/facts.d/*.fact`：
+
+```json
+// 在被管理节点的 /etc/ansible/facts.d/application.fact
+{
+  "app_name": "my-app",
+  "app_port": 3000,
+  "app_env": "production"
+}
+```
+
+然后在 Playbook 中直接引用：
+
+```yaml
+- name: 使用自定义 Facts
+  ansible.builtin.debug:
+    msg: "应用名: {{ ansible_facts.ansible_local.application.app_name }}"
+```
+
+---
+
+## register：捕获任务执行结果
+
+`register` 让你把一个任务的执行结果保存到变量中，后续任务可以根据结果做决策：
+
+```yaml
+- name: 检查某个文件是否存在
+  ansible.builtin.stat:
+    path: /etc/myapp/config.yml
+  register: config_stat
+
+- name: 如果文件不存在，复制默认配置
+  ansible.builtin.copy:
+    src: default-config.yml
+    dest: /etc/myapp/config.yml
+  when: not config_stat.stat.exists    # ← 根据 register 的结果决定
+
+- name: 打印文件大小
+  ansible.builtin.debug:
+    msg: "配置文件大小：{{ config_stat.stat.size }} 字节"
+  when: config_stat.stat.exists
+```
+
+`register` 捕获的结构体包含了大量信息。常用的字段：
+
+```yaml
+config_stat.stat.exists      # 是否存在
+config_stat.stat.size        # 文件大小
+config_stat.stat.md5         # MD5 校验
+config_stat.stat.mode        # 权限
+config_stat.stat.isreg       # 是否是普通文件
+
+# 对 shell/command 模块：
+result.rc                    # 退出码
+result.stdout                # 标准输出
+result.stderr                # 标准错误输出
+result.changed               # 是否有变更
+result.failed                # 是否失败
+```
+
+---
+
+## set_fact：在运行时动态创建变量
+
+`set_fact` 让你在 Playbook 运行过程中动态设置变量（临时生成、计算得出）：
+
+```yaml
+- name: 收集信息并动态计算
+  hosts: all
+  tasks:
+    - name: 获取当前运行的 worker 进程数
+      ansible.builtin.shell: "ps aux | grep worker | grep -v grep | wc -l"
+      register: worker_count
+
+    - name: 动态设置 Nginx worker 数
+      ansible.builtin.set_fact:
+        nginx_workers: "{{ [ansible_processor_vcpus * 2, worker_count.stdout | int] | max }}"
+        # 取 CPU 核数*2 和当前 worker 数的最大值
+
+    - name: 使用计算出的 worker 数
+      ansible.builtin.debug:
+        msg: "Nginx worker 数设置为 {{ nginx_workers }}"
+```
+
+---
+
+## 变量的数据类型与 Jinja2 过滤器
+
+变量的值不只是字符串。你可以在 Playbook 中使用列表、字典，并用 Jinja2 过滤器处理它们：
+
+```yaml
+vars:
+  # 字符串
+  app_name: "my-app"
+
+  # 列表
+  packages:
+    - nginx
+    - htop
+    - curl
+
+  # 字典
+  db_config:
+    host: localhost
+    port: 3306
+    user: app_user
+
+tasks:
+  - name: 安装包列表
+    ansible.builtin.apt:
+      name: "{{ packages }}"      # 直接传列表
+      state: present
+
+  - name: 使用默认值过滤器
+    ansible.builtin.debug:
+      msg: "{{ db_config.password | default('changeme') }}"
+      # 如果 db_config.password 没定义，用 'changeme'
+
+  - name: 列表操作
+    ansible.builtin.debug:
+      msg: "{{ packages | join(', ') }}"        # "nginx, htop, curl"
+```
+
+---
+
+## 小结
+
+变量是让 Playbook 变得灵活的核心机制。记住三个要点：
+
+1. **变量优先级是确定的**：命令行 `-e` 最高，defaults 最低。出问题时顺着优先级链往上找
+2. **Facts 是免费的系统信息**：`ansible_hostname`、`ansible_os_family`、`ansible_memtotal_mb` 等拿起来就用
+3. **和 Shell 脚本变量不同**：Ansible 的变量是声明式的——同一个变量在不同层级被覆盖，而不是先后赋值
+
+下一章，我们要让 Playbook 会"思考"——用条件判断和循环处理真正的复杂逻辑。

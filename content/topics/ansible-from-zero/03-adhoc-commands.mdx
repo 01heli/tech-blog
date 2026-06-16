@@ -1,0 +1,300 @@
+---
+title: "临时命令（Ad-hoc Commands）：Ansible 的"快速模式""
+description: "不用写 Playbook，一行命令就能在所有服务器上执行操作。掌握模块的用法，理解幂等性的重要性。"
+order: 3
+---
+
+## 什么是 Ad-hoc 命令？
+
+Ad-hoc（临时）命令是 Ansible 的"快速模式"。你不需要写 YAML 文件，直接在命令行里敲一条命令，Ansible 就会把它推送到所有目标服务器上执行。
+
+```bash
+ansible <目标> -m <模块名> -a "<模块参数>"
+```
+
+举个例子——检查所有 Web 服务器的内存使用情况：
+
+```bash
+ansible webservers -m ansible.builtin.shell -a "free -h"
+```
+
+输出：
+
+```
+web-01 | CHANGED | rc=0 >>
+              total        used        free      shared  buff/cache   available
+Mem:           7.7G        2.1G        3.2G        156M        2.4G        5.1G
+
+web-02 | CHANGED | rc=0 >>
+              total        used        free      shared  buff/cache   available
+Mem:          15.3G        4.8G        6.1G        312M        4.4G        9.8G
+```
+
+你在控制节点上敲了一条命令，两台 Web 服务器同时返回了各自的内存信息。这就是 Ansible 的核心能力：**一条命令，N 台机器并发执行**。
+
+---
+
+## Ad-hoc 命令的结构
+
+Ad-hoc 命令由三部分组成：
+
+```
+ansible <pattern> -m <module> -a "<arguments>"
+        │            │           │
+        │            │           └── 传给模块的参数（字符串形式）
+        │            └── 模块名（要执行哪种操作）
+        └── 目标主机（all / 组名 / 主机名 / 通配符）
+```
+
+常用的 `<pattern>` 目标写法：
+
+| 写法 | 含义 |
+|------|------|
+| `all` | 所有主机 |
+| `webservers` | webservers 组里的所有主机 |
+| `web-01` | 只对 web-01 这一台 |
+| `webservers:dbservers` | webservers 组和 dbservers 组 |
+| `webservers:!web-01` | webservers 组里**除了** web-01 |
+| `webservers:&staging` | 同时属于 webservers **和** staging 组的主机 |
+
+---
+
+## 最常用的 10 个模块
+
+Ansible 内置了几百个模块，但日常用到的只有其中一小部分。下面按"你上手第一周就会用到"的频率排序。
+
+### 1. `ping` —— 连通性测试
+
+最简单的模块，不传任何参数，纯粹验证 Ansible 能不能和被管理节点通话。
+
+```bash
+ansible all -m ansible.builtin.ping
+# 返回 "pong" = 正常
+```
+
+### 2. `shell` 和 `command` —— 执行任意命令
+
+这两个模块都能在远程主机上执行命令，但有一个关键区别：
+
+| 特性 | `command` | `shell` |
+|------|-----------|---------|
+| 通过 shell 执行 | 否（直接执行二进制） | 是（通过 `/bin/sh`） |
+| 支持管道 `\|` | **不支持** | 支持 |
+| 支持重定向 `>` `<` | **不支持** | 支持 |
+| 支持变量 `$VAR` | **不支持** | 支持 |
+| 安全性 | 更高（不会被 shell 注入） | 需注意注入风险 |
+
+```bash
+# command 模块：适用于简单命令
+ansible all -m ansible.builtin.command -a "uptime"
+
+# shell 模块：需要管道、重定向、变量的场景
+ansible all -m ansible.builtin.shell -a "ps aux | grep nginx | wc -l"
+```
+
+> **规则**：能用 `command` 就别用 `shell`，前者不会经过 shell 解析，更安全。
+
+### 3. `apt` / `yum` / `dnf` / `package` —— 包管理
+
+```bash
+# 安装 nginx（Debian/Ubuntu）
+ansible webservers -m ansible.builtin.apt -a "name=nginx state=present update_cache=true"
+
+# 安装 nginx（CentOS/RHEL）
+ansible webservers -m ansible.builtin.yum -a "name=nginx state=present"
+
+# 使用通用 package 模块（自动适配包管理器）
+ansible webservers -m ansible.builtin.package -a "name=nginx state=present"
+
+# 卸载
+ansible webservers -m ansible.builtin.apt -a "name=nginx state=absent"
+
+# 更新所有包
+ansible webservers -m ansible.builtin.apt -a "upgrade=dist update_cache=true"
+```
+
+> **注意 `state` 参数**：`present`（安装）、`absent`（卸载）、`latest`（安装最新版）。这是 Ansible **声明式**的体现——你只关心"包在不在"，不关心"怎么装"。
+
+### 4. `copy` —— 复制文件
+
+```bash
+# 把控制节点上的文件复制到被管理节点
+ansible webservers -m ansible.builtin.copy -a \
+  "src=/local/nginx.conf dest=/etc/nginx/nginx.conf owner=root group=root mode=0644 backup=true"
+```
+
+`backup=true` 表示如果目标文件已存在，会先备份再覆盖。这个细节在生产环境非常重要。
+
+### 5. `file` —— 管理文件和目录属性
+
+```bash
+# 创建目录
+ansible all -m ansible.builtin.file -a "path=/opt/myapp state=directory mode=0755"
+
+# 创建软链接
+ansible all -m ansible.builtin.file -a "src=/opt/myapp/v2 dest=/opt/myapp/current state=link"
+
+# 删除文件
+ansible all -m ansible.builtin.file -a "path=/tmp/junk state=absent"
+```
+
+### 6. `service` / `systemd` —— 管理服务
+
+```bash
+# 启动 Nginx 并设为开机自启
+ansible webservers -m ansible.builtin.service -a "name=nginx state=started enabled=true"
+
+# 重启
+ansible webservers -m ansible.builtin.service -a "name=nginx state=restarted"
+
+# 重新加载配置（不中断服务，比 restart 更优雅）
+ansible webservers -m ansible.builtin.service -a "name=nginx state=reloaded"
+```
+
+> **Tip**：能用 `reloaded` 就不用 `restarted`。"重载"只是让进程重新读取配置文件，不会中断正在处理的请求。
+
+### 7. `user` —— 用户管理
+
+```bash
+# 创建用户
+ansible all -m ansible.builtin.user -a \
+  "name=deploy shell=/bin/bash groups=sudo append=yes create_home=true"
+
+# 删除用户
+ansible all -m ansible.builtin.user -a "name=olduser state=absent remove=true"
+
+# 设置 SSH 公钥
+ansible all -m ansible.builtin.authorized_key -a \
+  "user=deploy key='{{ lookup('file', '~/.ssh/id_ed25519.pub') }}'"
+```
+
+### 8. `get_url` —— 下载文件
+
+```bash
+ansible all -m ansible.builtin.get_url -a \
+  "url=https://example.com/app.tar.gz dest=/tmp/app.tar.gz mode=0644"
+```
+
+### 9. `lineinfile` —— 确保某行存在于文件中
+
+这个模块在"确保配置文件中有某行配置"时特别有用：
+
+```bash
+# 确保 /etc/ssh/sshd_config 中 PasswordAuthentication 设为 no
+ansible all -m ansible.builtin.lineinfile -a \
+  "path=/etc/ssh/sshd_config regexp='^PasswordAuthentication' line='PasswordAuthentication no'"
+
+# 在 /etc/hosts 中追加一行
+ansible all -m ansible.builtin.lineinfile -a \
+  "path=/etc/hosts line='192.168.1.100  api.internal'"
+```
+
+### 10. `setup` —— 收集系统信息
+
+```bash
+# 收集所有信息（输出会很长）
+ansible web-01 -m ansible.builtin.setup
+
+# 只收集特定类别的信息
+ansible web-01 -m ansible.builtin.setup -a "filter=ansible_distribution"
+ansible web-01 -m ansible.builtin.setup -a "filter=ansible_memtotal_mb"
+ansible web-01 -m ansible.builtin.setup -a "filter=ansible_*_ipv4"
+```
+
+`setup` 收集到的信息叫 **Facts（事实）**，在后面的 Playbook 章节中会大量使用。
+
+---
+
+## 模块文档怎么查
+
+Ansible 的模块太多了，没人能全记住。你可以随时在命令行查阅任何模块的文档：
+
+```bash
+# 查看模块的完整文档和示例
+ansible-doc ansible.builtin.copy
+
+# 列出所有模块
+ansible-doc -l
+
+# 搜索含 "user" 的模块
+ansible-doc -l | grep user
+```
+
+---
+
+## 幂等性：Ansible 的设计哲学
+
+这是本章最重要的概念，所以单独强调。
+
+**幂等性**（Idempotency）的意思是：**同一个操作执行一次和执行一百次，结果应该完全一样。**
+
+Ansible 的每个模块都遵循幂等性设计。举个例子：
+
+```bash
+# 第一次执行：nginx 没装，所以安装它
+ansible webservers -m ansible.builtin.apt -a "name=nginx state=present"
+# 输出：CHANGED（状态变了，从"没装"变成"装了"）
+
+# 第二次执行：nginx 已经装了，什么也不做
+ansible webservers -m ansible.builtin.apt -a "name=nginx state=present"
+# 输出：SUCCESS（成功了，但什么都没变）
+```
+
+注意输出的状态：
+- **CHANGED**（黄色）——任务确实执行了（安装、修改了文件等）
+- **SUCCESS / OK**（绿色）——任务检查了，但目标状态已经满足，什么都不用做
+- **FAILED**（红色）——任务失败了
+
+这就是 Ansible 比你手动 SSH 执行命令的优越之处：**你不说"安装 nginx"，你说"确保 nginx 是安装状态"。** 前者不知道装没装就再装一遍，后者先检查再决定要不要行动。
+
+> **幂等性是运维自动化的基石**。一个不幂等的自动化脚本只会制造混乱——第一次执行成功，第二次执行报错或覆盖了手动调整过的配置。
+
+---
+
+## 实战练习：用 Ad-hoc 命令 5 分钟配好一台服务器
+
+假设你拿到一台全新的 Ubuntu 22.04 服务器，要把基础环境搭好：
+
+```bash
+HOST=dbservers
+
+# 1. 更新 apt 缓存并安装基础包
+ansible $HOST -m ansible.builtin.apt -a \
+  "name={{ packages }} state=present update_cache=true" \
+  -e '{"packages":["htop","curl","git","unzip","python3-pip"]}'
+
+# 2. 创建 deploy 用户
+ansible $HOST -m ansible.builtin.user -a \
+  "name=deploy shell=/bin/bash groups=sudo append=yes create_home=true"
+
+# 3. 设置 SSH 密钥
+ansible $HOST -m ansible.builtin.authorized_key -a \
+  "user=deploy key='{{ lookup(\"file\", \"~/.ssh/id_ed25519.pub\") }}'"
+
+# 4. 安全加固：禁止 root SSH 密码登录
+ansible $HOST -m ansible.builtin.lineinfile -a \
+  "path=/etc/ssh/sshd_config regexp='^PermitRootLogin' line='PermitRootLogin no'"
+ansible $HOST -m ansible.builtin.lineinfile -a \
+  "path=/etc/ssh/sshd_config regexp='^PasswordAuthentication' line='PasswordAuthentication no'"
+
+# 5. 重启 SSH 服务使配置生效
+ansible $HOST -m ansible.builtin.service -a "name=sshd state=reloaded"
+
+# 6. 设置时区
+ansible $HOST -m ansible.builtin.command -a "timedatectl set-timezone Asia/Shanghai"
+```
+
+不到 5 分钟，一台新服务器基础环境就准备好了。如果你有 10 台新服务器，同样的命令只需要改一下 `$HOST` 参数。
+
+---
+
+## 小结
+
+Ad-hoc 命令是 Ansible 最直观的入口。它让你能"一行命令管理所有服务器"，不需要先写 Playbook 文件。
+
+但它的局限也很明显：
+- 不能编排复杂流程（先做 A，根据 A 的结果决定做 B 还是 C）
+- 不能复用（每次都要手敲参数）
+- 不适合版本管理（命令不写在文件里，没法 commit 到 Git）
+
+这些正是 Playbook 要解决的问题——下一章见。

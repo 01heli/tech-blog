@@ -1,0 +1,408 @@
+---
+title: "Playbook 入门：用 YAML 写你的第一个自动化剧本"
+description: "从 Playbook 的基本结构讲起，理解 YAML 语法、Tasks、Handlers 和幂等性设计，写第一个完整可用的 Playbook。"
+order: 4
+---
+
+## 为什么需要 Playbook？
+
+上一章我们用了很多 Ad-hoc 命令，每条命令确实好用，但它们有几个明显的局限：
+
+- 你有一个"先停 Nginx、再更新代码、最后重启 Nginx"的三步流程——Ad-hoc 命令没法编排这种有先后依赖的操作
+- 你要在新同事的电脑上重现你的服务器配置——"我之前敲过哪些命令来着？"
+- 团队里 5 个人都在用 Ad-hoc 调服务器——没人知道现在服务器的状态是谁改的
+
+**Playbook 就是解决这些问题的。**
+
+> Playbook = 把你要做的事情写进 YAML 文件，版本管理、团队共享、重复执行。
+
+---
+
+## 第一个 Playbook
+
+来看一个最简的例子——确保 Nginx 处于安装并运行状态：
+
+```yaml
+# site.yml
+---
+- name: 配置 Web 服务器
+  hosts: webservers
+  become: true
+
+  tasks:
+    - name: 安装 Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: 启动 Nginx 服务
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+```
+
+执行它：
+
+```bash
+ansible-playbook -i inventory.ini site.yml
+```
+
+输出来自 Ansible 的"任务汇报"：
+
+```
+PLAY [配置 Web 服务器] *****************************************************
+
+TASK [Gathering Facts] *****************************************************
+ok: [web-01]
+ok: [web-02]
+
+TASK [安装 Nginx] ***********************************************************
+changed: [web-01]
+changed: [web-02]
+
+TASK [启动 Nginx 服务] ******************************************************
+ok: [web-01]
+ok: [web-02]
+
+PLAY RECAP *****************************************************************
+web-01 : ok=3  changed=1  unreachable=0  failed=0  skipped=0  rescued=0  ignored=0
+web-02 : ok=3  changed=1  unreachable=0  failed=0  skipped=0  rescued=0  ignored=0
+```
+
+来读一下输出了什么信息：
+
+1. **PLAY**：一个 Play 是"针对一组主机执行的一系列任务"。这里只有 1 个 Play
+2. **TASK**：每个 Task 是"做一件事"。这里 Ansible 还自动加了一个 `Gathering Facts`（收集系统信息）
+3. **changed vs ok**：`changed` 表示确实执行了操作，`ok` 表示目标状态已满足，什么都没做
+4. **PLAY RECAP**：汇总报告，每台主机多少个任务成功/失败/跳过
+
+> **再运行一次**——你会发现 `安装 Nginx` 从 `changed` 变成了 `ok`。这就是幂等性：Nginx 已经装好了，Ansible 检查后决定不再重复安装。
+
+---
+
+## YAML 语法速成
+
+Ansible 的 Playbook 用 YAML 写成，只涉及最基础的 YAML 语法。
+
+### 键值对
+
+```yaml
+name: nginx
+state: present
+```
+
+### 列表（用 `-` 开头）
+
+```yaml
+packages:
+  - nginx
+  - htop
+  - curl
+```
+
+### 字典（缩进嵌套）
+
+```yaml
+user:
+  name: deploy
+  shell: /bin/bash
+```
+
+### 关键规则
+
+| 规则 | 说明 |
+|------|------|
+| 缩进必须用**空格**，不能用 Tab | 推荐 2 个空格 |
+| 缩进层级表示嵌套关系 | 同级必须对齐 |
+| 字符串通常不需要引号 | 但含 `:` 或 `{}` 等特殊字符时需要 |
+| `true` / `false` / `yes` / `no` | 布尔值，不需要引号 |
+| `---` 开头 | 表示一个 YAML 文档的开始（可选但推荐） |
+
+---
+
+## Playbook 的结构解剖
+
+一个完整的 Playbook 从外到内有四级：
+
+```
+Playbook（文件）
+  └── Play（针对一组主机的目标声明）
+       └── Task（一个具体操作）
+            └── Module（执行操作的模块 + 参数）
+```
+
+以一个稍微复杂一点的例子来拆解：
+
+```yaml
+---
+- name: 配置 Web 服务器集群          # ← Play 的名称
+  hosts: webservers                  # ← 目标主机组
+  become: true                       # ← 以 sudo 权限执行
+  vars:                              # ← Play 级别的变量
+    http_port: 80
+    app_user: www-data
+
+  pre_tasks:                         # ← 在执行 tasks 之前先做的事
+    - name: 更新 apt 缓存
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+  tasks:                             # ← 核心：任务列表
+    - name: 安装所需包                 # ← 任务名称（必须写！）
+      ansible.builtin.apt:           # ← 模块名
+        name: "{{ packages }}"       # ← 模块参数（支持变量引用）
+        state: present
+      vars:                          # ← 任务级别的变量
+        packages:
+          - nginx
+          - git
+          - curl
+
+    - name: 复制 Nginx 配置文件
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+      notify: 重启 Nginx             # ← 触发 Handler
+
+  handlers:                          # ← 被 notify 触发的操作
+    - name: 重启 Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+```
+
+### Play 层级的关键参数
+
+| 参数 | 作用 |
+|------|------|
+| `hosts` | 目标主机（all / 组名 / 主机名 / 模式匹配） |
+| `become` | 是否提权（sudo），默认 `false` |
+| `vars` | 定义变量 |
+| `vars_files` | 从外部文件加载变量 |
+| `gather_facts` | 是否收集 Facts，默认 `true` |
+| `tasks` | 要执行的任务列表 |
+| `handlers` | 被触发的"响应操作" |
+| `pre_tasks` / `post_tasks` | 在 tasks 之前/之后执行 |
+
+---
+
+## Handler：按需触发的"响应"
+
+Handler 是 Ansible 的一个优雅设计：**只有当某个任务确实改变了系统状态时，才执行对应的 Handler。**
+
+```yaml
+tasks:
+  - name: 复制 Nginx 配置
+    ansible.builtin.template:
+      src: nginx.conf.j2
+      dest: /etc/nginx/nginx.conf
+    notify: 重载 Nginx             # ← 配置变了才重载
+
+  - name: 复制虚拟主机配置
+    ansible.builtin.template:
+      src: site.conf.j2
+      dest: /etc/nginx/sites-available/site.conf
+    notify: 重载 Nginx             # ← 两个任务触发同一个 Handler
+
+handlers:
+  - name: 重载 Nginx
+    ansible.builtin.service:
+      name: nginx
+      state: reloaded
+```
+
+无论有多少个任务触发了 `重载 Nginx`，Handler 只会在**所有任务执行完后执行一次**。这样配置改了一堆，服务只会重启一次。
+
+> **对比**：如果没有 Handler，你只能在每个修改配置的任务后面都加一句 `ansible.builtin.service: name=nginx state=reloaded`——重复的代码，还可能重启多次。
+
+---
+
+## 幂等性实践：怎么写幂等的 Playbook
+
+Playbook 的幂等性不是自动的——你的任务是确保它"反复跑也不出乱子"。以下是三条核心技巧：
+
+### 1. 用声明式模块，而不是 `shell`/`command`
+
+```yaml
+# 坏写法——每次执行都会创建用户（第二次会报"用户已存在"）
+- name: 创建用户
+  ansible.builtin.shell: useradd deploy
+
+# 好写法——声明式，已存在就跳过
+- name: 创建用户
+  ansible.builtin.user:
+    name: deploy
+    state: present
+```
+
+### 2. 用 `creates` 或 `when` 条件保护 `shell`/`command`
+
+当你确实需要用 shell 时，加上保护条件：
+
+```yaml
+# 只有当 /opt/app 目录不存在时才 clone
+- name: 克隆代码仓库
+  ansible.builtin.command:
+    cmd: git clone https://github.com/user/repo.git /opt/app
+    creates: /opt/app/.git
+
+# 检查后再决定是否下载
+- name: 下载 Go（不存在时才下载）
+  ansible.builtin.get_url:
+    url: https://go.dev/dl/go1.23.linux-amd64.tar.gz
+    dest: /tmp/go.tar.gz
+  when: not ansible_check_mode
+```
+
+### 3. 使用 `changed_when` 控制任务报告
+
+有些命令本身不"改变状态"但你想控制它如何报告：
+
+```yaml
+- name: 检查 API 健康状态
+  ansible.builtin.uri:
+    url: http://localhost/health
+    return_content: true
+  register: health_result
+  changed_when: false             # 告诉 Ansible 这个任务永远不会产生变更
+  failed_when: "'ok' not in health_result.content"
+```
+
+---
+
+## 实战：写一个完整的 Web 服务器 Playbook
+
+下面是一个可以直接用的 Playbook，在一台空白 Ubuntu 服务器上部署一个静态网站：
+
+```yaml
+---
+- name: 部署静态网站
+  hosts: webservers
+  become: true
+
+  vars:
+    site_domain: example.com
+    site_root: /var/www/{{ site_domain }}
+
+  tasks:
+    - name: 更新 apt 缓存
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: 安装 Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: 创建网站目录
+      ansible.builtin.file:
+        path: "{{ site_root }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: 创建首页
+      ansible.builtin.copy:
+        content: |
+          <html>
+            <head><title>Welcome to {{ site_domain }}</title></head>
+            <body>
+              <h1>部署成功！</h1>
+              <p>服务器：{{ ansible_hostname }}</p>
+              <p>IP：{{ ansible_default_ipv4.address }}</p>
+            </body>
+          </html>
+        dest: "{{ site_root }}/index.html"
+        owner: www-data
+        group: www-data
+        mode: "0644"
+
+    - name: 配置 Nginx 站点
+      ansible.builtin.template:
+        src: nginx-site.conf.j2
+        dest: /etc/nginx/sites-available/{{ site_domain }}
+      notify: 启用站点并重载 Nginx
+
+    - name: 确保默认站点被禁用
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: 重载 Nginx
+
+  handlers:
+    - name: 启用站点并重载 Nginx
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/{{ site_domain }}
+        dest: /etc/nginx/sites-enabled/{{ site_domain }}
+        state: link
+      notify: 重载 Nginx
+
+    - name: 重载 Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+```
+
+配合一个简单的 Nginx 模板文件 `nginx-site.conf.j2`：
+
+```nginx
+server {
+    listen 80;
+    server_name {{ site_domain }};
+
+    root {{ site_root }};
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+```
+
+然后执行：
+
+```bash
+ansible-playbook -i inventory.ini site.yml
+```
+
+几分钟后，访问服务器的 80 端口，你就能看到部署好的页面。
+
+---
+
+## 常用执行参数
+
+```bash
+# 检查模式（Dry Run）：看看会做什么，但不真的执行
+ansible-playbook -i inventory.ini site.yml --check
+
+# 只看有变化的任务
+ansible-playbook -i inventory.ini site.yml --check --diff
+
+# 从某个任务开始执行（调试用）
+ansible-playbook -i inventory.ini site.yml --start-at-task="安装 Nginx"
+
+# 只执行某些标签的任务
+ansible-playbook -i inventory.ini site.yml --tags=nginx
+
+# 跳过某些标签的任务
+ansible-playbook -i inventory.ini site.yml --skip-tags=restart
+
+# 逐步确认（每步都问你是否继续）
+ansible-playbook -i inventory.ini site.yml --step
+
+# 详细输出（-v / -vv / -vvv，越多越详细）
+ansible-playbook -i inventory.ini site.yml -vv
+```
+
+---
+
+## 小结
+
+Playbook 是 Ansible 的核心。它把"想要服务器长什么样"用 YAML 描述了出来，配合幂等性设计和 Handler 机制，让你可以放心地反复执行同一个 Playbook。
+
+下一章，我们要深入变量系统——如何在 Playbook、Inventory、外部文件和主机 Facts 之间优雅地管理和传递数据。

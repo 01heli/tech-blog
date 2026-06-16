@@ -1,0 +1,312 @@
+---
+title: "条件判断与循环：让 Playbook 会思考"
+description: "掌握 when 条件判断、loop/with_* 循环、block 错误处理，以及根据 Facts 做操作系统适配的实战技巧。"
+order: 6
+---
+
+## 条件判断：when
+
+在运维中，很多事情需要"看情况"：
+
+- "如果是 Ubuntu 就用 apt，如果是 CentOS 就用 yum"
+- "如果配置文件已存在，就跳过初始化"
+- "如果上一个命令失败了，就执行补救措施"
+
+Ansible 用 `when` 关键字来实现这一切。
+
+### 基础语法
+
+```yaml
+- name: 只在 Ubuntu 系统上安装 Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+  when: ansible_distribution == "Ubuntu"
+```
+
+`when` 后面的表达式是 Jinja2 语法——但不需要加 `{{ }}`。Ansible 会自动把它当作 Jinja2 模板来求值。
+
+### 根据 Facts 做操作系统判断
+
+这是 `when` 最常用的场景——为不同的操作系统选择不同的包管理器：
+
+```yaml
+- name: Debian 系安装
+  ansible.builtin.apt:
+    name: "{{ package_name }}"
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: RedHat 系安装
+  ansible.builtin.yum:
+    name: "{{ package_name }}"
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: SUSE 系安装
+  ansible.builtin.zypper:
+    name: "{{ package_name }}"
+    state: present
+  when: ansible_os_family == "Suse"
+```
+
+> **另一种写法**：如果你想让 Ansible 自动选择包管理器，用 `ansible.builtin.package` 模块，它会根据系统自动调用对应的包管理器。但当你需要传特定于某个包管理器的参数时（比如 apt 的 `update_cache`），还是得分开写。
+
+### 根据变量和 register 结果判断
+
+```yaml
+- name: 检查应用是否已部署
+  ansible.builtin.stat:
+    path: /opt/myapp/version.txt
+  register: app_check
+
+- name: 首次部署应用
+  ansible.builtin.include_tasks: deploy-app.yml
+  when: not app_check.stat.exists
+
+- name: 更新应用
+  ansible.builtin.include_tasks: update-app.yml
+  when: app_check.stat.exists and upgrade_needed
+```
+
+### 多个条件的组合
+
+```yaml
+# AND 条件
+when:
+  - ansible_os_family == "Debian"
+  - ansible_distribution_version is version("20.04", ">=")
+  - app_environment != "production"     # 只允许在非生产环境执行
+
+# OR 条件
+when: ansible_distribution == "Ubuntu" or ansible_distribution == "Debian"
+```
+
+### 与字符串和列表相关的高级条件
+
+```yaml
+# 检查一个值是否在列表中
+when: app_environment in ["staging", "development"]
+
+# 检查主机是否在某个组中
+when: "'webservers' in group_names"
+
+# 检查变量是否定义
+when: db_password is defined
+
+# 检查变量是否为 None
+when: some_var is not none
+
+# 版本号比较
+when: ansible_distribution_version is version("22.04", ">=")
+```
+
+### 检查命令执行结果
+
+```yaml
+- name: 检查 Nginx 是否在运行
+  ansible.builtin.command: pgrep nginx
+  register: nginx_status
+  failed_when: false              # pgrep 没找到进程会返回非0，不要让任务报错
+  changed_when: false
+
+- name: 如果 Nginx 没运行就启动它
+  ansible.builtin.service:
+    name: nginx
+    state: started
+  when: nginx_status.rc != 0
+```
+
+---
+
+## 循环：loop
+
+如果要对一台服务器上创建 3 个用户、安装 5 个包、创建 10 个目录——你不会想写 10 个几乎一样的 Task。
+
+### 基础循环
+
+```yaml
+- name: 安装多个包
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - nginx
+    - htop
+    - curl
+    - git
+    - unzip
+```
+
+`loop` 会遍历列表，每次迭代中当前元素用 `item` 引用。
+
+### 循环字典
+
+```yaml
+- name: 创建多个用户
+  ansible.builtin.user:
+    name: "{{ item.username }}"
+    shell: "{{ item.shell }}"
+    groups: "{{ item.groups | default('') }}"
+  loop:
+    - { username: "deploy",  shell: "/bin/bash", groups: "sudo" }
+    - { username: "app",     shell: "/bin/false" }
+    - { username: "monitor", shell: "/bin/bash", groups: "docker" }
+```
+
+### 循环嵌套（子列表）
+
+```yaml
+- name: 给每个用户设置多个 SSH 公钥
+  ansible.builtin.authorized_key:
+    user: "{{ item[0] }}"
+    key: "{{ item[1] }}"
+  loop: "{{ ['deploy', 'admin'] | product(['ssh-rsa AAA...', 'ssh-ed25519 BBB...']) | list }}"
+```
+
+### 循环 + when 过滤
+
+```yaml
+- name: 只安装非生产环境需要的调试工具
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - strace
+    - tcpdump
+    - htop
+  when: environment != "production"
+```
+
+> **循环的 when 是作用在每次迭代上的**——不是整个 task 的开关。
+
+### 控制循环行为
+
+```yaml
+# loop_control：自定义循环变量名和标签
+- name: 安装包
+  ansible.builtin.apt:
+    name: "{{ pkg }}"
+    state: present
+  loop: "{{ packages }}"
+  loop_control:
+    loop_var: pkg               # 把 item 改名为 pkg（可读性更好）
+    label: "{{ pkg }}"          # 输出中显示包名而不是整个 item 对象
+```
+
+---
+
+## 条件判断 + 循环的实战场景
+
+### 场景一：跨系统通用 Playbook
+
+```yaml
+- name: 通用 Nginx 安装（Ubuntu + CentOS）
+  hosts: all
+  tasks:
+    - name: Debian 系安装 Nginx
+      block:
+        - name: 添加 Nginx 官方源
+          ansible.builtin.apt_repository:
+            repo: "ppa:nginx/stable"
+        - name: 安装
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+            update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: RedHat 系安装 Nginx
+      block:
+        - name: 添加 Nginx 官方源
+          ansible.builtin.yum_repository:
+            name: nginx
+            description: Nginx official repo
+            baseurl: http://nginx.org/packages/rhel/$releasever/$basearch/
+            gpgcheck: true
+        - name: 安装
+          ansible.builtin.yum:
+            name: nginx
+            state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: 启动 Nginx（不管哪个系统）
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+```
+
+### 场景二：按功能组区分任务
+
+```yaml
+- name: 分层配置
+  hosts: all
+  tasks:
+    - name: 所有主机都装的基础包
+      ansible.builtin.package:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - htop
+        - curl
+        - vim
+        - ntp
+
+    - name: Web 服务器专属包
+      ansible.builtin.package:
+        name: nginx
+        state: present
+      when: "'webservers' in group_names"
+
+    - name: 数据库服务器专属包
+      ansible.builtin.package:
+        name: mysql-server
+        state: present
+      when: "'dbservers' in group_names"
+
+    - name: 生产环境特有的安全配置
+      ansible.builtin.include_tasks: security-hardening.yml
+      when: environment == "production"
+```
+
+---
+
+## 特殊循环技巧
+
+### until：重试直到成功
+
+适合等待某个服务启动：
+
+```yaml
+- name: 等待应用端口就绪
+  ansible.builtin.uri:
+    url: http://localhost:3000/health
+  register: health_result
+  until: health_result.status == 200
+  retries: 30                    # 最多重试 30 次
+  delay: 2                       # 每次间隔 2 秒
+```
+
+### with_fileglob：遍历文件
+
+```yaml
+- name: 上传所有配置文件
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: /etc/myapp/conf.d/
+  with_fileglob:
+    - conf.d/*.conf
+```
+
+---
+
+## 小结
+
+`when` 和 `loop` 让 Playbook 从"死板的配置文件"变成了"能思考的自动化脚本"。记住三条规则：
+
+1. **用 `when` 做操作系统适配**——同一个 Playbook 跑在 Ubuntu 和 CentOS 上没问题
+2. **用 `loop` 消灭重复**——创建 10 个用户只要一个 Task
+3. **组合使用 `register` + `when`**——根据前面的执行结果决定后面的操作
+
+下一章，我们要让配置文件的生成也变得灵活——Jinja2 模板。
