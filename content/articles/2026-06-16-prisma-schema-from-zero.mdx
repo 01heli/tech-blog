@@ -1,0 +1,658 @@
+---
+title: 搞懂 Prisma Schema：一张图纸管好你所有的数据库表
+description: 面向零基础读者的 Prisma Schema 完全指南，从手写 SQL 建表的痛点出发，逐步理解 Prisma Schema 的五大核心概念，附带可直接运行的代码示例和生产环境最佳实践。
+date: '2026-06-16'
+category: Database
+tags:
+  - Prisma
+  - ORM
+  - TypeScript
+  - PostgreSQL
+  - 数据库
+  - Schema
+featured: true
+---
+
+你正在开发一个博客系统。数据库中需要几张表：用户表、文章表、分类表、标签表。
+
+于是你打开数据库客户端，手敲 SQL：
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(100),
+  password_hash VARCHAR(255) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  author_id INT REFERENCES users(id),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+项目上线了。三个月后，产品经理说："文章表加一个 `published` 字段，用户表加一个 `role` 字段"。你熟练地打开数据库客户端，又是一通 ALTER TABLE。同事拉了代码，跑不起来，因为不知道数据库早就变了。
+
+再后来团队来了新人。他问："现在的数据库有哪些表？每张表有哪些字段？用户表和文章表是什么关系？" 你翻出一个已经三个月没更新的 wiki 文档，上面的内容有一半已经不准了。
+
+这个场景你不陌生。问题的根源在哪里？**数据库的结构（Schema）是真实存在的，但它长在数据库里，不在你的代码仓库里。** 你无法像管理代码一样管理它——没有版本历史、没有变更记录、没有类型检查、没法 Code Review。
+
+Prisma 解决的就是这个问题：**把数据库结构从"藏在数据库里的隐知识"变成"仓库里的一张图纸"，用代码来管，用 Git 来跟踪。**
+
+## Prisma Schema 是什么
+
+先给定义：
+
+> Prisma Schema 是一个以 `.prisma` 结尾的文本文件，用 Prisma 自定义的 Schema Language 描述你的数据库结构。它既是数据库的建表图纸，又是生成 TypeScript 类型客户端的源头——一份定义，两处生效。
+
+打个比方：盖房子需要建筑图纸，数据库也需要一张"图纸"。传统的做法是你直接在数据库里建表（等于没图纸直接开工），Prisma Schema 的做法是先把图纸画好、审查通过、提交 Git，然后再按图纸施工。
+
+这张图纸包含三部分内容：
+
+```
+schema.prisma
+│
+├── datasource（数据源：连哪个数据库）
+├── generator （生成器：生成什么代码）
+├── model     （模型：有哪些表，表之间什么关系）
+├── enum      （枚举：有哪些固定选项值）
+└── relation  （关系：隐含在 model 中，但你必须理解它）
+```
+
+下面一个一个讲清楚。
+
+## 五个核心概念
+
+### 1. Datasource：连哪个数据库
+
+`datasource` 告诉 Prisma"我的数据库在哪、是什么类型"。
+
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `provider` | 数据库类型。可选值：`postgresql`、`mysql`、`sqlite`、`sqlserver`、`mongodb`、`cockroachdb` |
+| `url` | 数据库连接字符串。`env("DATABASE_URL")` 表示从环境变量读取，不是硬编码在文件里 |
+
+连接字符串长这样：
+
+```bash
+# PostgreSQL
+DATABASE_URL="postgresql://用户名:密码@主机:5432/数据库名"
+
+# MySQL
+DATABASE_URL="mysql://用户名:密码@主机:3306/数据库名"
+
+# SQLite（文件数据库，最简单，不需要装数据库软件）
+DATABASE_URL="file:./dev.db"
+```
+
+一个 `schema.prisma` 文件中只能有一个 `datasource` 块。整个项目的所有表都在同一个 datasource 下。
+
+### 2. Generator：生成什么代码
+
+`generator` 告诉 Prisma"基于我的模型定义，给我生成什么代码"。
+
+```prisma
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+```
+
+Prisma 默认生成的是 TypeScript/JavaScript 客户端——Prisma Client。生成之后你在代码里这样操作数据库：
+
+```typescript
+// 不用再写 SQL，用生成的 Client 操作数据库
+import { PrismaClient } from '@prisma/client'
+
+const db = new PrismaClient()
+
+// 查所有用户
+const users = await db.user.findMany()
+
+// 按条件查，类型自动补全
+const post = await db.post.findFirst({
+  where: { published: true },
+  include: { author: true }    // 自动把作者信息也查出来
+})
+```
+
+注意到没有——`db.user` 和 `db.post` 的类型都是**自动生成**的，不需要你手动写类型声明。Schema 改了，Client 的类型自动跟着变，TypeScript 编译器会告诉你哪些代码需要改。这就是"一份定义，两处生效"真正的价值。
+
+### 3. Model：有哪些表
+
+`model` 是 Schema 中最核心的部分。一个 `model` 对应数据库中的一张表。
+
+```prisma
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  name         String?
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  posts        Post[]
+}
+```
+
+上面这段定义等价于手写这条 SQL：
+
+```sql
+CREATE TABLE users (
+  id         SERIAL PRIMARY KEY,
+  email      VARCHAR NOT NULL UNIQUE,
+  name       VARCHAR,
+  role       VARCHAR DEFAULT 'USER',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+但 Prisma 版本多了这些好处：字段类型一眼可见、哪些是必填哪些可选一目了然（`?` 后缀）、默认值逻辑写在明处、关系字段 `posts Post[]` 在 SQL 中没有对应列，但它告诉类型系统"User 有很多 Post"。
+
+#### 标量类型速查
+
+Prisma 提供了这些基础字段类型，对应数据库的列类型：
+
+| Prisma 类型 | PostgreSQL 实际类型 | 用途 |
+|-------------|-------------------|------|
+| `String` | `text` / `varchar` | 文本 |
+| `Int` | `integer` | 整数 |
+| `Float` | `double precision` | 浮点数 |
+| `Boolean` | `boolean` | 是/否 |
+| `DateTime` | `timestamp` | 日期时间 |
+| `BigInt` | `bigint` | 大整数 |
+| `Decimal` | `decimal` | 精确小数（金额） |
+| `Json` | `jsonb` | JSON 数据 |
+| `Bytes` | `bytea` | 二进制数据 |
+
+#### 常用属性（Attributes）
+
+属性用 `@` 或 `@@` 开头（`@` 用于单字段，`@@` 用于多字段组合），修饰字段的行为：
+
+```prisma
+model Product {
+  id       Int     @id @default(autoincrement())   // @id: 主键
+  sku      String  @unique                          // @unique: 唯一约束
+  name     String  @db.VarChar(500)                 // @db.xxx: 指定具体数据库类型
+  price    Decimal @default(0)                      // @default: 默认值
+  stock    Int?
+  desc     String?                                   // ? = 可选字段（允许 NULL）
+
+  @@index([sku])                                     // @@index: 建索引
+  @@map("products")                                  // @@map: 数据库表名用 "products"
+}
+```
+
+几个最常用的属性：
+
+| 属性 | 级别 | 作用 |
+|------|------|------|
+| `@id` | 单字段 | 主键 |
+| `@@id([a, b])` | 多字段 | 联合主键 |
+| `@unique` | 单字段 | 值必须唯一 |
+| `@default(val)` | 单字段 | 插入时的默认值 |
+| `@updatedAt` | 单字段 | 每次更新自动设当前时间 |
+| `@map("name")` | 单字段 | 数据库列名映射 |
+| `@@map("name")` | 模型级 | 数据库表名映射 |
+| `@@index([a, b])` | 模型级 | 创建复合索引 |
+
+`@map` 和 `@@map` 的价值在于：你在 Prisma 层面用 `camelCase` 命名（`createdAt`），数据库层面保持 `snake_case` 传统（`created_at`），两边都不别扭。
+
+### 4. Enum：固定选项值
+
+有些字段的值是固定的几种。比如用户的角色：要么是普通用户，要么是管理员。
+
+```prisma
+enum Role {
+  USER
+  ADMIN
+  MODERATOR
+}
+
+model User {
+  id   Int  @id
+  role Role @default(USER)   // role 字段只能是 Role 枚举中的值
+}
+```
+
+对比一个容易踩的坑：用 `String` 存角色 vs 用 `Enum` 存角色。
+
+```
+用 String：
+  代码中可能不小心写成 role = "adimn"（拼错了）
+  数据库不会报任何错
+  上线后发现管理员功能全挂
+
+用 Enum：
+  编译器在你写 role = "adimn" 时就红了
+  根本跑不起来
+```
+
+枚举的本质是把错误从运行时提前到编译期发现。能用枚举的尽量用枚举。
+
+不过要注意：PostgreSQL 原生支持枚举，MySQL 不支持（Prisma 会把 MySQL 的枚举映射为 `VARCHAR`）。如果你的生产环境用 MySQL，别太依赖枚举在数据库层面的校验，把它当作文档和类型约束来用就好。
+
+### 5. Relation：表之间什么关系
+
+这是新手最容易困惑的部分，也是最体现 Prisma 价值的部分。
+
+数据库表之间的关系只有三种：一对多、一对一、多对多。任何复杂的系统都是这三种关系的组合。
+
+#### 一对多
+
+一个用户写多篇文章，一篇文章只属于一个用户。
+
+```prisma
+model User {
+  id    Int    @id @default(autoincrement())
+  posts Post[]    // "User 有很多 Post"
+}
+
+model Post {
+  id       Int  @id @default(autoincrement())
+  title    String
+  author   User @relation(fields: [authorId], references: [id])
+  //                 └─── 关系声明：authorId 列引用 User 的 id 列
+  authorId Int  // 这个字段真实存在于数据库中（外键列）
+}
+```
+
+理解两个概念的区别，你就理解了 Prisma 关系的全部：
+
+```
+author   Post?    关系字段（relation field）
+  └── 只存在于 Prisma 层面，数据库中不存在
+  └── 用于在代码中做关联查询：post.author.name
+
+authorId Int      关系标量字段（relation scalar field）
+  └── 真实存在于数据库中（外键列）
+  └── 存储关联记录的 id 值
+```
+
+`@relation` 的参数就是告诉 Prisma：外键列 `authorId` 引用的是 `User` 表的 `id` 列。
+
+#### 一对一
+
+一个用户有一个个人资料，一个个人资料只属于一个用户。
+
+```prisma
+model User {
+  id      Int      @id @default(autoincrement())
+  profile Profile?   // 一个用户可以有 0 或 1 个资料
+}
+
+model Profile {
+  id     Int  @id @default(autoincrement())
+  bio    String
+  user   User @relation(fields: [userId], references: [id])
+  userId Int  @unique    // 关键：外键上加 @unique，保证一对一
+}
+```
+
+秘诀就一句话：**在一对多的基础上，给外键列加 `@unique`。** 加了 `@unique` 就保证一个 userId 只会出现一次，从而实现一对一。
+
+#### 多对多
+
+一篇文章可以有多个标签，一个标签下可以有多篇文章。
+
+先看隐式多对多——Prisma 自动生成中间表，写法最简单：
+
+```prisma
+model Post {
+  id    Int       @id
+  tags  Tag[]     // 多对多，Prisma 自动管理中间表
+}
+
+model Tag {
+  id    Int    @id
+  posts Post[]  // 多对多
+}
+```
+
+你不需要定义中间表，Prisma 在数据库里自动建一张 `_PostToTag` 表。但隐式多对多有一个限制：中间表不能加额外字段。
+
+如果你需要在"文章-标签"的关联上记录"是谁在什么时候打的标签"，就要用显式多对多——手动定义中间表：
+
+```prisma
+model Post {
+  id        Int             @id
+  postTags  PostTag[]       // 通过中间表关联
+}
+
+model Tag {
+  id       Int       @id
+  postTags PostTag[]  // 通过中间表关联
+}
+
+model PostTag {
+  postId    Int
+  tagId     Int
+  post      Post     @relation(fields: [postId], references: [id])
+  tag       Tag      @relation(fields: [tagId], references: [id])
+  assignedAt DateTime @default(now())  // 中间表可以有额外字段！
+  assignedBy Int                        // 谁打的标签
+
+  @@id([postId, tagId])  // 联合主键：同一个人不能给同一篇文章打同一个标签两次
+}
+```
+
+什么时候用显式？**只要中间表需要承载额外信息（时间、操作人、排序权重），就必须用显式多对多。**
+
+## 从 Schema 到数据库：Migration
+
+Schema 文件写好了，怎么让数据库按照这张图纸建表？
+
+Prisma 用了一套叫 Migration 的机制——**每次 Schema 变更自动生成一份 SQL 文件，存到仓库里，按序执行**。
+
+```
+你修改 schema.prisma（比如加了一个 published 字段）
+        │
+        ▼
+npx prisma migrate dev --name add-published-field
+        │
+        ▼
+Prisma 自动做三件事：
+  1. 对比你的 Schema 和数据库当前状态，生成 SQL 变更脚本
+  2. 把 SQL 脚本保存到 prisma/migrations/20260616_add_published/ 目录
+  3. 把脚本应用到数据库
+```
+
+Migration 目录结构长这样：
+
+```
+prisma/
+├── schema.prisma
+└── migrations/
+    ├── 20260601_init/           ← 第一次建表
+    │   └── migration.sql
+    ├── 20260610_add_tags/       ← 加了标签功能
+    │   └── migration.sql
+    └── 20260616_add_published/  ← 加了发布状态
+        └── migration.sql
+```
+
+这些 SQL 文件就是数据库结构的完整变更历史。新同事加入时，跑一条命令就能把数据库同步到最新状态：
+
+```bash
+npx prisma migrate deploy
+```
+
+关键纪律：
+
+```
+可以做的：    修改 schema.prisma → migrate dev → 提交 migration 文件
+绝对不能做：  手动改数据库结构 → 期望 Prisma 感知到变化
+绝对不能做：  直接编辑已提交的 migration 文件
+生产环境：    只用 prisma migrate deploy（非交互式，安全）
+```
+
+## 一个完整的 Schema 示例
+
+结合前面五个概念，这是一个博客系统完整的 `schema.prisma`：
+
+```prisma
+// ============================================
+// 1. 生成器：生成 TypeScript 客户端
+// ============================================
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/client"
+}
+
+// ============================================
+// 2. 数据源：连接 PostgreSQL
+// ============================================
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// 3. 枚举：用户角色和文章状态
+// ============================================
+enum UserRole {
+  READER
+  AUTHOR
+  ADMIN
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+// ============================================
+// 4. 模型：用户表
+// ============================================
+model User {
+  id           Int        @id @default(autoincrement())
+  email        String     @unique
+  passwordHash String     @map("password_hash")
+  name         String?    // 可选字段
+  role         UserRole   @default(READER)
+  bio          String?    @db.VarChar(500)  // 限制长度
+  avatarUrl    String?    @map("avatar_url")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  // 关系字段
+  posts        Post[]
+  comments     Comment[]
+  likedPosts   PostLike[]
+
+  @@map("users")
+  @@index([role])              // 按角色筛选用户时加速
+  @@index([createdAt])         // 按注册时间排序时加速
+}
+
+// ============================================
+// 模型：文章表
+// ============================================
+model Post {
+  id          Int        @id @default(autoincrement())
+  title       String     @db.VarChar(255)
+  slug        String     @unique  // URL 友好的标题
+  content     String     @db.Text
+  excerpt     String?    @db.VarChar(500)  // 摘要
+  coverImage  String?    @map("cover_image")
+  status      PostStatus @default(DRAFT)
+  viewCount   Int        @default(0) @map("view_count")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+  publishedAt DateTime?  @map("published_at")
+
+  // 外键
+  authorId    Int        @map("author_id")
+  author      User       @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  //                                                    └── 删除用户时自动删除他的文章
+
+  // 关系字段
+  comments    Comment[]
+  tags        PostTag[]
+  likes       PostLike[]
+
+  @@map("posts")
+  @@index([status, publishedAt])   // 查"已发布文章按时间排序"最常用
+  @@index([authorId])              // 查某用户的所有文章
+  @@index([slug])                  // 按 slug 查文章
+}
+
+// ============================================
+// 模型：标签（与文章多对多）
+// ============================================
+model Tag {
+  id    Int      @id @default(autoincrement())
+  name  String   @unique @db.VarChar(50)
+  color String?  @db.VarChar(7)   // 十六进制颜色，如 #FF5733
+  posts PostTag[]
+
+  @@map("tags")
+}
+
+// 显式多对多中间表
+model PostTag {
+  postId Int
+  tagId  Int
+  post   Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag    Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])   // 联合主键
+  @@map("post_tags")
+}
+
+// ============================================
+// 模型：评论
+// ============================================
+model Comment {
+  id        Int      @id @default(autoincrement())
+  content   String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // 外键——谁写的、评论哪篇文章
+  authorId  Int      @map("author_id")
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  postId    Int      @map("post_id")
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  // 自关联：回复某条评论（嵌套评论）
+  parentId  Int?      @map("parent_id")
+  parent    Comment?  @relation("CommentReplies", fields: [parentId], references: [id])
+  replies   Comment[] @relation("CommentReplies")
+
+  @@map("comments")
+  @@index([postId, createdAt])     // 查某文章的最新评论
+}
+
+// ============================================
+// 模型：点赞
+// ============================================
+model PostLike {
+  userId Int
+  postId Int
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post   Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@id([userId, postId])   // 一个人只能给一篇文章点一次赞
+  @@map("post_likes")
+}
+```
+
+拿这段 Schema 跑 `npx prisma migrate dev --name init`，Prisma 会自动生成对应的 SQL 并在数据库中建好所有表。然后你在 TypeScript 代码里 `db.post.findMany({ include: { author: true, tags: true } })` 就能查出文章带作者带标签——不需要手写任何 JOIN 语句。
+
+## 生产环境避坑指南
+
+踩过的坑列出来，省得你再踩一遍。
+
+**坑一：PrismaClient 实例化多次**
+
+Next.js 的热更新会让 `new PrismaClient()` 被执行很多次，每次都创建一个新的数据库连接。开发几小时后，数据库连接池耗尽，服务挂了。
+
+解决方案：全局单例。
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from '@/generated/client'
+
+const globalForPrisma = globalThis as unknown as { db: PrismaClient | undefined }
+
+export const db = globalForPrisma.db ?? new PrismaClient({
+  log: process.env.NODE_ENV === 'development' ? ['query'] : [],
+})
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.db = db
+}
+```
+
+**坑二：查询所有字段，数据量爆炸**
+
+```typescript
+// 不好：查出所有字段包括几百 KB 的文章正文，但你只需要标题
+const posts = await db.post.findMany()
+
+// 好：只查你需要的字段
+const posts = await db.post.findMany({
+  select: { id: true, title: true, createdAt: true }
+})
+```
+
+`select` 白名单和 `omit` 黑名单（Prisma 新版本支持）是控制查询字段的两个工具。列表页用 `select`，减少网络传输。
+
+**坑三：N+1 查询**
+
+```typescript
+// 不好：循环里查数据库——100 篇文章 = 101 次查询
+const posts = await db.post.findMany()
+for (const post of posts) {
+  const author = await db.user.findUnique({ where: { id: post.authorId } })
+}
+
+// 好：一次查询把关联数据全带出来——总共 1 次查询
+const posts = await db.post.findMany({
+  include: { author: true }
+})
+```
+
+**坑四：索引忘了加**
+
+建表时不加索引，上线后数据量上去，查询越来越慢。一个底线规则：
+
+```
+以下字段必须加索引：
+  - 所有外键列（如 authorId）
+  - 所有 WHERE 条件中频繁出现的列（如 status）
+  - 所有 ORDER BY 的列（如 createdAt）
+
+什么情况不加索引：
+  - 数据量极小（几百行）
+  - 该列的查询频率极低
+```
+
+**坑五：直接用 `prisma db push` 上生产**
+
+`db push` 是原型开发阶段的快捷工具，它不生成 migration 文件。生产环境必须用 `prisma migrate deploy`，否则你没法知道数据库什么时候被谁改了什么。
+
+**坑六：枚举值在生产环境修改**
+
+PostgreSQL 中给已有枚举类型增加值是安全的，但删除或重命名枚举值极其危险——已有数据可能引用着它。除非你确认该枚举值没有任何行在用，否则只增不减。
+
+## 总结
+
+Prisma Schema 解决的核心问题就一个：**把数据库结构从"只有 DBA 知道的运行时状态"变成"全团队可见、可审查、可追溯的代码"**。
+
+回到你正在做的博客系统。也许目前只有三张表，手动管着还行。可当你开始做 DataTalk 这种项目——用户上传 CSV 要自动建表、NL→SQL 要根据 Schema 生成查询、多租户要做数据隔离——Schema 管理的复杂度会是指数级的。到那时候，一份规整的 schema.prisma 不是一个"最好有"的东西，而是"没有就做不下去"的基础设施。
+
+如果你是后端开发者：花一个小时把现有数据库的表用 Prisma Schema 定义出来，跑一次 `prisma db pull` 可以让 Prisma 自动从数据库反向生成 Schema。
+
+如果你是前端开发者：哪怕后端不是你写的，理解 Schema 文件能让你更清楚数据是怎么存的。TypeScript 类型提示+Prisma Client=你不需要去猜 `res.data.user.profile.avatar_url` 链上的哪个字段可能是 null。
+
+如果你是项目负责人：把 Schema 文件放入 Code Review 流程。一张表加不加索引、关联用不用级联删除，这些问题在 PR 阶段讨论的代价是在生产环境修复的千分之一。
+
+---
+
+## 参考资料
+
+- [Prisma Schema 概览（中文）](https://prisma.org.cn/docs/orm/prisma-schema/overview)（Prisma 中文官方文档 Schema 部分的入口）
+- [Prisma Schema Language: The Best Way to Define Your Data](https://www.prisma.io/blog/prisma-schema-language-the-best-way-to-define-your-data)（Prisma 官方博客介绍 Schema Language 的设计理念）
+- [Models — Prisma Documentation](https://www.prisma.io/docs/orm/prisma-schema/data-model/models)（模型定义的完整官方参考）
+- [Prisma 关系详解](https://www.prisma.io/docs/orm/prisma-schema/data-model/relations)（一对一、一对多、多对多关系的完整语法说明）
+- [Prisma Indexes](https://www.prismagraphql.com/docs/v6/orm/prisma-schema/data-model/indexes)（索引配置参考，含 PostgreSQL 专用类型 Hash/GIN/GiST/BRIN）
+- [Prisma Migrations 指南](https://www.prisma.io/docs/orm/prisma-migrate)（Migration 工作流程、生产环境部署规范）
+- [Prisma Best Practices](https://www.prismagraphql.com/docs/orm/more/best-practices)（官方最佳实践汇总：命名规范、索引策略、连接管理）
+- [The Perfect Prisma Schema for a SaaS App (Next.js 16 + PostgreSQL)](https://dev.to/huangyongshan46a11y/the-perfect-prisma-schema-for-a-saas-app-nextjs-16-postgresql-5b28)（Dev.to 上关于 Next.js 项目中 Prisma Schema 的实践总结）
+- [Prisma Schema Design: Relationships, Enums, and Indexes That Scale](https://dev.to/whoffagents/prisma-schema-design-relationships-enums-and-indexes-that-scale-9gm)（关系、枚举、索引的扩展用法指南）
+- [全栈类型共享：从 Prisma 到前端，一劳永逸解决接口不一致](https://sysiya.blog.csdn.net/article/details/157738894)（中文博客：Prisma 类型如何贯通前后端）

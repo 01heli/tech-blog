@@ -23,8 +23,11 @@ jobs:
             git fetch origin master
             git reset --hard origin/master
 
-            echo ">>> 构建并重启..."
-            docker compose up -d --build --force-recreate
+            echo ">>> 登录 GitHub Container Registry..."
+            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u 01heli --password-stdin
+
+            echo ">>> 拉取镜像并重启..."
+            docker compose up -d --pull always --force-recreate
 
             echo ">>> 清理旧镜像..."
             docker image prune -f
