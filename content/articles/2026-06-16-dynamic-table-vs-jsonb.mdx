@@ -1,0 +1,522 @@
+---
+title: 用户上传的 CSV 该存成 JSON 还是动态建表？一份给全栈开发者的数据库设计决策指南
+description: 从零讲清四种动态数据存储方案（JSONB、动态建表、EAV、混合模型）的优劣，附带 1500 万行数据的实测性能对比，帮助你在实际项目中做出正确选型。
+date: '2026-06-16'
+category: Database
+tags:
+  - PostgreSQL
+  - JSONB
+  - 数据库设计
+  - SaaS
+  - 全栈
+  - 性能优化
+featured: true
+---
+
+你做了一个数据平台产品。用户上传 CSV 文件，系统自动解析、存储，然后用户在界面上查询、制图、分析。
+
+第一个版本你写得很快——用户上传的 CSV 不管有多少列、什么类型，你全部塞进一个 JSONB 字段里。`{ "姓名": "张三", "年龄": 28, "部门": "研发部", "入职日期": "2023-05-10", ... }`。一行数据一个 JSONB 对象，一张表搞定所有用户的所有数据集。
+
+测试环境跑得挺好。上线第二周，运营团队导入了一份 50 万行的销售订单表。
+
+然后用户打开了数据看板页面。
+
+"销售额按月趋势图"——这个查询需要对 JSONB 里的 `销售额` 字段做 SUM，按 `订单日期` 字段做 GROUP BY。PostgreSQL 开始全表扫描 JSONB 列，解析每一行的 JSON 对象，提取两个字段，转类型，聚合。50 万行跑了 12 秒。
+
+用户又点了一下"按区域筛选"。又跑了 8 秒。
+
+你意识到一个问题：**JSONB 灵活是灵活，但灵活是有代价的。**
+
+要不要改成动态建表？每条 CSV 进来，自动建一张对应的 PostgreSQL 表，"销售额"列就是 decimal 类型，"订单日期"列就是 date 类型，原生 SQL 查询，性能拉满。
+
+但是你翻了一下 PostgreSQL 的文档——DDL 操作会锁表吗？一千个用户每人建 5 张表就是 5000 张表，数据库扛得住吗？如果用户上传的 CSV 结构经常变（今天多一列、明天少一列），怎么管理这些变更？
+
+这篇文章就是针对这个场景写的。我们不聊"最佳实践"这种空话，而是把这四种方案的原理、性能实测数据、适用边界、以及在一个真实数据平台项目中的选型逻辑全部讲清楚。
+
+## 问题定义：你到底在存什么
+
+先把问题说清楚。一个"用户自定义数据结构"的平台型系统，本质上要处理三类数据：
+
+```
+第一类：核心固定字段
+  不管用户导入什么数据，系统层面必须有这些字段：
+  id、创建时间、更新时间、所属用户（tenant_id）、所属数据集
+
+第二类：高频查询字段
+  用户的数据集中，大概率会出现这些字段：
+  销售额、订单日期、产品名称、区域、数量
+  这些字段会被频繁地 WHERE、GROUP BY、ORDER BY
+
+第三类：长尾自定义字段
+  某个用户特有的字段：
+  "产品经理的星座"、"客户的猫咪名字"、"供应商的微信备注"
+  几乎不会被查询条件用到
+```
+
+问题不是"这三类数据怎么存"，而是"**在你不知道第三类字段具体是什么的情况下，如何让第一类和第二类数据查询足够快，同时不限制第三类的灵活性。**"
+
+## 四种方案逐一拆解
+
+### 方案 A：JSONB 一把梭
+
+把所有动态字段打成一个 JSONB 对象，存在一个列里。
+
+```sql
+CREATE TABLE user_datasets (
+  id          BIGSERIAL PRIMARY KEY,
+  dataset_id  INTEGER NOT NULL,
+  tenant_id   INTEGER NOT NULL,
+  data        JSONB NOT NULL,     -- 所有动态数据都在这里
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- 插入一行
+INSERT INTO user_datasets (dataset_id, tenant_id, data)
+VALUES (1, 42, '{
+  "name": "iPhone 充电器",
+  "sku": "ANK-00123",
+  "price": 29.99,
+  "category": "充电配件",
+  "channel": "Amazon",
+  "region": "北美",
+  "sold_at": "2025-11-15",
+  "quantity": 1200,
+  "revenue": 35988.00
+}');
+```
+
+查询"北美区充电配件上月销售额 Top 5"：
+
+```sql
+SELECT
+  data->>'sku' AS sku,
+  data->>'name' AS product_name,
+  SUM((data->>'revenue')::numeric) AS total_revenue
+FROM user_datasets
+WHERE dataset_id = 1
+  AND data->>'region' = '北美'
+  AND data->>'category' = '充电配件'
+  AND (data->>'sold_at')::date BETWEEN '2025-10-01' AND '2025-10-31'
+GROUP BY data->>'sku', data->>'name'
+ORDER BY total_revenue DESC
+LIMIT 5;
+```
+
+这条 SQL 的问题清单：
+
+1. `data->>'region'` 每一次都要解析 JSON 对象，取出字符串
+2. `(data->>'revenue')::numeric` 先取字符串再转数字，类型转换吃 CPU
+3. `(data->>'sold_at')::date BETWEEN` 同样的问题——日期解析+比较
+4. 日期范围查询的索引几乎不可用（除非建表达式索引）
+
+**加索引能救吗？**
+
+能缓解，但有代价：
+
+```sql
+-- 给 region 字段建表达式索引
+CREATE INDEX idx_region ON user_datasets ((data->>'region'));
+
+-- 给 (dataset_id, region) 建复合索引
+CREATE INDEX idx_dataset_region ON user_datasets (dataset_id, (data->>'region'));
+
+-- GIN 索引支持包含运算
+CREATE INDEX idx_data_gin ON user_datasets USING GIN (data jsonb_path_ops);
+```
+
+表达式索引的问题：每加一个查询字段就要加一个索引，索引数量 = 查询字段数。而且每次写入 JSONB 时，所有 GIN 索引都要更新，写入性能会受影响。
+
+那性能到底差多少？来看一组实测数据。
+
+#### 1500 万行实测数据
+
+以下数据来自 Evolveum 团队对 PostgreSQL JSONB 和 EAV 模型的系统对比测试（2024 年发布）：
+
+| 操作 | JSONB + GIN 索引 | EAV 模型 | 差距 |
+|------|-----------------|----------|------|
+| 精确 ID 查询 | **0.32 ms** | 0.50 ms | JSONB 快 36% |
+| 按稀有值筛选（~5 万匹配） | **181 ms** | 1,965 ms | JSONB 快 **11 倍** |
+| 按常见值筛选（~340 万匹配） | **8,200 ms** | 17,465 ms | JSONB 快 **2 倍** |
+| 存储空间（1500 万行） | **1,927 MB** + 1,616 MB 索引 | 2,841 MB + 3,253 MB 索引 | JSONB 省 **40%** 空间 |
+
+所以 JSONB 其实没有想象中那么慢——在有正确索引的情况下，它比 EAV 模型快得多。但跟原生列（Typed Column）比呢？
+
+IEEE 的一篇基准测试论文（2024 年）给出了答案：
+
+> 对于 100 万行以上的表，原生类型列（Typed Column）的 B-Tree 索引查询性能比 JSONB 表达式索引快至少 20%。
+
+**结论**：JSONB + 表达式索引已经"够快"了——足够应对大部分中小规模场景。但如果你追求极致的读取性能（比如数据看板这种分析型负载），原生列仍然是最好的选择。
+
+#### JSONB 方案的优劣总结
+
+```
+优点：
+  极致灵活——用户加字段、减字段、改字段，数据库不需要任何 DDL
+  实现简单——一张表搞定，应用层代码少
+  存储紧凑——比 EAV 省 40% 空间
+  GIN 索引对 @> 包含查询效率很高
+  支持嵌套结构，数组和对象都能存
+
+缺点：
+  查询语法别扭——data->>'field' 不如原生 SQL 直观
+  类型不安全——"2025-01-01" 和 "2025年1月1日" 都能存进去，系统不报错
+  无外键约束——JSON 里的 user_id 无法约束它真的指向 users 表
+  聚合查询吃 CPU——SUM((data->>'amount')::numeric) 每一行都要解析+转换
+  索引膨胀——GIN 索引可能比表本身还大
+```
+
+---
+
+### 方案 B：动态建表
+
+"既然 JSONB 查询慢，那我干脆给每个用户的数据集建一张 PostgreSQL 原生表，字段类型精确匹配 CSV 的列类型。"
+
+```sql
+-- 用户上传了一个产品表（products），列是：
+--   name (文本), sku (文本), price (数字), category (文本), created_at (日期)
+
+-- 系统自动执行：
+CREATE TABLE ds_42_products (
+  id         BIGSERIAL PRIMARY KEY,
+  name       VARCHAR(255) NOT NULL,
+  sku        VARCHAR(100) NOT NULL,
+  price      DECIMAL(10,2),
+  category   VARCHAR(100),
+  created_at DATE
+);
+
+CREATE INDEX idx_ds42_products_category ON ds_42_products (category);
+CREATE INDEX idx_ds42_products_created_at ON ds_42_products (created_at);
+CREATE INDEX idx_ds42_products_price ON ds_42_products (price);
+```
+
+现在查询"北美区充电配件上月销售额 Top 5"变成了原生 SQL：
+
+```sql
+SELECT sku, name, SUM(price * quantity) AS revenue
+FROM ds_42_orders
+WHERE region = '北美'
+  AND category = '充电配件'
+  AND created_at BETWEEN '2025-10-01' AND '2025-10-31'
+GROUP BY sku, name
+ORDER BY revenue DESC
+LIMIT 5;
+```
+
+没有 `->>`、没有 `::numeric` 转换、B-Tree 索引完全生效。这在查询性能上是天花板。
+
+但代价呢？
+
+```
+缺点清单：
+
+1. DDL 事务风险
+   每次 CREATE TABLE 和 CREATE INDEX 都是一次 DDL 操作
+   PostgreSQL 中 DDL 是事务性的——一张大表的 DDL 可能锁住整个系统
+   如果用户在界面上点了"确认导入"，服务端要等 DDL 执行完才能返回响应
+
+2. 表数量爆炸
+   1000 个用户 × 平均 3 个数据集 = 3000 张表
+   PostgreSQL 的系统目录（pg_class、pg_attribute）存储了所有表和列的元数据
+   3000 张表意味着每次查询规划器（Query Planner）要搜索 3000 个条目
+   虽然 PostgreSQL 理论上支持数十亿张表，但实际经验是超过 1 万张表后
+   某些管理操作（如 VACUUM、pg_dump、autovacuum）会显著变慢
+
+3. Schema 变更噩梦
+   用户 A 的 products 表有 15 列，用户 B 的 products 表有 12 列
+   某天你要给所有 products 表加一个 "数据来源"字段
+   你需要找到所有名为 ds_*_products 的表，逐一 ALTER TABLE ADD COLUMN
+   有些表可能已经有这个字段，有些没有——你要处理这种不一致
+
+4. 连接池压力
+   每个连接都要加载一次表结构信息
+   表太多意味着连接初始化更慢
+   连接池中的连接复用效率降低
+
+5. 运维复杂度
+   pg_dump 导出变慢
+   监控和慢查询日志里多出几千张表名
+   新同事看数据库结构时毫无头绪
+```
+
+#### 动态建表什么时候用
+
+尽管有这些缺点，在以下场景中动态建表仍然是最佳选择：
+
+1. **数据集数量有限**（几十到几百），但每个数据集的数据量极大（千万行以上）且查询模式复杂
+2. **对数据完整性和类型安全有极高要求**（金融、医疗）
+3. **表结构基本稳定**，用户导入的 CSV 结构不会频繁变化
+4. **团队有成熟的自动化运维能力**，能处理动态 DDL 的监控和异常恢复
+
+---
+
+### 方案 C：EAV 模型（实体-属性-值）
+
+EAV 是老牌方案，90 年代就出现了。思路是把每一条扩展属性的值拆成一行：
+
+```sql
+-- 实体表
+CREATE TABLE entities (
+  id         BIGSERIAL PRIMARY KEY,
+  dataset_id INTEGER NOT NULL,
+  tenant_id  INTEGER NOT NULL
+);
+
+-- 值表
+CREATE TABLE attribute_values (
+  entity_id   INTEGER NOT NULL REFERENCES entities(id),
+  attr_name   VARCHAR(100) NOT NULL,
+  attr_value  TEXT,
+  PRIMARY KEY (entity_id, attr_name)
+);
+```
+
+插入刚才那条充电器数据：
+
+```sql
+-- 插入实体
+INSERT INTO entities VALUES (1, 1, 42);
+
+-- 插入 9 条属性值
+INSERT INTO attribute_values VALUES
+  (1, 'name', 'iPhone 充电器'),
+  (1, 'sku', 'ANK-00123'),
+  (1, 'price', '29.99'),
+  (1, 'category', '充电配件'),
+  (1, 'channel', 'Amazon'),
+  (1, 'region', '北美'),
+  (1, 'sold_at', '2025-11-15'),
+  (1, 'quantity', '1200'),
+  (1, 'revenue', '35988.00');
+```
+
+一条业务记录变成了 10 行数据库记录。查询 "sum(revenue) group by region" 需要先把 `region` 的值行和 `revenue` 的值行 PIVOT 回一行，再做聚合——这在 SQL 里写起来极其痛苦。
+
+从前面 1500 万行的实测数据可以看到，EAV 在存储和查询两个维度上都落后于 JSONB，差距在 2 到 11 倍之间。
+
+**EAV 的唯二优势**：
+1. 可以在值上附加元数据（谁填的、什么时候填的、数据来源），因为每个值都是一行
+2. 所有数据库都原生支持，不需要 JSON 相关特性
+
+对于大多数现代应用来说，EAV 已经不是首选项了。除非你有极强的值级审计需求（比如医疗记录中的每个字段都要追溯来源），否则 JSONB 或混合模型更好。
+
+---
+
+### 方案 D：混合模型（推荐的方案）
+
+核心思路简单到只有一句话：**高频字段用原生列，长尾字段用 JSONB。**
+
+```sql
+CREATE TABLE dataset_records (
+  id           BIGSERIAL PRIMARY KEY,
+  dataset_id   INTEGER NOT NULL,
+  tenant_id    INTEGER NOT NULL,
+
+  -- 系统字段（每行必有）
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  updated_at   TIMESTAMPTZ DEFAULT now(),
+
+  -- 智能识别出来的高频字段 → 原生列
+  name         VARCHAR(500),
+  sku          VARCHAR(200),
+  price        DECIMAL(12,2),
+  quantity     INTEGER,
+  category     VARCHAR(200),
+  channel      VARCHAR(100),
+  region       VARCHAR(100),
+  sold_at      DATE,
+  revenue      DECIMAL(14,2),
+
+  -- 其他所有字段 → JSONB 兜底
+  extra        JSONB DEFAULT '{}'
+);
+
+-- 高频字段建 B-Tree 索引
+CREATE INDEX idx_dr_category ON dataset_records (dataset_id, category);
+CREATE INDEX idx_dr_region ON dataset_records (dataset_id, region);
+CREATE INDEX idx_dr_sold_at ON dataset_records (dataset_id, sold_at);
+CREATE INDEX idx_dr_price ON dataset_records (dataset_id, price);
+CREATE INDEX idx_dr_revenue ON dataset_records (dataset_id, revenue);
+
+-- 长尾字段建 GIN 索引（只建一个，轻量）
+CREATE INDEX idx_dr_extra ON dataset_records USING GIN (extra jsonb_path_ops);
+```
+
+跟纯 JSONB 方案比，查询直接改成了原生 SQL：
+
+```sql
+-- 原先（JSONB 方案）：
+SELECT data->>'sku', SUM((data->>'revenue')::numeric)
+FROM user_datasets
+WHERE dataset_id = 1
+  AND data->>'region' = '北美'
+  AND data->>'category' = '充电配件'
+GROUP BY data->>'sku';
+
+-- 现在（混合方案）：
+SELECT sku, SUM(revenue)
+FROM dataset_records
+WHERE dataset_id = 1
+  AND region = '北美'
+  AND category = '充电配件'
+GROUP BY sku;
+```
+
+B-Tree 索引完全匹配，执行计划从"全表扫描 + Filter"变成"Index Scan"。
+
+而且 JSONB 仍然在那里——用户导入 CSV 时如果有一个"备注"列，系统不认识的字段全部进 `extra`。用户仍然可以按 `extra` 里的字段查询（只是比原生列慢一点），灵活性没丢。
+
+#### 混合模型的挑战：你怎么知道哪些是"高频字段"？
+
+这是混合模型唯一需要动脑子的地方。三种策略：
+
+**策略 1：人工标注（最可控）**
+
+在数据源管理界面，让用户把 CSV 的某些列标记为"常用字段"。系统建表时这些列走原生列，其余走 JSONB。
+
+**策略 2：自动推断（最智能）**
+
+解析 CSV 时自动做字段类型推断，同时按一套规则标记哪些字段应该原生化：
+
+```
+字符串字段，去重值 < 50 个 → 可能是分类字段 → 原生化
+数字字段 → 原生化（大概率要聚合）
+日期字段 → 原生化（大概率要范围查询）
+长文本字段 → JSONB（几乎不会被用来查询）
+去重值 > 1000 个的字符串 → JSONB（高基数，索引收益不大）
+```
+
+**策略 3：渐进式迁移（最务实）**
+
+第一版全部存 JSONB。上线后观察慢查询日志，看哪些 `data->>'xxx'` 的模式频繁出现在 WHERE 条件中。下次迭代时把这些字段 ALTER TABLE ADD COLUMN 迁移到原生列，后台异步回填历史数据。这样做的好处是：你不需要在第一天就猜对，你只需要在需要的时候改对。
+
+---
+
+## 四种方案决策矩阵
+
+| 维度 | JSONB 一把梭 | 动态建表 | EAV | 混合模型 |
+|------|-------------|---------|-----|---------|
+| 实现复杂度 | 低 | 极高 | 高 | 中 |
+| 查询性能 | 中等（表达式索引）| 极致 | 差 | 中等到优 |
+| 聚合分析 | 慢 | 极致 | 极慢 | 快（原生列上的聚合）|
+| 灵活性 | 极高 | 低 | 极高 | 高 |
+| 类型安全 | 弱 | 强 | 弱 | 中（原生列强，JSON 弱）|
+| 存储效率 | 中 | 优 | 差（数据膨胀 2-3x）| 良 |
+| DDL 变更频率 | 零 | 高 | 零 | 低 |
+| 多租户友好度 | 高 | 中（表数量爆炸）| 中 | 高 |
+| 运维复杂度 | 低 | 极高 | 低 | 低 |
+| 适合团队规模 | 小团队 | 大团队 | — | 任意 |
+| 1500万行首选 | 可以 | 推荐 | 不推荐 | 强烈推荐 |
+
+---
+
+## 一个真实场景的选型过程
+
+回到你正在做的 DataTalk 项目。核心需求是：
+
+1. 用户上传 CSV/Excel 文件
+2. 系统自动建表，支持用户自然语言查询（NL→SQL）
+3. 数据看板——聚合查询频繁
+4. 用户数初期很少（个位数），但单个数据集可能有几十万行
+5. 你只有 3 周时间交付核心功能
+
+第一步：排除 EAV。数据量大、聚合查询多、开发时间紧，EAV 在这三点上都是最差选择。
+
+第二步：排除动态建表。只有 3 周时间，你需要把精力花在 NL→SQL 引擎和看板渲染上，不值得花一半时间做 DDL 管理和 Schema 变更编排。而且初期用户少，表数量不会爆炸（但代码复杂度会），这是典型的"过度设计"。
+
+第三步：在 JSONB 和混合模型之间选。
+
+- 纯 JSONB：3 周能跑通，但 NL→SQL 引擎的质量会受影响（LLM 生成的 SQL 带 `->>` 操作符，比标准 SQL 更容易出错）
+- 混合模型：多花 2-3 天做字段推断和原生列映射，但 NL→SQL 引擎生成的 SQL 更简洁标准，LLM 正确率更高
+
+选混合模型。理由：
+
+1. **NL→SQL 的正确率是关键体验指标**。用户说"销售额 Top 5"，你生成的 SQL 如果是 `SUM((data->>'revenue')::numeric)` 而不是 `SUM(revenue)`，LLM 搞错的概率更高，用户体验就差一截。
+2. **聚合查询性能是核心指标**。看板页面每个图表都在做 GROUP BY + SUM，纯 JSONB 方案 50 万行跑 12 秒，混合方案 1 秒以内。
+3. **渐进式实现不增加太多工作量**。第一版可以识别 5-8 个最常见的字段类型（数字、日期、金额、分类），其余兜底 JSONB。第二版再增强字段推断的准确率。
+
+## 运维避坑指南
+
+不论选哪种方案，这几个坑先知道能省你很多时间。
+
+**坑一：JSONB GIN 索引的大小**
+
+一个 10GB 的表，建 `GIN (data jsonb_ops)` 索引可能再吃掉 8-9GB 磁盘。用 `jsonb_path_ops` 代替 `jsonb_ops` 可以缩小约 30%，代价是不支持键存在性查询（`?`、`?|`、`?&` 操作符）。如果你只用 `@>` 做包含查询，一定要用 `jsonb_path_ops`。
+
+**坑二：表达式索引的 NULL 问题**
+
+```sql
+CREATE INDEX idx_region ON user_datasets ((data->>'region'));
+```
+
+如果 `data->>'region'` 返回 NULL（JSON 对象中没有 region 键），这一行不会进索引。查询 `WHERE data->>'region' = '北美'` 不会用到这个索引——PostgreSQL 认为 NULL 不在索引中，可能走全表扫描。解决方案是建索引时加 `WHERE (data->>'region') IS NOT NULL` 过滤条件。
+
+**坑三：DDL 在 PostgreSQL 中的事务行为**
+
+PostgreSQL 中大多数 DDL（CREATE TABLE、ALTER TABLE ADD COLUMN）是事务性的——你可以把它们包在 BEGIN...COMMIT 中。但 `CREATE INDEX CONCURRENTLY` 必须独立于事务执行（它内部使用多个事务）。如果你的动态建表流程包含 CONCURRENTLY 创建索引，确保不要在同一个事务中调用它。
+
+**坑四：类型转换吃掉索引**
+
+```sql
+WHERE (data->>'amount')::numeric > 100  -- 索引失效
+WHERE (data->>'sold_at')::date = '2025-01-01'  -- 索引失效
+```
+
+`::numeric` 和 `::date` 类型转换会让表达式索引失效。解决方案是用 PostgreSQL 的 Generated Column 把 JSON 字段物化为真实列：
+
+```sql
+ALTER TABLE user_datasets
+  ADD COLUMN amount_num numeric
+  GENERATED ALWAYS AS ((data->>'amount')::numeric) STORED;
+
+CREATE INDEX idx_amount ON user_datasets (amount_num);
+```
+
+这样查询 `WHERE amount_num > 100` 就能正常走 B-Tree 索引了。
+
+**坑五：JSONB 写多读少的场景**
+
+如果你的系统是日志收集类应用（大量写入、偶尔查询），JSON 类型（非 JSONB）可能更适合——JSON 只是存储文本，写入时不做 binary 转换，写入速度比 JSONB 快约 2 倍。但代价是每次读取都要重新解析文本，查询比 JSONB 慢 7-8 倍。
+
+## 总结
+
+回到最初的问题：用户上传的 CSV，该存成 JSONB 还是动态建表？
+
+答案不是二选一。**把数据分类——那些"不确定是什么但几乎不会被查"的字段放 JSONB，那些"你确定会被查且会被聚合"的字段放原生列。** 这不是某种技术的胜利，而是在灵活性和性能之间的工程权衡。
+
+```
+开始前先回答三个问题：
+
+1. 你的查询模式是什么？
+   → 主要是全文搜索/文档查询 → JSONB
+   → 主要是聚合分析（SUM、GROUP BY）→ 原生列为主
+
+2. 你的用户数据会长成什么样？
+   → 每个用户字段差异极大 → JSONB 为主
+   → 大部分用户的字段相似 → 混合模型，原生列主导
+
+3. 你的团队和时间？
+   → 一个人三周 → JSONB 或混合，不要碰动态建表和 EAV
+   → 一个团队三个月 → 混合 + 自动化 DDL 管理
+```
+
+如果你是后端开发者，下次设计"用户自定义字段"时，不要一上来就建 JSONB 列然后心里默念"后面再优化"。花 10 分钟列一下用户最可能查询的 Top 5 字段，把它们设计成原生列——这 10 分钟的分量，在数据量涨到 100 万行之后会显现出来。
+
+如果你是前端/全栈开发者，理解这个选型对你写 NL→SQL 引擎有直接影响。LLM 生成 `WHERE region = '北美'` 的正确率远高于 `WHERE data->>'region' = '北美'`。**数据库 Schema 设计的质量，直接决定了你的 Prompt Engineering 的上限。**
+
+---
+
+## 参考资料
+
+- [Evolveum — Comparing JSONB and EAV model for extensions](https://docs.evolveum.com/midpoint/projects/midscale/design/repo/repository-json-vs-eav/)（1500 万行数据下 JSONB 与 EAV 的全面性能对比，包含存储空间和查询响应时间的详细实测数据）
+- [IEEE Dataport — PostgreSQL JSONB-based vs Typed-column Indexing Benchmark](https://ieee-dataport.org/documents/postgresql-jsonb-based-vs-typed-column-indexing-benchmark-read-queries)（IEEE 发表的 JSONB 表达式索引 vs 原生类型列索引的读查询基准测试，结论是原生列至少快 20%）
+- [PostgreSQL JSONB Indexing for Multi-Tenant AI Feature Metadata](https://dev.to/uaslimcreate/postgresql-jsonb-indexing-for-multi-tenant-ai-feature-metadata-querying-100k-feature-configs-3hno)（多租户场景下 10 万条配置数据的 JSONB GIN 索引实操指南）
+- [PostgreSQL Wiki — JSONB is not for free](https://folio-org.atlassian.net/wiki/pages/viewpage.action?pageId=1379643)（FOLIO 项目在 1110 万行 MARC 记录的 JSONB 查询性能分析和索引选择经验）
+- [JusDB — PostgreSQL JSONB vs JSON: Performance, Indexing, and Operator Guide](https://www.jusdb.com/blog/postgresql-jsonb-vs-json-performance-indexing)（JSON vs JSONB 的写入/读取/索引全面对比）
+- [Prisma Schema Design: Relationships, Enums, and Indexes That Scale](https://dev.to/whoffagents/prisma-schema-design-relationships-enums-and-indexes-that-scale-9gm)（Prisma ORM 中 Schema 设计的最佳实践，含索引策略）
+- [阿里云开发者 — 数据库中动态列的几种设计思路](https://developer.aliyun.com/article/1001647)（中文文章：动态列的四种实现方案对比，含存储结构图）
+- [JavaGuidePro — 如何设计数据库以支持动态数据模型：技术与实践指南](https://javaguidepro.com/blog/ru-he-she-ji-shu-ju-ku-yi-zhi-chi-dong-tai-shu-ju-mo-xing/)（中文文章：从需求到落地覆盖 JSONB/EAV/动态建表/NoSQL 四种方案的设计细节）
+- [DZone — Custom Attributes in Relational Databases](https://dzone.com/articles/custom-attributes-in-relational-databases)（关系型数据库中自定义属性字段的经典方案综述）
+- [高可扩展属性建模设计：架构师的全局思考与落地方案](https://blog.csdn.net/u010362741/article/details/149127145)（中文架构师视角的属性建模方案，含混合模型的实际落地细节）
+- [PostgreSQL 官方文档 — jsonb 数据类型](https://www.postgresql.org/docs/current/datatype-json.html)（PostgreSQL JSONB 类型的官方完整文档）
+- [PostgreSQL 官方文档 — GIN 索引](https://www.postgresql.org/docs/current/gin.html)（GIN 索引的官方说明，含 jsonb_ops 和 jsonb_path_ops 的区别）
