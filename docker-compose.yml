@@ -1,7 +1,7 @@
 
 services:
   blog:
-    image: ghcr.io/01heli/tech-blog:latest
+    image: registry.cn-hangzhou.aliyuncs.com/tech-blog/tech-blog:latest
     container_name: tech-blog-app
     expose:
       - "3000"

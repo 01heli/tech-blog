@@ -5,6 +5,10 @@ on:
     branches: [master]
   workflow_dispatch:
 
+env:
+  REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  NAMESPACE: tech-blog
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -15,25 +19,25 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          command_timeout: 15m
+          command_timeout: 5m
           script: |
             set -e
             cd /root/tech_blog/tech-blog
 
-            echo ">>> 拉取最新代码..."
+            echo ">>> [$(date '+%H:%M:%S')] 拉取最新代码..."
             git fetch origin master
             git reset --hard origin/master
 
-            echo ">>> 登录 GitHub Container Registry..."
-            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u 01heli --password-stdin
+            echo ">>> [$(date '+%H:%M:%S')] 登录阿里云 ACR..."
+            echo "${{ secrets.ACR_PASSWORD }}" | docker login registry.cn-hangzhou.aliyuncs.com -u "${{ secrets.ACR_USERNAME }}" --password-stdin
 
-            echo ">>> 拉取镜像..."
+            echo ">>> [$(date '+%H:%M:%S')] 拉取镜像..."
             docker compose pull
 
-            echo ">>> 重启服务..."
+            echo ">>> [$(date '+%H:%M:%S')] 重启服务..."
             docker compose up -d --force-recreate
 
-            echo ">>> 清理旧镜像..."
+            echo ">>> [$(date '+%H:%M:%S')] 清理旧镜像..."
             docker image prune -f
 
-            echo ">>> 部署完成!"
+            echo ">>> [$(date '+%H:%M:%S')] 部署完成!"
