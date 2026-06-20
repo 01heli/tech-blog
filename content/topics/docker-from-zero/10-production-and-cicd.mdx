@@ -1,0 +1,367 @@
+---
+title: "Docker 在生产环境：CI/CD 集成、镜像仓库与监控"
+description: "单机 docker run 只是开始。生产环境需要自动化构建、镜像仓库管理、零停机部署、日志收集和监控告警。理解 Docker 在 CI/CD 中的位置，学会用 Docker 驱动持续交付流水线。"
+order: 10
+---
+
+## 一、从"手工 docker build"到"自动构建推送"
+
+你现在已经会用 Docker 了——写好 Dockerfile，`docker build`，`docker run`，一切正常。但生产环境不是这样运作的。
+
+```
+开发环境（你的笔记本）：                生产环境：
+  docker build                          git push
+  docker run                            ↓
+  docker compose up                  CI 自动构建镜像
+  "能跑就行"                          ↓
+                                   镜像推送到 Registry
+                                        ↓
+                                   CD 自动部署到服务器
+                                        ↓
+                                   监控 + 告警
+```
+
+这一章串起 Docker 在 CI/CD 流水线中的角色。
+
+---
+
+## 二、镜像仓库（Registry）：镜像的"GitHub"
+
+### 2.1 公共 vs 私有仓库
+
+```bash
+# Docker Hub（公共，官方默认）
+docker tag my-app:v1 yourusername/my-app:v1
+docker push yourusername/my-app:v1
+docker pull yourusername/my-app:v1
+
+# 私有仓库常见方案：
+# · Docker Hub Private Repos（个人/小团队，免费 1 个私有仓库）
+# · GitHub Container Registry (ghcr.io)（GitHub 用户免费）
+# · AWS ECR（AWS 生态首选）
+# · Harbor（企业自建，有漏洞扫描、RBAC、镜像复制）
+# · GitLab Container Registry（GitLab 内置）
+```
+
+### 2.2 登录和推送
+
+```bash
+# Docker Hub
+docker login
+docker tag my-app:v1.0.0 myusername/my-app:v1.0.0
+docker push myusername/my-app:v1.0.0
+
+# GitHub Container Registry
+echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+docker tag my-app:v1.0.0 ghcr.io/myusername/my-app:v1.0.0
+docker push ghcr.io/myusername/my-app:v1.0.0
+
+# AWS ECR
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin 123456789.dkr.ecr.us-east-1.amazonaws.com
+docker tag my-app:v1.0.0 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:v1.0.0
+docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app:v1.0.0
+```
+
+### 2.3 镜像标签策略
+
+```
+不要这样打标签：                  应该这样：
+my-app:latest                     my-app:v2.1.0
+my-app:v2                         my-app:v2.1.0-abc1234（Git commit SHA）
+                                  my-app:v2.1.0-20260620（构建日期）
+                                  my-app:v2.1（语义版本的大版本）
+
+latest 的问题：
+  · 不知道具体是什么版本——3 个月后你想回滚，不知道 latest 当时是什么
+  · 两个 Node 上的 latest 可能不一样——镜像被更新过但没同步
+```
+
+> **用 Git commit SHA 做标签的一部分。** 当生产环境出问题时，你能从标签直接找到对应的代码版本——这是可回溯的基础。
+
+---
+
+## 三、CI/CD 流水线中的 Docker
+
+### 3.1 GitHub Actions 示例
+
+```yaml
+# .github/workflows/build-and-deploy.yml
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /opt/myapp
+            docker compose pull api
+            docker compose up -d --no-deps api
+            docker image prune -af
+```
+
+### 3.2 Docker Buildx：多平台构建
+
+```bash
+# 创建跨平台构建器
+docker buildx create --name multi-arch --use
+
+# 构建 amd64 + arm64 镜像（适用于 Intel Mac 和 Apple Silicon Mac）
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t myusername/my-app:v1.0.0 \
+  --push .
+
+# 常用平台组合
+# linux/amd64  → Intel/AMD 服务器、传统 PC
+# linux/arm64  → Apple Silicon Mac、树莓派 4/5、AWS Graviton
+```
+
+### 3.3 构建缓存优化
+
+```yaml
+# GitHub Actions 中使用 buildx 缓存
+- uses: docker/build-push-action@v6
+  with:
+    cache-from: type=gha        # 从 GitHub Actions 缓存读取
+    cache-to: type=gha,mode=max # 写入缓存（包含所有层的缓存）
+```
+
+CI 中构建镜像最大的痛点是慢——每次构建都从头下载依赖。Buildx + GitHub Actions 缓存可以把依赖安装层的构建缩短到几秒。
+
+---
+
+## 四、零停机部署
+
+### 4.1 docker compose up 的滚动更新
+
+```bash
+# 更新镜像后平滑重启（不中断服务）
+docker compose pull api              # 拉取新镜像
+docker compose up -d --no-deps api   # 只重建 api 服务
+
+# Compose 默认行为：先启动新容器，健康检查通过后，停掉旧容器
+# 整个过程服务不中断
+```
+
+### 4.2 Nginx 反代 + 多副本平滑切换
+
+```
+                  ┌───────────────────┐
+                  │      Nginx        │
+                  │  upstream api {   │
+                  │    server :5001;  │
+                  │    server :5002;  │  ← 两个 api 实例
+                  │  }                │
+                  └───┬───────┬───────┘
+                      │       │
+              ┌───────▼─┐ ┌───▼───────┐
+              │ api:5001│ │ api:5002  │
+              │ (蓝色)   │ │ (绿色)    │
+              └─────────┘ └───────────┘
+
+更新流程：
+1. 停 api:5001 → Nginx 自动把流量全转到 api:5002（服务不中断）
+2. 更新 api:5001 的镜像 → 启动 → 健康检查通过
+3. Nginx 把流量分回 api:5001
+4. 对 api:5002 重复 1-3
+```
+
+这就是经典的**蓝绿部署**或**滚动更新**。在 Kubernetes 中这是 Deployment 的原生能力，在 Docker Compose 中可以配合 Nginx 手动实现。
+
+---
+
+## 五、日志管理
+
+```bash
+# 默认日志驱动：json-file
+docker logs my-app
+
+# 推荐：把日志发送到集中收集系统
+# 方式 1：应用直接输出到 stdout/stderr，Docker 收集，再转发
+docker run --log-driver=fluentd \
+  --log-opt fluentd-address=localhost:24224 \
+  --log-opt tag=myapp.{{.Name}} \
+  my-app:v1
+
+# 方式 2（更推荐）：应用输出到 stdout/stderr，用 Docker 日志驱动转发到 Loki/ELK
+# Docker Compose 中配置
+services:
+  api:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"      # 最多保留 3 个日志文件，自动轮转
+```
+
+> **不要把日志写在容器里的文件里。** 遵循 Twelve-Factor App 的原则——日志输出到 stdout/stderr。Docker 会收集所有 stdout/stderr，你只需要配置 Docker 的日志驱动把这些日志发送到集中管理系统（ELK、Loki、Datadog）。
+
+---
+
+## 六、Docker 监控
+
+### 6.1 基础监控：docker stats 和 Prometheus
+
+```bash
+# 实时资源使用
+docker stats
+
+# 启用 Docker 的 Prometheus 指标暴露
+# 在 /etc/docker/daemon.json 中添加：
+{
+  "metrics-addr": "127.0.0.1:9323",
+  "experimental": true
+}
+
+# 重启 Docker
+sudo systemctl restart docker
+
+# 验证
+curl localhost:9323/metrics
+# 输出：docker 引擎和容器的 Prometheus 格式指标
+# engine_daemon_container_actions_seconds_bucket{action="start"}
+# container_cpu_usage_seconds_total{name="my-app"}
+# ...
+```
+
+### 6.2 cAdvisor：Google 的容器监控工具
+
+```bash
+# cAdvisor 自动收集所有容器的 CPU、内存、网络、磁盘指标
+docker run -d --name cadvisor \
+  -p 8081:8080 \
+  -v /:/rootfs:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /sys:/sys:ro \
+  -v /var/lib/docker:/var/lib/docker:ro \
+  gcr.io/cadvisor/cadvisor:latest
+
+# 浏览器打开 http://localhost:8081
+# 看到每个容器的实时 CPU、内存、网络、磁盘使用图表
+
+# 配合 Prometheus + Grafana：
+# Prometheus 从 cAdvisor 抓指标 → Grafana 展示面板
+```
+
+### 6.3 关键告警指标
+
+| 指标 | 告警条件 | 说明 |
+|------|---------|------|
+| 容器 CPU 使用率 | > 80% for 5min | 应用可能需要扩容 |
+| 容器内存使用率 | > 85% | 接近 OOM 边界 |
+| 容器重启次数 | > 3 次/小时 | 应用不断崩溃 |
+| 宿主机磁盘使用率 | > 80% | Docker 镜像/卷可能占满磁盘 |
+| 镜像漏洞数 | > 0 CRITICAL | 新扫描到严重漏洞 |
+| 容器停止运行 | 核心服务停止 | 立即告警 |
+
+---
+
+## 七、运维日常速查
+
+```bash
+# 磁盘清理（Docker 会悄悄吃磁盘空间）
+docker system df                        # 看 Docker 占了多少空间
+docker system prune -a -f               # 清理一切未使用的镜像/容器/网络
+docker system prune -a -f --volumes     # 加上未使用的卷（数据也删了！慎用）
+
+# 批量操作
+docker stop $(docker ps -q)             # 停止所有运行中的容器
+docker rm $(docker ps -aq)              # 删除所有已停止的容器
+docker rmi $(docker images -q -f "dangling=true")  # 删除无标签的悬空镜像
+
+# 查看 Docker Engine 日志
+sudo journalctl -u docker -f
+
+# 限制 Docker 的总资源
+# /etc/docker/daemon.json
+{
+  "default-ulimits": {
+    "nofile": { "Name": "nofile", "Hard": 64000, "Soft": 64000 }
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  }
+}
+```
+
+---
+
+## 八、学完这套专题后，下一步学什么？
+
+这 10 章带你从"容器是什么"走到了"容器在生产环境怎么跑"。Docker 本身是一个单机工具，当你需要跨多台服务器管理容器时，就进入了**容器编排**的领域：
+
+- **Kubernetes**：容器编排的事实标准。当你需要跨 10+ 台服务器管理几百个容器、自动扩缩容、滚动更新、服务发现——这就是 K8s 做的事。本博客已有完整的 [K8s 从零专题](/topics/k8s-from-zero)。
+- **Docker Swarm**：Docker 原生的轻量级编排方案。用 `docker service` 和 `docker stack` 在几台机器上编排容器——比 K8s 简单得多，适合不想学 K8s 的小团队。
+- **Podman**：Red Hat 推动的无守护进程容器引擎——不需要 Docker 守护进程，可以用 rootless 模式运行。如果你的公司要求不用 Docker（许可证顾虑），Podman 是首选替代。
+- **Buildpacks / Jib / Ko**：如果写 Dockerfile 太繁琐，这些工具可以从源码直接生成符合最佳实践的 Docker 镜像——不需要写 Dockerfile。
+
+但对于大多数开发者来说，**先把本专题的 10 章内容吃透，你已经能从零构建、优化、部署、监控容器化应用了。**
+
+---
+
+## 参考资料
+
+- [Docker 官方文档](https://docs.docker.com/)（Docker 权威参考，涵盖安装、Dockerfile、Compose、Swarm 等所有主题）
+- [Dockerfile 最佳实践 (Docker 官方)](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/)（本章第 8 章的核心参考，Docker 官方对镜像构建的建议）
+- [Docker 安全 (Docker 官方)](https://docs.docker.com/engine/security/)（本章第 9 章的核心参考，seccomp、AppArmor、Capability 的官方文档）
+- [Docker Buildx 官方文档](https://docs.docker.com/buildx/working-with-buildx/)（多平台构建、远程构建、构建缓存的完整指南）
+- [Trivy (Aqua Security)](https://github.com/aquasecurity/trivy)（开源容器镜像漏洞扫描器，支持 CI 集成）
+- [Docker Scout](https://docs.docker.com/scout/)（Docker 内置的镜像分析和漏洞扫描工具）
+- [cAdvisor (Google)](https://github.com/google/cadvisor)（Google 开源的容器资源监控工具，自动收集所有容器的 CPU/内存/磁盘/网络指标）
+- [Play with Docker](https://labs.play-with-docker.com/)（浏览器中的 Docker 实验环境，免费、无需安装，适合初学者练习）
+- [Docker Compose 官方文档](https://docs.docker.com/compose/)（Compose 的完整配置项参考，覆盖 service、network、volume、secret、config 等全部特性）
+- [十二要素应用 (12-Factor App)](https://12factor.net/zh_cn/)（云原生应用的方法论，Docker 日志管理、环境变量、配置分离的思想来源）
+- [Docker 的容器网络模型 (CNM)](https://docs.docker.com/network/)（Docker 网络架构的底层设计文档，理解 Bridge、Overlay、Macvlan 的权威来源）
+- [OCI 镜像规范](https://github.com/opencontainers/image-spec)（开放容器倡议的镜像标准，理解 Docker 镜像格式的底层定义）
+- [GitHub Actions: docker/build-push-action](https://github.com/docker/build-push-action)（GitHub Actions 中构建推送 Docker 镜像的官方 Action，CI/CD 集成参考）

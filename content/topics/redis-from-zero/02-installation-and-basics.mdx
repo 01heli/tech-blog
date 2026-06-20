@@ -1,0 +1,264 @@
+---
+title: "环境搭建与基础操作：装上 Redis，先玩 20 个命令"
+description: "在本地装上 Redis，用 redis-cli 和它对话。搞懂 Key 的命名规范、过期时间、基础原子操作，理解 Redis 每个命令都是原子的这一核心特性。"
+order: 2
+---
+
+## 一、安装 Redis
+
+### 1.1 Mac
+
+```bash
+brew install redis
+brew services start redis     # 后台启动
+
+# 验证
+redis-cli ping                # 预期输出: PONG
+```
+
+### 1.2 Linux (Ubuntu/Debian)
+
+```bash
+# 方式 1：apt 安装（版本可能较旧）
+sudo apt update
+sudo apt install redis-server -y
+sudo systemctl start redis-server
+
+# 方式 2：源码编译安装最新版
+wget https://download.redis.io/redis-stable.tar.gz
+tar xzf redis-stable.tar.gz
+cd redis-stable
+make -j$(nproc)
+sudo make install
+```
+
+### 1.3 Windows
+
+Redis 官方不直接支持 Windows，但有几种替代方案：
+
+```powershell
+# 方式 1：WSL2（推荐）
+# 在 WSL2 的 Ubuntu 中按上面的 Linux 方式安装
+wsl --install -d Ubuntu
+# 然后在 WSL2 中执行 apt install redis-server
+
+# 方式 2：Docker
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+
+# 方式 3：Memurai（Redis 的 Windows 兼容版）
+# https://www.memurai.com/
+```
+
+### 1.4 Docker（所有平台通用）
+
+```bash
+# 拉取并启动 Redis 7
+docker run -d --name redis-dev -p 6379:6379 redis:7-alpine
+
+# 进入容器内的 redis-cli
+docker exec -it redis-dev redis-cli
+
+# 带密码启动
+docker run -d --name redis-dev -p 6379:6379 \
+  redis:7-alpine redis-server --requirepass mypassword
+```
+
+---
+
+## 二、redis-cli：你和 Redis 的对话窗口
+
+`redis-cli` 是 Redis 自带的命令行客户端。整个学习过程中，你会频繁用到它：
+
+```bash
+# 连接本地 Redis
+redis-cli
+
+# 连接远程 Redis
+redis-cli -h 10.0.1.5 -p 6379
+
+# 带密码连接
+redis-cli -a mypassword
+
+# 连接 Redis Cluster
+redis-cli -c -h 10.0.1.5 -p 7000
+
+# 执行单条命令后退出（适合脚本里用）
+redis-cli SET counter 0
+
+# 监控 Redis 正在处理的每一条命令（调试利器）
+redis-cli MONITOR
+```
+
+---
+
+## 三、Key：所有操作的基础
+
+Redis 里的一切都通过 Key 来访问。Key 的命名不是随意的——一个好的命名规范能让你省掉无数调试时间。
+
+```
+推荐的 Key 命名规范（<业务>:<实体>:<属性>）：
+
+user:1001:profile           →  用户 1001 的个人信息
+product:2025:stock          →  商品 2025 的库存
+order:50001:status          →  订单 50001 的状态
+session:a1b2c3d4            →  Session ID
+cache:hot-products:page1    →  热门商品第一页的缓存
+counter:likes:article:888   →  文章 888 的点赞数
+```
+
+**反例（不要这样写）：**
+
+```
+user1001                   → 一眼看不出是什么
+a                         → 过五分钟你自己也不知道这是什么
+user:1001:profile:2025:v2 → 太长了，浪费内存
+user:1001:profile          → 汉字或空格在 Key 里，出问题时排查困难
+```
+
+Key 的常用操作：
+
+```bash
+# 查看所有 Key（生产环境禁用——它会遍历整个 Key 空间，可能阻塞几秒到几十秒）
+KEYS user:*            # 查看所有 user 开头的 Key
+
+# 更好的做法（生产环境用 SCAN）
+SCAN 0 MATCH user:* COUNT 100   # 每次返回一批，不阻塞
+
+# 判断 Key 是否存在
+EXISTS user:1001:profile        # 返回 1 存在，0 不存在
+
+# 查看 Key 的类型
+TYPE user:1001:profile          # 返回 string / list / set / hash / zset / none
+
+# 删除 Key
+DEL user:1001:profile           # 同步删除
+UNLINK user:1001:profile        # 异步删除（Redis 4.0+，大 Key 推荐用这个）
+
+# 设置过期时间
+EXPIRE user:1001:token 3600     # 3600 秒后自动删除
+TTL user:1001:token             # 查看剩余秒数（-1 永不过期，-2 已过期）
+
+# 重命名
+RENAME old_key new_key          # 注意：如果 new_key 已存在会被覆盖
+RENAMENX old_key new_key        # 仅在 new_key 不存在时才重命名
+```
+
+> **KEYS vs SCAN**：KEYS 会在命令执行期间阻塞整个 Redis。如果数据库里有 1000 万个 Key，KEYS 可能要跑十几秒，这段时间内所有来自客户端的请求都在排队等待。SCAN 是增量迭代——每次返回一小批，不会长时间阻塞。**生产环境的唯一选择是 SCAN。**
+
+---
+
+## 四、String：最基本但最滥用的类型
+
+String 是 Redis 最基础的类型——一个 Key 对应一个字符串值。但别被"字符串"这个名字限制住了：它可以存数字、JSON、序列化对象、甚至是二进制数据。
+
+```bash
+# 基本读写
+SET product:2025:name "蓝牙降噪耳机 Pro Max"
+GET product:2025:name                    # "蓝牙降噪耳机 Pro Max"
+
+# 带过期时间的设置（原子操作，SET + EXPIRE 合二为一）
+SET verification:13900001111 "382619" EX 300   # 验证码 5 分钟过期
+
+# 只在 Key 不存在时设置（分布式锁的核心指令）
+SETNX lock:order:50001 "server-3"       # 返回 1（设置成功）
+SETNX lock:order:50001 "server-5"       # 返回 0（Key 已存在，设置失败）
+
+# 数字操作（原子递增/递减）
+INCR counter:likes:article:888          # 点赞数 +1，返回新值
+INCRBY product:2025:stock -1            # 库存 -1
+INCRBY user:1001:balance 5000         # 余额 +5000
+
+# 获取旧值同时设置新值
+GETSET temp:token "new-token"           # 返回旧 token
+
+# 批量操作（减少网络往返次数）
+MSET user:1:name "张三" user:1:age "28" user:1:city "上海"
+MGET user:1:name user:1:age user:1:city    # 返回 ["张三", "28", "上海"]
+```
+
+**String 类型的核心应用场景：**
+
+| 场景 | 用法 | 命令 |
+|------|------|------|
+| 缓存数据 | JSON 字符串存缓存 | `SET` / `GET` + `EXPIRE` |
+| 计数器 | 原子自增 | `INCR` / `INCRBY` |
+| 分布式锁 | 互斥设置 | `SETNX` + `EXPIRE` |
+| 限流 | 滑动窗口计数 | `INCR` + `EXPIRE` |
+| 全局唯一 ID | 原子自增生成 | `INCR` |
+| 短信验证码 | 临时存储 | `SET ... EX 300` |
+
+---
+
+## 五、Key 的过期策略：Redis 怎么清理过期数据
+
+设置了过期时间的 Key，Redis 怎么删掉它？不是你设了 `EXPIRE` 就立刻删——Redis 用了三种策略组合：
+
+### 5.1 惰性删除（Lazy Expiration）
+
+当你访问一个 Key 时，Redis 会检查它是否过期。过期了就顺手删掉，返回空。
+
+```
+GET user:1001:token   →  Redis 内部检查：已过期 → 删除 + 返回 nil
+```
+
+这个方式零开销，但如果一个过期的 Key 再也没人访问，它就会一直占着内存。
+
+### 5.2 定期删除（Active Expiration）
+
+Redis 每隔 100ms（默认 `hz=10`，即每秒 10 次）随机抽取一批设置了过期时间的 Key，检查并删除过期的。每次抽查的量不大，保证不长时间阻塞。
+
+### 5.3 内存淘汰（Eviction）
+
+如果上面两种策略还是没来得及清理，内存满了怎么办？Redis 会按照配置的 **maxmemory-policy** 来驱逐 Key：
+
+| 策略 | 行为 | 适用场景 |
+|------|------|---------|
+| `noeviction` | 返回错误，不删任何 Key | 数据绝对不能丢 |
+| `allkeys-lru` | 从所有 Key 中淘汰最近最少用的 | **缓存场景首选** |
+| `allkeys-lfu` | 从所有 Key 中淘汰最不常用的 | 热点数据明显的缓存 |
+| `volatile-lru` | 从有过期时间的 Key 中淘汰最近最少用的 | 混合场景 |
+| `volatile-ttl` | 从有过期时间的 Key 中淘汰最快过期的 | 业务有自然时效要求 |
+| `allkeys-random` | 随机淘汰 | 访问模式均匀 |
+
+```bash
+# 查看当前配置
+CONFIG GET maxmemory-policy
+
+# 设置为 allkeys-lru（缓存场景推荐）
+CONFIG SET maxmemory-policy allkeys-lru
+
+# 设置最大内存（redis.conf 或运行时设置）
+CONFIG SET maxmemory 2gb
+```
+
+> **对缓存场景来说，用 `allkeys-lru` 是最安全的选择。** 它会优先淘汰"最近没被访问的"——这符合缓存的自然规律：冷数据优先被清退，热数据尽量保留。
+
+---
+
+## 六、找个地方试试：搭建一个简单的访问计数器
+
+用刚才学的东西，花 5 分钟做一个最简单的计数器：
+
+```bash
+# 场景：统计网站今天的访客数
+# 每天一个 Key，直接自增
+
+# 记录一次访问
+INCR site:visitors:20260620
+
+# 查看今天的访客数
+GET site:visitors:20260620
+
+# 设置当天结束自动过期（当天剩余的秒数）
+EXPIRE site:visitors:20260620 86400
+
+# 记录每个页面的访问量
+INCR page:homepage:20260620
+INCR page:product-detail:20260620
+INCR page:checkout:20260620
+
+# 同时查看多个页面的访问量
+MGET page:homepage:20260620 page:product-detail:20260620 page:checkout:20260620
+```
+
+这就是 Redis 入门了。但到现在为止，我们只用到了 String 类型——Redis 真正的威力在它丰富的数据结构上。下一章，我们逐一拆解 List、Set、Hash、Sorted Set，看看它们各自解决了什么问题。

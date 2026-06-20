@@ -1,0 +1,389 @@
+---
+title: "K8s 生产最佳实践：资源、安全、网络与可观测性"
+description: "把应用从'能跑'升级到'生产可用'的完整清单。涵盖 PodSecurity、NetworkPolicy、RBAC、HPA、PodDisruptionBudget 和 Prometheus 监控体系——这是一篇你上线前必须逐条核对的检查清单。"
+order: 10
+---
+
+## 一、从"能跑"到"生产可用"有多远？
+
+让一个应用在 K8s 上跑起来不难。但"能跑"和"生产可用"之间隔了一整套工程规范——就像在驾校操场绕圈和上高速的区别。这一章不讲新概念，而是把前面九章学到的所有知识点串成一条生产级的部署清单。
+
+---
+
+## 二、安全：最小权限原则
+
+### 2.1 Pod Security Standards (PSS)
+
+K8s 1.25 以后，PodSecurityPolicy (PSP) 被正式移除，取而代之的是 Pod Security Standards。命名空间有三个级别：
+
+| 级别 | 含义 | 允许的操作 |
+|------|------|-----------|
+| **privileged** | 无限制 | 可以跑任何东西（慎用） |
+| **baseline** | 基本安全 | 禁止 hostPath、hostPort、privileged 容器 |
+| **restricted** | 严格限制 | 在 baseline 基础上还要 non-root 用户、只读根文件系统、禁止能力提升 |
+
+```yaml
+# 给命名空间打标签启用 PSS
+kubectl label ns production pod-security.kubernetes.io/enforce=restricted
+kubectl label ns production pod-security.kubernetes.io/warn=restricted
+kubectl label ns production pod-security.kubernetes.io/audit=restricted
+```
+
+**生产环境的最低标准：baseline。对于 Web 服务这类不需要特权的应用，用 restricted。**
+
+### 2.2 SecurityContext：Pod 和容器级别的安全设置
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true          # 禁止以 root 运行
+    runAsUser: 1000             # 指定 UID
+    fsGroup: 2000               # 文件系统挂载的组 ID
+  containers:
+  - name: app
+    securityContext:
+      allowPrivilegeEscalation: false   # 禁止提权
+      readOnlyRootFilesystem: true      # 根文件系统只读
+      capabilities:
+        drop:
+        - ALL                           # 丢弃所有 Linux Capabilities
+      runAsNonRoot: true
+```
+
+### 2.3 RBAC：谁可以做什么
+
+```yaml
+# 角色：定义权限集合
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: production
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+
+# 角色绑定：把角色授予用户/组/ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: production
+  name: dev-read-pods
+subjects:
+- kind: ServiceAccount
+  name: ci-bot
+  namespace: ci
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+RBAC 的核心原则：**应用用 ServiceAccount，人类用 User，CI/CD 用 ServiceAccount，每个 ServiceAccount 只给必需的最小权限。**
+
+### 2.4 NetworkPolicy：Pod 级的防火墙
+
+默认情况下，K8s 集群内所有 Pod 之间可以互相通信。NetworkPolicy 给你加上了"默认拒绝，显式放行"的能力：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend      # 只允许前端 Pod 访问
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres       # 后端只能访问数据库
+    ports:
+    - protocol: TCP
+      port: 5432
+```
+
+> NetworkPolicy 需要 CNI 插件支持（Calico、Cilium、Weave Net 都支持，Flannel 默认不支持）。对于生产集群，NetworkPolicy 是必需品。
+
+---
+
+## 三、稳定性：自愈、扩缩容与预算
+
+### 3.1 PodDisruptionBudget (PDB)——别让维护操作打垮你
+
+集群节点升级、缩容、替换这些维护操作是不可避免的。如果你有 3 个 API Pod，节点维护可能导致 3 个全被驱逐，服务中断。PDB 限制一次最多有多少 Pod 可以同时不可用：
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+spec:
+  minAvailable: 2          # 至少保证 2 个 Pod 一直可用
+  selector:
+    matchLabels:
+      app: backend
+```
+
+```bash
+# 同理可以用 maxUnavailable 限制最大不可用比例
+# maxUnavailable: 25%    # 最多 25% 的 Pod 可以同时不可用
+```
+
+### 3.2 HPA：根据负载自动扩缩容
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70    # CPU 超过 70% 就扩容
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80    # 内存超过 80% 也扩容
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 冷静 5 分钟再缩容，防止抖动
+```
+
+### 3.3 Pod 拓扑分布约束
+
+确保 Pod 分散到不同的可用区/节点，避免单点故障：
+
+```yaml
+spec:
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone     # 按可用区分散
+    whenUnsatisfiable: DoNotSchedule              # 宁可不调度，也不违背约束
+    labelSelector:
+      matchLabels:
+        app: backend
+```
+
+---
+
+## 四、资源配置：不设就是隐患
+
+### 4.1 LimitRange：给 namespace 设默认值
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: production
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: "500m"
+      memory: "256Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    max:
+      cpu: "4"
+      memory: "8Gi"
+    min:
+      cpu: "10m"
+      memory: "32Mi"
+```
+
+这样即使开发者忘了在 Pod 里设 resources，也会自动套上默认值。
+
+### 4.2 ResourceQuota：给 namespace 设容量上限
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: production
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: "40Gi"
+    limits.cpu: "40"
+    limits.memory: "80Gi"
+    persistentvolumeclaims: "20"
+    configmaps: "50"
+    secrets: "50"
+    services: "20"
+```
+
+ResourceQuota 防止一个团队或服务吃光整个集群的资源。
+
+---
+
+## 五、可观测性：你能看到问题在哪吗？
+
+### 5.1 健康检查三大件
+
+```yaml
+# startupProbe: 给足启动时间，防止 liveness 过早介入
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  failureThreshold: 30        # 最多 5 分钟
+  periodSeconds: 10
+
+# livenessProbe: 应用卡住了就重启
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  periodSeconds: 10
+  failureThreshold: 3
+
+# readinessProbe: 暂时不能接客时从负载池移除
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8080
+  periodSeconds: 5
+  failureThreshold: 3
+```
+
+### 5.2 Prometheus + Grafana：K8s 监控标配
+
+```bash
+# 用 Helm 快速部署 Prometheus 全栈
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+```
+
+部署后你会得到：
+- **Prometheus**：收集和存储指标
+- **Grafana**：可视化面板（预装了 K8s 集群监控、Node 指标、Pod 概况等面板）
+- **Alertmanager**：告警管理
+
+> 对于生产环境，Prometheus + Grafana 是监控的标配。但你不需要从零搭建——用 `kube-prometheus-stack` Helm Chart 一条命令就行。
+
+---
+
+## 六、镜像策略
+
+```yaml
+spec:
+  containers:
+  - name: app
+    image: myapp:v2.1.0          # 不要用 latest
+    imagePullPolicy: IfNotPresent # 如果本地有就不用拉
+  imagePullSecrets:              # 私有镜像仓库的认证
+  - name: regcred
+```
+
+为什么不能用 `latest`？
+1. `latest` 让回滚变得不确定——你不知道上一次部署到底拉了什么
+2. 两个 Node 上的 `latest` 可能不一样——如果不凑巧在不同的时间拉取了镜像
+3. Git tag 和镜像 tag 一一对应是可回溯的基础
+
+---
+
+## 七、无状态优先：正确的架构思维
+
+在 K8s 上设计应用时，有一个指导原则会帮你避免无数麻烦：**让 Pod 尽可能无状态。**
+
+```
+好的设计：                              不好的设计：
+┌──────────────────┐                  ┌──────────────────┐
+│  Pod（无状态）     │                  │  Pod（有状态）     │
+│  · 不存 session   │                  │  · 保存用户 session│
+│  · 不存本地文件    │                  │  · 依赖本地 IP     │
+│  · 配置外部注入    │                  │  · 启动顺序要求    │
+│  · 可以随时替换    │                  │  · 不能随便替换     │
+└──────────────────┘                  └──────────────────┘
+
+把状态推到外部：
+  · Session → Redis
+  · 文件 → 对象存储 (S3/MinIO)
+  · 数据库 → RDS / Cloud SQL
+  · 缓存 → Redis / Memcached
+  · 消息队列 → RabbitMQ / Kafka
+```
+
+这不是说 K8s 管不了有状态应用——前一章 StatefulSet 就是为这个存在的。但如果你能走无状态路线，你的运维复杂度会大幅降低。**有状态的服务（数据库、消息队列）尽量用托管服务，实在不行再用 StatefulSet + Operator。**
+
+---
+
+## 八、生产上线检查清单
+
+在把你的应用推到生产环境之前，逐条核对：
+
+```
+安全
+□ 命名空间启用了 Pod Security Standards（至少 baseline）
+□ 每个 Pod 都有 SecurityContext（runAsNonRoot, drop ALL capabilities）
+□ 已创建 NetworkPolicy（最少限制模型）
+□ 敏感信息存 Secret，etcd 已开启静态加密
+□ RBAC 使用最小权限（每个 ServiceAccount 只给必需的权限）
+□ 容器镜像不用 latest tag
+
+稳定性
+□ Deployment 配置了 health check（startup + liveness + readiness）
+□ PDB 已创建（保证维护时最小可用副本数）
+□ HPA 已配置（基于 CPU/内存的自动扩缩容）
+□ Pod 使用 topologySpreadConstraints 分散到不同可用区
+
+资源
+□ 所有容器都设置了 resources.requests 和 resources.limits
+□ Namespace 配置了 ResourceQuota 和 LimitRange
+□ 关键服务 QoS 为 Guaranteed
+
+网络
+□ 对外服务通过 Ingress + HTTPS（TLS）暴露
+□ 内部服务用 ClusterIP，不暴露到公网
+□ 已配置 Ingress 的限流和 body size 限制
+
+可观测性
+□ 部署了 Prometheus + Grafana 监控
+□ 关键业务指标配置了告警
+□ 日志输出到 stdout/stderr（遵循 Twelve-Factor App）
+```
+
+---
+
+## 九、学完这套专题后，下一步学什么？
+
+这 10 章带你走完了从"K8s 是什么"到"生产级配置"的完整路线。但 K8s 的生态远比这庞大：
+
+- **Service Mesh（Istio / Linkerd）**：如果你需要更细粒度的流量管理（重试、熔断、故障注入、mTLS），Service Mesh 是下一步
+- **GitOps（ArgoCD / Flux）**：如果你的集群配置需要 Git 版本控制、自动同步和审批流程
+- **Cilium（eBPF）**：下一代 CNI，用 eBPF 替代 iptables，大幅提升网络性能和可观测性
+- **KEDA**：事件驱动的自动扩缩容——不仅基于 CPU，还能基于消息队列积压、数据库查询负载等
+- **OpenTelemetry**：统一的观测数据采集标准，Trace + Metrics + Logs 三位一体
+
+但这些都不是"必须学"的——先把手头的 K8s 基础打好，大部分生产问题用我们这 10 章的内容已经能解决了。真正碰到规模化瓶颈的时候，再根据需要去学对应的工具。

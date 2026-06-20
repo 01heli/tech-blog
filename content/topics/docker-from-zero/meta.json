@@ -1,0 +1,5 @@
+{
+  "title": "从零开始掌握 Docker",
+  "description": "从容器的底层原理讲起，系统学习 Docker 镜像构建、容器生命周期、Dockerfile 最佳实践、Compose 多容器编排、网络与存储、安全加固，直到 CI/CD 集成。每一篇都从真实开发痛点引入，用类比讲清原理，配有可直接运行的命令和代码。",
+  "icon": "container"
+}

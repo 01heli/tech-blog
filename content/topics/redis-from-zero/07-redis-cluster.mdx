@@ -1,0 +1,217 @@
+---
+title: "Redis Cluster：把数据分散到几十台机器，突破单机内存上限"
+description: "主从+哨兵解决了高可用，但所有数据还在一台机器上。Cluster 把数据按槽位自动分片到多台机器，每台分片还有自己的从节点——这是 Redis 横向扩展的终局方案。"
+order: 7
+---
+
+## 一、单机内存的玻璃天花板
+
+假设你的业务缓存了 500GB 数据。你买了一台 512GB 内存的服务器——很贵，而且已经是物理极限了。数据继续增长到 1TB、2TB，你怎么办？
+
+```
+方案            能否解决 1TB 数据    代价
+────────────────────────────────────────────
+更大的机器         否            物理上限
+主从+哨兵           否            所有数据还在一个 Master 上
+多个独立 Redis     能            应用层需要知道哪些数据在哪台机器（Sharding 逻辑侵入业务代码）
+Redis Cluster      能            服务端自动分片，对客户端几乎透明
+```
+
+Redis Cluster 把所有数据**自动按槽位分布**在多台 Redis 实例上。每个实例只负责一部分数据——10 台机器，每台只需要内存的十分之一。
+
+---
+
+## 二、Cluster 的核心概念
+
+### 2.1 槽位（Slot）
+
+Redis Cluster 把整个 Key 空间分成 **16384 个哈希槽（Hash Slot）**。每个 Master 节点负责其中一部分槽。
+
+```
+Key → CRC16(key) % 16384 → 槽位号 → 该槽位所在的 Master 节点
+
+例如：
+  user:1001  → CRC16("user:1001") % 16384 = 12733 → 在 Master-2 上
+  order:5001 → CRC16("order:5001") % 16384 = 8921  → 在 Master-1 上
+```
+
+### 2.2 集群拓扑
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                     Redis Cluster                         │
+│                                                          │
+│   Master-1        Master-2        Master-3               │
+│   槽位 0-5460     槽位 5461-10922  槽位 10923-16383       │
+│   ┌──────┐       ┌──────┐       ┌──────┐                 │
+│   │ :7000│       │ :7001│       │ :7002│                 │
+│   └──┬───┘       └──┬───┘       └──┬───┘                 │
+│      │              │              │                      │
+│   ┌──▼───┐       ┌──▼───┐       ┌──▼───┐                 │
+│   │Slave │       │Slave │       │Slave │                 │
+│   │ :7003│       │ :7004│       │ :7005│                 │
+│   └──────┘       └──────┘       └──────┘                 │
+│                                                          │
+│   如果 Master-1 挂了 → Slave :7003 自动提升为新 Master      │
+│   每台机器只负责约 1/3 的数据和请求                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Cluster = 分片（Sharding）+ 高可用（Replication）。** 每个 Master 都有一个或多个 Slave。Master 挂了，Slave 顶上去。
+
+---
+
+## 三、搭建 Cluster
+
+### 3.1 快速搭建（本地开发）
+
+```bash
+# 方式 1：用 create-cluster 脚本（Redis 源码自带，本地学习推荐）
+cd redis-stable/utils/create-cluster
+./create-cluster start        # 启动 6 个实例（3 Master + 3 Slave）
+./create-cluster create       # 分配槽位，建立集群关系
+redis-cli -c -p 30001         # -c 表示 Cluster 模式
+
+# 方式 2：Docker Compose 一键搭建
+# 参考 https://github.com/bitnami/containers/tree/main/bitnami/redis-cluster
+```
+
+### 3.2 手动搭建（生产环境参考）
+
+```bash
+# 每台机器上的 redis.conf
+port 7000
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 15000
+appendonly yes
+
+# 启动 6 个 Redis 实例（3 台机器 × 2 或 6 台机器 × 1）
+redis-server redis-7000.conf
+redis-server redis-7001.conf
+redis-server redis-7002.conf
+redis-server redis-7003.conf
+redis-server redis-7004.conf
+redis-server redis-7005.conf
+
+# 建立集群关系（平均分配槽位，每个 Master 配 1 个 Slave）
+redis-cli --cluster create \
+  10.0.1.1:7000 10.0.1.2:7001 10.0.1.3:7002 \
+  10.0.1.4:7003 10.0.1.5:7004 10.0.1.6:7005 \
+  --cluster-replicas 1
+```
+
+### 3.3 集群管理命令
+
+```bash
+# 查看集群状态
+redis-cli -c -p 7000 CLUSTER INFO
+# cluster_state:ok
+# cluster_slots_assigned:16384
+# cluster_known_nodes:6
+
+# 查看节点列表
+redis-cli -c -p 7000 CLUSTER NODES
+
+# 查看槽位分布
+redis-cli -c -p 7000 CLUSTER SLOTS
+
+# 添加新节点
+redis-cli --cluster add-node 10.0.1.7:7007 10.0.1.1:7000
+
+# 重新分配槽位（给新节点搬一部分数据）
+redis-cli --cluster reshard 10.0.1.1:7000 \
+  --cluster-from all --cluster-to <new-node-id> --cluster-slots 1000
+
+# 删除节点（先迁移走它的槽位）
+redis-cli --cluster del-node 10.0.1.1:7000 <node-id>
+```
+
+---
+
+## 四、Cluster 模式下的客户端
+
+### 4.1 MOVED 重定向
+
+Cluster 下，每个 Redis 节点只知道"自己负责哪些槽位"。如果你连接的节点不负责你请求的 Key——它会返回一个重定向错误：
+
+```bash
+# 你连接的是 7001（负责槽位 5461-10922）
+redis-cli -c -p 7001
+SET user:1001 "张三"
+# → 内部计算：CRC16("user:1001") % 16384 = 12733
+# → 12733 在 10923-16383 范围，不在本节点
+# → 返回 MOVED 12733 10.0.1.3:7002
+# → 客户端（-c 模式）自动重定向到 7002，再次执行 SET
+```
+
+**Redis Cluster 客户端需要处理 MOVED 重定向**。主流的 Redis 客户端库都已内置支持，业务代码通常不需要关心——只要初始化时选择 Cluster 模式的连接方式即可。
+
+```python
+# Python: redis-py-cluster（或 redis-py 3.x+ 内置 Cluster 支持）
+from redis.cluster import RedisCluster
+rc = RedisCluster(host="10.0.1.1", port=7000)
+rc.set("user:1001", "张三")        # 自动计算槽位、路由到正确节点
+```
+
+```java
+// Java: JedisCluster / Lettuce
+Set<HostAndPort> nodes = new HashSet<>();
+nodes.add(new HostAndPort("10.0.1.1", 7000));
+nodes.add(new HostAndPort("10.0.1.2", 7001));
+JedisCluster cluster = new JedisCluster(nodes);
+cluster.set("user:1001", "张三");
+```
+
+### 4.2 Hash Tags：控制 Key 去哪
+
+有时候你需要确保两个 Key 落在同一个槽位（比如需要对它们做交集操作）。在 Key 中用 `{}` 括起来的部分会参与哈希计算：
+
+```bash
+# 这两个 Key 会落在不同槽位
+user:1001:profile
+user:1001:orders
+
+# 用 {} 包裹共同部分——保证落在同一槽位
+user:{1001}:profile   → CRC16("1001") % 16384
+user:{1001}:orders    → CRC16("1001") % 16384    ← 相同槽位
+```
+
+> **只在需要跨 Key 事务或集合运算时使用 Hash Tag。** 滥用 Hash Tag 会导致数据分布不均匀——大量 Key 挤在同一个槽位，这台节点变成热点。
+
+---
+
+## 五、Cluster 的限制（必须知道）
+
+1. **Multi-Key 操作必须在同一槽位。** `MGET user:1001:name user:1002:name` 如果两个 Key 不在同一槽位会报错。用 Hash Tag 或逐个 `GET`。
+
+2. **事务（MULTI/EXEC）和 Lua 脚本不能跨槽位。** 只能对同一槽位的 Key 执行。这和 Multi-Key 限制是同一个原因。
+
+3. **没有跨节点的 Pub/Sub。** 在一个节点订阅频道只能收到发给该节点的消息。需要全集群广播的场景用外部的消息队列。
+
+4. **数据迁移（Resharding）期间性能会下降。** 大 Key 迁移时阻塞时间较长，建议在业务低峰期操作。
+
+5. **最少需要 6 个节点（3 Master + 3 Slave）** 才能实现基本的高可用+分片。对于小规模应用，Cluster 的运维成本可能高于实际收益。
+
+> **如果数据量小于单机内存（< 32GB），用主从+哨兵就够了，不需要 Cluster。** Cluster 解决的是数据量超过单机内存的问题——如果你还没有到这个量级，引入 Cluster 只会增加运维复杂度。
+
+---
+
+## 六、什么时候该上 Cluster？
+
+```
+判断流程：
+
+你的 Redis 数据量 > 单机内存吗？
+  │
+  ├── 否 → 主从 + 哨兵（简单、稳定、够用）
+  │
+  └── 是 → 数据可以自然分片吗？
+            │
+            ├── 是 → Redis Cluster（自动分片）
+            │
+            └── 否 → 业务层分片（多个独立 Redis，应用代码控制路由）
+                   或考虑换方案（Pika、Tendis 等基于 SSD 的兼容方案）
+```
+
+下一章，我们回到实战层面——缓存穿透、击穿、雪崩，以及最让人头疼的"缓存和数据库数据不一致"问题。

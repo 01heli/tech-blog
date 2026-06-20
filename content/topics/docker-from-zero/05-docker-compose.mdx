@@ -1,0 +1,331 @@
+---
+title: "Docker Compose：多容器应用的一键编排"
+description: "当你需要同时跑 Web + 数据库 + 缓存 + 消息队列，docker run 变成了一场噩梦。Docker Compose 用一份 YAML 文件声明所有服务，一键启动、停止、重建整个应用栈——这是本地开发和中小规模部署的最佳方案。"
+order: 5
+---
+
+## 一、问题：你的应用不是一个容器
+
+一个真实的 Web 应用通常由多个服务组成：
+
+```
+┌───────────────────────────────────────────────┐
+│              my-app（一个完整的应用栈）          │
+│                                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+│  │  Nginx   │  │  Web API │  │  Worker  │     │
+│  │  反向代理  │  │ (Flask)  │  │ (Celery) │     │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘     │
+│       │             │             │           │
+│       └─────────────┼─────────────┘           │
+│                     │                         │
+│         ┌───────────┼───────────┐             │
+│         ▼           ▼           ▼             │
+│    ┌──────────┐ ┌──────┐ ┌──────────┐        │
+│    │PostgreSQL│ │Redis │ │RabbitMQ  │        │
+│    └──────────┘ └──────┘ └──────────┘        │
+└───────────────────────────────────────────────┘
+```
+
+用 `docker run` 手动启动这 6 个容器：
+
+```bash
+# 你需要记住这些命令，每次启动按正确顺序执行：
+docker run -d --name db -e POSTGRES_PASSWORD=xxx -v pgdata:/var/lib/postgresql/data postgres:16
+docker run -d --name redis redis:7-alpine
+docker run -d --name rabbitmq -e RABBITMQ_DEFAULT_USER=admin rabbitmq:3-management
+docker run -d --name api --link db --link redis --link rabbitmq -e DATABASE_URL=... my-api:v1
+docker run -d --name worker --link db --link redis my-worker:v1
+docker run -d --name nginx -p 80:80 --link api my-nginx:v1
+```
+
+每次换电脑、换服务器、有新同事入职——都得重来一遍。漏了一个参数，排查两个小时。
+
+**Docker Compose 把上面这一切写成一个文件，然后一条命令全部启动。**
+
+---
+
+## 二、docker-compose.yml：声明式地描述你的应用栈
+
+```yaml
+# docker-compose.yml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: my-secret-pw
+      POSTGRES_DB: myapp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+
+  api:
+    build: ./api                # 从 Dockerfile 构建（而不是用现成镜像）
+    ports:
+      - "5000:5000"
+    environment:
+      DATABASE_URL: postgresql://postgres:my-secret-pw@db:5432/myapp
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      db:
+        condition: service_healthy    # 等数据库准备好了再启动
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: postgresql://postgres:my-secret-pw@db:5432/myapp
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:     # 声明命名卷
+```
+
+---
+
+## 三、Compose 核心命令
+
+```bash
+# 启动所有服务（-d 后台运行）
+docker compose up -d
+
+# 启动并强制重新构建镜像（代码改了，需要重新构建）
+docker compose up -d --build
+
+# 查看所有服务的状态
+docker compose ps
+
+# 查看所有服务的日志
+docker compose logs
+docker compose logs -f             # 实时跟踪
+docker compose logs api            # 只看某个服务的日志
+
+# 停止所有服务（不删除容器）
+docker compose stop
+
+# 停止并删除容器、网络（不删除卷，数据还在）
+docker compose down
+
+# 停止并删除容器、网络、卷（数据也删了，慎用）
+docker compose down -v
+
+# 重启某个服务
+docker compose restart api
+
+# 在某个服务中执行命令
+docker compose exec api bash
+docker compose exec db psql -U postgres myapp
+
+# 查看服务占用的资源
+docker compose stats
+
+# 列出有哪些 Compose 项目
+docker compose ls
+```
+
+---
+
+## 四、Compose 文件的核心语法
+
+### 4.1 构建 vs 镜像
+
+```yaml
+services:
+  # 方式 1：从 Dockerfile 构建
+  api:
+    build:
+      context: ./api              # Dockerfile 所在的目录（构建上下文）
+      dockerfile: Dockerfile.prod # Dockerfile 文件名（默认 Dockerfile）
+      args:
+        APP_VERSION: "2.0.0"      # 构建参数
+
+  # 方式 2：直接用现成的镜像
+  redis:
+    image: redis:7-alpine
+```
+
+### 4.2 环境变量
+
+```yaml
+services:
+  api:
+    # 方式 1：直接写死
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: "postgresql://..."
+
+    # 方式 2：从 .env 文件读取
+    env_file:
+      - .env
+      - .env.production
+
+    # 方式 3：从 Shell 环境变量传入（${VAR} 语法）
+    environment:
+      API_KEY: ${API_KEY}         # 从当前 Shell 的 API_KEY 变量取值
+      VERSION: ${VERSION:-latest} # 带默认值
+```
+
+### 4.3 卷和网络
+
+```yaml
+services:
+  db:
+    volumes:
+      # 命名卷（Docker 管理的，推荐）
+      - pgdata:/var/lib/postgresql/data
+
+      # Bind mount（直接挂宿主机目录，适合开发环境热重载）
+      - ./backups:/backups
+
+      # 只读挂载
+      - ./config.yml:/app/config.yml:ro
+
+  api:
+    networks:
+      - frontend       # 连接 frontend 网络
+      - backend        # 连接 backend 网络
+    # Nginx 通过 frontend 网络访问 api，api 通过 backend 网络访问 db
+    # db 不暴露在 frontend 网络中——安全隔离
+
+volumes:
+  pgdata:              # 声明命名卷
+
+networks:
+  frontend:
+  backend:
+```
+
+### 4.4 depends_on：启动顺序
+
+```yaml
+services:
+  api:
+    depends_on:
+      db:
+        condition: service_healthy   # 等 db 健康检查通过（Compose v2.1+）
+      redis:
+        condition: service_started   # 等 redis 启动即可
+    # 注意：depends_on 只控制启动顺序，不保证 db 的内存中的数据已就绪
+    # 应用本身还需要做数据库连接重试
+```
+
+### 4.5 覆盖配置：多环境适配
+
+```bash
+# docker-compose.yml（基础配置）
+# docker-compose.override.yml（开发环境覆盖，compose 自动合并这两个文件）
+# docker-compose.prod.yml（生产环境覆盖）
+
+# 开发环境（自动加载 override）
+docker compose up -d
+
+# 生产环境（显式指定，不加载 override）
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+```yaml
+# docker-compose.override.yml
+services:
+  api:
+    build: .                     # 开发环境从本地构建
+    volumes:
+      - ./api:/app               # 挂载代码，修改实时生效（热重载）
+    environment:
+      DEBUG: "true"
+
+# docker-compose.prod.yml
+services:
+  api:
+    image: registry.example.com/my-api:v2.1.0  # 生产环境用构建好的镜像
+    restart: always
+    deploy:                      # 生产环境资源限制
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1g
+```
+
+---
+
+## 五、一个完整的开发环境实战
+
+```yaml
+# 开发环境的 docker-compose.yml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: myapp_dev
+    ports:
+      - "5432:5432"        # 暴露端口，方便用本地工具连数据库
+    volumes:
+      - dev-pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5000:5000"
+    environment:
+      DATABASE_URL: "postgresql://postgres:devpassword@db:5432/myapp_dev"
+      REDIS_URL: "redis://redis:6379"
+      DEBUG: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./api:/app          # 代码热重载——改了 Python 文件，容器里的服务自动重启
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  dev-pgdata:
+```
+
+```bash
+# 新同事入职只需要：
+git clone git@github.com:team/myapp.git
+cd myapp
+docker compose up -d
+# 3 分钟后，完整的开发环境就绪——PostgreSQL、Redis、API 服务全部运行。
+# 不需要装 Python、装 PostgreSQL、手动改配置——零环境配置。
+```
+
+---
+
+## 六、Compose 的局限性
+
+Docker Compose 解决了单机上的多容器编排问题。但它不管多机的事情。
+
+如果你的应用需要跨多台服务器部署（负载均衡、滚动更新、自动扩缩容），你需要 Kubernetes、Docker Swarm 或其他编排工具。Compose 的边界是**单机多容器**。
+
+对于本地开发、CI 测试环境、小规模生产部署（单机足以承载），Compose 仍然是最佳选择——它比 Kubernetes 简单两个数量级，对于 80% 的项目来说足够用了。
+
+下一章，深入 Docker 网络——容器之间怎么通信、Bridge / Overlay / Host / None 四种网络模式的区别、自定义网络怎么隔离服务。

@@ -1,0 +1,362 @@
+---
+title: "安装 Docker 与基础命令：用 20 条命令覆盖 80% 的日常操作"
+description: "在本地装好 Docker，用 docker run / ps / exec / logs / rm / rmi 这条命令链理解容器的完整生命周期。掌握端口映射、环境变量注入、卷挂载三大核心操作，初步感受"docker run 一把梭"的效率。"
+order: 2
+---
+
+## 一、安装 Docker
+
+### 1.1 Mac
+
+```bash
+# 方式 1：Docker Desktop（GUI + Docker Engine，推荐日常开发）
+brew install --cask docker
+
+# 方式 2：仅 Docker Engine（无 GUI，命令行使用）
+brew install docker
+brew install colima    # 轻量的 Docker 运行时
+colima start
+```
+
+安装 Docker Desktop 后，会在菜单栏出现 Docker 图标。点击它看到 "Docker Desktop is running"，就可以在终端里用 `docker` 命令了。
+
+### 1.2 Linux (Ubuntu/Debian)
+
+```bash
+# 用官方脚本安装（推荐）
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+
+# 把当前用户加到 docker 组（不用每次 sudo）
+sudo usermod -aG docker $USER
+
+# 重新登录或执行
+newgrp docker
+
+# 验证
+docker version
+```
+
+### 1.3 Windows
+
+```bash
+# 方式 1：Docker Desktop for Windows（推荐日常开发）
+winget install Docker.DockerDesktop
+
+# 方式 2：WSL2 + Docker（更接近 Linux 生产环境）
+wsl --install -d Ubuntu
+# 然后在 WSL2 的 Ubuntu 中按上面的 Linux 方式安装
+
+# 方式 3：直接装 Docker Engine in WSL2（无 Docker Desktop）
+# 参考 https://dev.to/bowmanjd/install-docker-on-windows-wsl-without-docker-desktop-34m9
+```
+
+### 1.4 验证安装
+
+```bash
+# 版本信息
+docker version
+
+# 运行测试容器
+docker run --rm hello-world
+
+# 如果看到 "Hello from Docker!" 字样，说明安装成功
+```
+
+---
+
+## 二、镜像操作：找镜像、下载、查看、删除
+
+### 2.1 搜索和下载镜像
+
+```bash
+# 搜索镜像（也可以在 https://hub.docker.com 网页搜索）
+docker search nginx
+
+# 下载镜像（pull）
+docker pull nginx:alpine              # 指定标签
+docker pull nginx                      # 不指定标签，默认拉 latest
+docker pull python:3.12-slim          # 精简版的 Python 镜像
+
+# 下载完整镜像的所有版本（不常用）
+docker pull --all-tags nginx          # 下载 nginx 所有版本
+```
+
+### 2.2 查看和删除镜像
+
+```bash
+# 列出本地所有镜像
+docker images
+# 或
+docker image ls
+
+# 输出示例：
+# REPOSITORY   TAG       IMAGE ID       CREATED        SIZE
+# nginx        alpine    abc123def456   2 weeks ago    40MB
+# python       3.12-slim xyz789ghi012   3 weeks ago    130MB
+
+# 查看镜像详细信息（层、环境变量、暴露的端口等）
+docker image inspect nginx:alpine
+
+# 查看镜像的构建历史（每一层是怎么来的）
+docker image history nginx:alpine
+
+# 删除镜像
+docker rmi nginx:alpine                # 按名称:标签
+docker rmi abc123def456                 # 按 IMAGE ID
+
+# 清理无用的镜像（dangling images，没有标签的）
+docker image prune
+
+# 清理所有未被任何容器使用的镜像
+docker image prune -a
+```
+
+---
+
+## 三、容器的完整生命周期
+
+```
+            docker run
+    ┌──────────────────────────┐
+    │                          │
+    ▼                          │
+┌─────────┐    docker stop   ┌─────────┐   docker start   ┌─────────┐
+│ Created  │ ──────────────► │ Stopped  │ ───────────────► │ Running  │
+│ (已创建) │                │ (已停止) │                 │ (运行中) │
+└─────────┘                └─────────┘                 └─────────┘
+                                  ▲                          │
+                                  │    docker pause           │ docker restart
+                                  │ ◄─────────────────────────┤
+                                  │    docker unpause         │
+                                  │                           │
+                                  ▼                           ▼
+                            ┌─────────┐               ┌─────────┐
+                            │  Paused  │               │  Dead   │
+                            │ (已暂停) │               │(已死亡) │
+                            └─────────┘               └─────────┘
+                                  │
+                                  │  docker rm
+                                  ▼
+                              (容器被删除，不复存在)
+```
+
+### 3.1 docker run：创建并启动一个容器
+
+```bash
+# 最简启动（前台运行，Ctrl+C 退出）
+docker run nginx:alpine
+
+# 后台运行（-d）
+docker run -d --name my-web nginx:alpine
+
+# 命名 + 端口映射 + 后台运行
+docker run -d --name my-web -p 8080:80 nginx:alpine
+#          │          │          │           │
+#          │          │          │           └── 镜像
+#          │          │          └── 宿主机端口:容器端口
+#          │          └── 给容器命名（不指定自动生成）
+#          └── 后台运行
+
+# 启动后自动删除（--rm，容器停止后自动清理，适合一次性任务）
+docker run --rm -it alpine sh
+```
+
+### 3.2 查看容器
+
+```bash
+# 查看运行中的容器
+docker ps
+
+# 查看所有容器（包括已停止的）
+docker ps -a
+
+# 只显示容器 ID
+docker ps -q
+
+# 查看容器详细信息（IP、网络、挂载等）
+docker inspect my-web
+
+# 查看容器资源使用情况（CPU、内存、网络、磁盘）
+docker stats my-web
+docker stats                    # 查看所有运行容器
+```
+
+### 3.3 进入容器、执行命令
+
+```bash
+# 在运行中的容器里执行一条命令
+docker exec my-web ls /usr/share/nginx/html
+
+# 进入容器的 Shell（交互模式，-i 保持 stdin 打开，-t 分配伪终端）
+docker exec -it my-web sh       # Alpine 用 sh（没有 bash）
+docker exec -it my-web bash     # Ubuntu/Debian 可以用 bash
+
+# 查看容器日志
+docker logs my-web              # 全部日志
+docker logs --tail 50 my-web    # 最后 50 行
+docker logs -f my-web           # 持续跟踪（类似 tail -f）
+docker logs --since 10m my-web  # 最近 10 分钟的日志
+```
+
+### 3.4 停止、启动、重启、删除
+
+```bash
+# 停止（发送 SIGTERM，10 秒后如果还没停，发送 SIGKILL）
+docker stop my-web
+
+# 立即强制停止（直接 SIGKILL）
+docker kill my-web
+
+# 启动已停止的容器
+docker start my-web
+
+# 重启
+docker restart my-web
+
+# 暂停容器（冻结进程，不释放资源，可以快速恢复）
+docker pause my-web
+docker unpause my-web
+
+# 删除已停止的容器
+docker rm my-web
+
+# 强制删除运行中的容器
+docker rm -f my-web
+
+# 清理所有已停止的容器
+docker container prune
+
+# 停掉并删除所有容器（危险！）
+docker rm -f $(docker ps -aq)
+```
+
+### 3.5 在容器和宿主机之间拷贝文件
+
+```bash
+# 从宿主机拷贝到容器
+docker cp ./index.html my-web:/usr/share/nginx/html/index.html
+
+# 从容器拷贝到宿主机
+docker cp my-web:/etc/nginx/nginx.conf ./nginx.conf
+```
+
+---
+
+## 四、三个核心操作：端口、环境变量、卷
+
+### 4.1 端口映射
+
+容器有自己的网络栈，默认和宿主机及其他容器是隔离的。要让外部访问容器里的服务，需要做端口映射。
+
+```bash
+# -p 宿主机端口:容器端口
+docker run -d -p 8080:80 nginx:alpine       # localhost:8080 → 容器 80
+
+# 绑定到特定 IP
+docker run -d -p 127.0.0.1:8080:80 nginx:alpine  # 仅本机可访问
+
+# 随机分配宿主机端口
+docker run -d -P nginx:alpine               # -P 大写，映射镜像里 EXPOSE 的所有端口
+
+# 查看容器端口映射
+docker port my-web
+```
+
+### 4.2 环境变量注入
+
+```bash
+# -e 注入环境变量
+docker run -d --name db \
+  -e MYSQL_ROOT_PASSWORD=my-secret-pw \
+  -e MYSQL_DATABASE=myapp \
+  mysql:8
+
+# 从文件批量注入
+docker run -d --name db --env-file ./mysql.env mysql:8
+```
+
+### 4.3 卷挂载（让数据在容器删除后还能存在）
+
+```bash
+# -v 宿主机路径:容器路径（Bind Mount）
+docker run -d --name my-web -v $(pwd)/html:/usr/share/nginx/html nginx:alpine
+# 效果：你改了本地的 ./html/index.html，容器里的页面立刻变了
+
+# 命名卷（Volume，Docker 管理的，更好）
+docker volume create myapp-data
+docker run -d -v myapp-data:/var/lib/mysql mysql:8
+# 数据存在 Docker 管理的存储里，不依赖宿主机的具体路径
+
+# 查看卷
+docker volume ls
+docker volume inspect myapp-data
+```
+
+---
+
+## 五、一口气跑一个完整的 Web 应用
+
+把上面学的串起来——5 分钟跑一个带数据库的博客应用：
+
+```bash
+# 1. 创建网络（让两个容器能互相通信）
+docker network create blog-net
+
+# 2. 启动 MySQL
+docker run -d \
+  --name blog-db \
+  --network blog-net \
+  -e MYSQL_ROOT_PASSWORD=blog-secret \
+  -e MYSQL_DATABASE=wordpress \
+  -v blog-data:/var/lib/mysql \
+  mysql:8
+
+# 3. 启动 WordPress
+docker run -d \
+  --name blog-web \
+  --network blog-net \
+  -p 8080:80 \
+  -e WORDPRESS_DB_HOST=blog-db \
+  -e WORDPRESS_DB_USER=root \
+  -e WORDPRESS_DB_PASSWORD=blog-secret \
+  -e WORDPRESS_DB_NAME=wordpress \
+  wordpress:latest
+
+# 4. 打开浏览器 http://localhost:8080
+# 看到 WordPress 安装页面
+```
+
+没有"配置 LAMP 环境"，没有"手动装 PHP 扩展"，没有"改 MySQL 配置"——两条 `docker run`，一个完整的博客应用跑起来了。这就是容器化部署的效率。
+
+---
+
+## 六、常用命令速查
+
+```
+镜像相关：
+  docker pull <image>       拉取镜像
+  docker images             列出本地镜像
+  docker rmi <image>        删除镜像
+  docker image prune        清理无用镜像
+
+容器生命周期：
+  docker run <image>         创建并启动
+  docker start/stop/restart  启动/停止/重启
+  docker kill <container>    强制停止
+  docker rm <container>      删除容器
+
+容器交互：
+  docker ps / ps -a          查看容器列表
+  docker logs <container>    查看日志
+  docker exec -it <c> sh     进入容器 Shell
+  docker cp <src> <dst>      拷贝文件
+  docker inspect <container> 查看详细信息
+  docker stats               查看资源使用
+
+系统清理：
+  docker system prune        清理所有未使用的资源（镜像+容器+网络+卷）
+  docker system df           查看 Docker 占用了多少磁盘空间
+```
+
+下一章，深入 Docker 镜像的构建——Dockerfile 怎么写、镜像层是什么、怎么把镜像做小。

@@ -1,0 +1,254 @@
+---
+title: "容器运行机制：资源限制、健康检查、重启策略与调试"
+description: "docker run 不是终点——限制 CPU 和内存防止容器吃光宿主机、用健康检查自动发现不健康的容器、配置重启策略让崩溃的容器自动复活、进入容器内部定位问题。这是在生产环境运行容器的基本素养。"
+order: 4
+---
+
+## 一、不给容器设限制等于没限制
+
+默认情况下，Docker 不会对容器做任何资源限制——一个容器可以把宿主机的所有 CPU 和内存吃光。这在生产环境是致命的。
+
+```bash
+# 查看容器的实时资源使用
+docker stats my-app
+# CONTAINER  CPU %   MEM USAGE / LIMIT   NET I/O       BLOCK I/O
+# my-app     0.50%   128MiB / 3.84GiB    1.2MB / 800kB 45MB / 0B
+```
+
+### 1.1 CPU 限制
+
+```bash
+# --cpus：容器最多用几个 CPU 核
+docker run -d --cpus 1.5 --name my-app my-app:v1
+# 最多用 1.5 个核心——比如一个双核 CPU，能用 75%
+
+# --cpu-shares：相对权重（只有在 CPU 争抢时才生效）
+docker run -d --cpu-shares 512 --name low-priority my-app:v1
+docker run -d --cpu-shares 1024 --name high-priority my-app:v1
+# 当 CPU 有竞争时，high-priority 使用的 CPU 时间是 low-priority 的 2 倍
+
+# --cpuset-cpus：绑定到特定 CPU 核心
+docker run -d --cpuset-cpus 0,1 --name my-app my-app:v1
+# 只使用 CPU 0 和 CPU 1
+```
+
+### 1.2 内存限制
+
+```bash
+# -m / --memory：硬限制（超过限制容器会被 OOM Kill）
+docker run -d -m 512m --name my-app my-app:v1
+docker run -d -m 1g --name my-app my-app:v1       # 最多 1GB
+
+# --memory-swap：总内存 + 交换空间的上限
+docker run -d -m 512m --memory-swap 1g --name my-app my-app:v1
+# 内存 512MB + Swap 512MB = 总上限 1GB
+
+# --memory-reservation：软限制（内存紧张时触发回收，但不会 OOM）
+docker run -d -m 512m --memory-reservation 256m --name my-app my-app:v1
+# 建议保留 256MB，当宿主机内存紧张时 Docker 会尝试回收超出部分
+
+# 如果容器被 OOM Kill，可以在 docker inspect 中看到：
+docker inspect my-app --format '{{.State.OOMKilled}}'
+# true ← 说明容器曾经因为内存超限被杀死
+```
+
+### 1.3 磁盘 I/O 限制
+
+```bash
+# --blkio-weight：I/O 权重（10-1000，默认 500）
+docker run -d --blkio-weight 200 --name slow-db mysql:8
+
+# 限制读写速率
+docker run -d --device-read-bps /dev/sda:1mb --device-write-bps /dev/sda:1mb mysql:8
+# 限制读写每秒 1MB
+```
+
+---
+
+## 二、健康检查：让 Docker 知道容器有没有"真正活者"
+
+一个进程可能正在运行，但服务已经不可用了（死锁、端口占满、数据库连接断开）。Docker 只知道进程是否存活——你不知道应用是否健康。
+
+`HEALTHCHECK` 让 Docker 主动检查容器内的应用是否真的能正常服务：
+
+```dockerfile
+# Dockerfile 中定义健康检查
+FROM nginx:alpine
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost/ || exit 1
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--interval` | 检查间隔 | 30s |
+| `--timeout` | 单次检查超时时间 | 30s |
+| `--start-period` | 启动缓冲时间（这段时间的失败不计入重试） | 0s |
+| `--retries` | 连续失败多少次认定不健康 | 3 |
+
+```bash
+# docker run 时覆盖健康检查
+docker run -d \
+  --health-cmd="curl -f http://localhost/health || exit 1" \
+  --health-interval=10s \
+  --health-timeout=3s \
+  --health-retries=3 \
+  --name my-app my-app:v1
+
+# 查看健康状态
+docker ps
+# CONTAINER  STATUS
+# my-app     Up 10 minutes (healthy)    ← 健康
+# bad-app    Up 5 minutes (unhealthy)   ← 不健康
+
+# 查看健康检查历史
+docker inspect my-app --format '{{json .State.Health}}' | python -m json.tool
+# 输出包含每次检查的详细结果、状态码和输出
+```
+
+> 如果你的容器启动需要时间（等数据库连接建立、等端口可用），`--start-period` 很重要——不用它的话，容器还没准备好就被判定不健康然后被重启了。
+
+---
+
+## 三、重启策略：容器崩溃了怎么办
+
+```bash
+# no: 不自动重启（默认）
+docker run -d --restart no --name my-app my-app:v1
+
+# on-failure：只有容器以非 0 退出码退出时才重启
+docker run -d --restart on-failure:5 --name my-app my-app:v1
+# 最多重启 5 次，之后放弃
+
+# always：无论什么原因退出，都重启
+docker run -d --restart always --name my-app my-app:v1
+# Docker 守护进程启动时也会自动启动这个容器
+
+# unless-stopped：类似 always，但如果你手动 docker stop 了，Docker 重启时不会启动它
+docker run -d --restart unless-stopped --name my-app my-app:v1
+```
+
+```
+重启策略决策树：
+
+容器崩了后……
+  │
+  ├── 无所谓 → --restart no
+  │
+  ├── 可能是临时错误（网络波动），希望重试几次 → --restart on-failure:N
+  │
+  ├── 必须一直运行的服务 → --restart always
+  │
+  └── 必须一直运行，但我手动停了你就别自启动了 → --restart unless-stopped
+```
+
+> **调试时记得关掉 `--restart always`。** 否则你启动一个立即崩溃的容器，它会无限重启，你的终端被日志刷屏，你还得 `docker rm -f` 才能让它停下来。
+
+---
+
+## 四、调试一个出问题的容器
+
+### 4.1 看日志
+
+```bash
+# 看最近的日志
+docker logs --tail 100 my-app
+
+# 实时跟踪
+docker logs -f my-app
+
+# 带时间戳
+docker logs -t my-app
+
+# 只看最近 30 分钟的日志
+docker logs --since 30m my-app
+
+# 看退出容器的日志（容器已经停了，日志还在）
+docker logs dead-container-name
+```
+
+### 4.2 进入容器内部
+
+```bash
+# 正常的容器：直接 exec 进去
+docker exec -it my-app bash       # 或 sh（Alpine 只有 sh）
+
+# 查看容器的文件系统（连 ls 都查不到问题在哪时用）
+docker exec my-app ls -la /app
+docker exec my-app cat /app/config.yml
+docker exec my-app env             # 查看容器内的环境变量
+docker exec my-app ps aux          # 查看容器内的进程
+docker exec my-app netstat -tlnp   # 查看容器内监听的端口
+```
+
+### 4.3 进入一个"死了的"容器
+
+容器因为启动命令失败而无法启动时，`docker exec` 进不去——因为进程没有在运行。但你可以覆盖它的启动命令：
+
+```bash
+# 覆盖 CMD，启动一个 Shell
+docker run -it --entrypoint sh my-app:v1
+# 现在你在容器里了，可以手动调试
+
+# 或者用了一个崩溃容器的镜像启动一个干净的 Shell
+docker run --rm -it my-app:v1 sh
+
+# 查看一个已停止容器的文件系统（导出整个文件系统）
+docker export dead-container | tar -tv | less
+```
+
+### 4.4 调试网络
+
+```bash
+# 查看容器的 IP 地址
+docker inspect my-app -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
+
+# 查看宿主机到容器的端口映射
+docker port my-app
+
+# 在容器内测试另一个容器的连通性
+docker exec my-app ping -c 3 172.17.0.3
+docker exec my-app curl http://other-container:8080/health
+
+# 查看容器的 DNS 配置
+docker exec my-app cat /etc/resolv.conf
+```
+
+---
+
+## 五、特权容器：当你确实需要更多权限
+
+```bash
+# --privileged：给容器几乎所有的宿主机权限（慎用！相当于把容器当 VM 用）
+docker run --privileged --name risky-container my-app:v1
+
+# --cap-add：更细粒度地添加特定 Linux Capability
+docker run --cap-add NET_ADMIN --name net-container my-app:v1  # 允许配置网络
+docker run --cap-add SYS_PTRACE --name debug-container my-app:v1 # 允许 strace
+
+# --cap-drop：丢弃能力（强化安全）
+docker run --cap-drop ALL --cap-add NET_BIND_SERVICE --name secure-app my-app:v1
+# 丢弃所有能力，只保留绑定低位端口的能力
+```
+
+> **不要用 `--privileged`。** 它给了容器修改宿主机网络、挂载磁盘、加载内核模块的能力——几乎等于让容器里的进程以 root 身份在宿主机上操作。用 `--cap-add` 精确添加需要的能力，用 `--cap-drop` 移除不必要的能力。
+
+---
+
+## 六、容器生命周期钩子
+
+```bash
+# docker run 时可以指定 init 进程，处理僵尸进程和信号转发
+docker run -d --init --name my-app my-app:v1
+# 用 tini 作为 PID 1，正确处理 SIGTERM 并转发给应用
+
+# 优雅停机：给容器时间清理资源（SIGTERM），超时才强杀（SIGKILL）
+docker stop -t 30 my-app   # 等 30 秒（默认 10 秒）
+
+# 信号传递
+docker kill -s SIGTERM my-app    # 发送 SIGTERM
+docker kill -s SIGHUP my-app     # 发送 SIGHUP（常用于通知进程重载配置）
+```
+
+> 写应用的时候注意：**你的主进程必须正确处理 SIGTERM。** Docker 停止容器时先发 SIGTERM，等 10 秒，没反应才发 SIGKILL。如果你的应用收到 SIGTERM 后不做清理直接退出，连接可能断得不干净。
+
+下一章，我们解决多容器应用的问题——Docker Compose，用一份 YAML 文件代替几十条 `docker run` 命令。

@@ -1,0 +1,5 @@
+{
+  "title": "从零开始掌握 Kubernetes",
+  "description": "从容器编排的必然性讲起，系统学习 K8s 核心组件、Pod、Deployment、Service、存储、Ingress、Helm，直到生产级最佳实践。每一篇都从真实场景引入，用类比讲清原理，配有可直接运行的命令和配置。",
+  "icon": "container"
+}

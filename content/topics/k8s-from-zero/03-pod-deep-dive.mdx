@@ -1,0 +1,313 @@
+---
+title: "Pod 深度解析：K8s 最小调度单元的一切"
+description: "从 Pod 的内部结构讲起，彻底搞懂 Init Container、Sidecar、健康检查探针、资源限制、亲和性与反亲和性——为什么 Pod 是这样设计的，以及每一个字段在真实生产中的意义。"
+order: 3
+---
+
+## 一、为什么 K8s 不直接管理容器？
+
+上一章我们提过一个关键事实：**K8s 从来不直接操作容器，它操作的最小单元是 Pod。** 这是一个设计选择，而非随意为之。
+
+想一想：如果 K8s 直接管理容器，会出现什么问题？
+
+```
+假设一个 Web 应用需要日志采集。最简单的做法——两个容器：
+
+┌─────────────────────────────┐
+│  主容器（Nginx）: port 80   │  ┌─────────────────────────┐
+│  日志容器（Filebeat）        │  │  但这俩容器如果被调度到   │
+│                              │  │  不同的机器上？           │
+│  问题：                      │  │  Filebeat 读不到主容器的  │
+│  · 它们共享同一个日志文件     │  │  日志文件——它们不在同一   │
+│  · 它们应该同生共死          │  │  台机器上了。             │
+│  · 它们之间用 localhost 通信  │  │                          │
+└─────────────────────────────┘  └─────────────────────────┘
+```
+
+Pod 的设计正是为了解决这个问题：**把需要紧密协作的容器"打包"在一起，确保它们永远被调度到同一台机器上，共享网络和存储。**
+
+---
+
+## 二、Pod 的内部解剖
+
+### 2.1 共享命名空间
+
+每个 Pod 在创建时会获得一个 **Pause 容器**（也叫 infra 容器），它率先启动，创建一个 Linux namespace 的"信封"。Pod 里的其他容器随后加入这个信封——它们共享：
+- **网络命名空间**：同一个 IP 地址，同一个端口空间。容器之间通过 `localhost` 通信。
+- **IPC 命名空间**：容器之间可以通过 System V 信号量或 POSIX 消息队列通信（实际很少用到）。
+- **共享的 Volume**：挂载到同一路径的存储卷，所有容器都能读写。
+
+```
+Pod "web-app-abc123"
+IP: 10.244.2.17
+┌──────────────────────────────────────┐
+│                                      │
+│  ┌──────────────────────┐            │
+│  │ Pause 容器            │ ← 先启动   │
+│  │ (持有 namespace)      │   创建网络  │
+│  └──────────────────────┘   和 IPC     │
+│          │               命名空间      │
+│     namespace 继承  ←────────────     │
+│     ┌─────┴─────┐                     │
+│     ▼           ▼                     │
+│  ┌────────┐ ┌──────────┐             │
+│  │ Nginx  │ │ Filebeat │             │
+│  │ :80    │ │          │             │
+│  │        │ │ 通过      │             │
+│  │ local- │←│ host 读   │             │
+│  │ host   │ │ 取日志    │             │
+│  └────────┘ └──────────┘             │
+│       │         │                     │
+│       └────┬────┘                    │
+│            ▼                          │
+│  ┌────────────────┐                  │
+│  │ /var/log/app   │ ← 共享存储         │
+│  └────────────────┘                  │
+└──────────────────────────────────────┘
+```
+
+### 2.2 Init Container：在主容器启动之前
+
+有时候，主容器启动前需要做一些准备工作——比如等待某个依赖服务就绪、创建配置文件、初始化数据库 schema。这时候就用 Init Container：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  initContainers:
+  - name: init-db
+    image: busybox:1.36
+    command: ['sh', '-c', 'until nslookup mysql-service; do echo "等待 MySQL 就绪..."; sleep 2; done']
+  - name: init-migration
+    image: myapp-migration:latest
+    command: ['./run-migrations.sh']
+  containers:
+  - name: app
+    image: myapp:latest
+```
+
+Init Container 的三个关键特性：
+1. **顺序执行**：按声明顺序一个接一个运行，前一个成功后才启动下一个
+2. **完成后退出**：Init Container 执行完就退出，主容器才启动
+3. **镜像独立**：Init Container 可以用和主容器完全不同的镜像（比如 Init Container 用 busybox 精简镜像，主容器用完整应用镜像）
+
+---
+
+## 三、健康检查：K8s 如何判断你的应用是活的
+
+如果一个容器进程还活着但服务已经卡死了（无限循环、死锁、内存泄漏导致 GC 停止世界），K8s 怎么知道？
+
+答案就是**探针（Probe）**——三把不同用途的尺子：
+
+| 探针类型 | 用途 | 失败后会发生什么 |
+|---------|------|----------------|
+| **livenessProbe** | 检查容器是否"活着" | 重启容器 |
+| **readinessProbe** | 检查容器是否"能接客" | 从 Service 的负载池中移除 |
+| **startupProbe** | 检查容器是否"已启动完毕" | 在成功之前，liveness 和 readiness 不生效 |
+
+这三个探针的区别用一句话记：**startup 管出生阶段，liveness 管活着没死，readiness 管能不能接客。**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app
+spec:
+  containers:
+  - name: app
+    image: myapp:latest
+    ports:
+    - containerPort: 8080
+    startupProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      failureThreshold: 30        # 最多等 30 × 10 = 300 秒
+      periodSeconds: 10
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 0      # startupProbe 成功后立即开始
+      periodSeconds: 10
+      failureThreshold: 3         # 连续 3 次失败 → 重启
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      periodSeconds: 5
+      failureThreshold: 3         # 连续 3 次失败 → 摘除流量
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+```
+
+**实战经验：** 很多线上事故的根因是部署时 `startupProbe` 没设，`livenessProbe` 又设得太激进——应用启动需要 30 秒，但 liveness 10 秒就开始检查，3 次失败就杀。结果新 Pod 永远起不来，因为每次启动到 30 秒就被杀了。**给足启动时间，让 startupProbe 兜底，这是最基本的线上经验。**
+
+---
+
+## 四、资源请求与限制：CPU 和内存是怎么分配的
+
+### 4.1 Requests vs Limits
+
+这是两个最容易混淆的概念：
+
+- **Requests**：容器启动时 K8s 保证分配给你的下限值。调度器根据 requests 决定 Pod 放在哪个 Node 上。
+- **Limits**：容器能使用的上限。超过 CPU limit 会被限流（throttle），超过内存 limit 会被 OOMKilled（直接杀掉）。
+
+```
+有一个 4 核 8G 的 Node，已经跑了 3 个 Pod：
+
+Pod A: request=1核2G, limit=2核4G
+Pod B: request=1核2G, limit=2核4G
+Pod C: request=1核2G, limit=2核4G
+─────────────────────────────────
+已 request: 3 核 6G（还能再调度）
+实际使用:   0.5+1.5+0.8=2.8 核, 1+3+1.5=5.5G（没到 limits）
+```
+
+K8s 根据 requests 做调度决策，根据 limits 做运行时限制。**不设 requests 的 Pod 会被视为"对资源没有要求"，调度器可能把它塞到已经过载的节点上。**
+
+### 4.2 QoS 级别
+
+K8s 根据 Pod 的 requests 和 limits 配置，自动给 Pod 分配一个 QoS（Quality of Service）级别：
+
+| QoS 级别 | 条件 | 驱逐优先级 |
+|----------|------|-----------|
+| **Guaranteed** | 每个容器的 CPU 和内存的 request == limit | 最低（最后一个被杀） |
+| **Burstable** | 至少一个容器的 request 和 limit 不等 | 中等 |
+| **BestEffort** | 没有设任何 request 和 limit | 最高（第一个被杀） |
+
+```bash
+# 查看 Pod 的 QoS 级别
+kubectl get pod <pod-name> -o jsonpath='{.status.qosClass}'
+```
+
+> 生产环境的一个硬规矩：**关键服务必须设为 Guaranteed，非关键服务至少 Burstable。BestEffort 只适用于临时调试。**
+
+---
+
+## 五、Pod 调度控制：亲和性与容忍度
+
+默认情况下，K8s 的调度器会自动为每个 Pod 找到一个合适的 Node 来运行。但有时候你需要干预这个决策。
+
+### 5.1 nodeSelector（最简单）
+
+```yaml
+spec:
+  nodeSelector:
+    disk: ssd        # 只调度到带有 disk=ssd 标签的 Node 上
+    env: production  # 同时满足多个条件
+```
+
+先给 Node 打上标签：
+
+```bash
+kubectl label node worker-1 disk=ssd
+kubectl label node worker-1 env=production
+```
+
+### 5.2 nodeAffinity / podAffinity / podAntiAffinity（灵活调度）
+
+```yaml
+spec:
+  affinity:
+    nodeAffinity:               # 控制 Pod 要调度到什么样的 Node 上
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values:
+            - zone-a
+            - zone-b
+    podAntiAffinity:            # 尽量不让同类 Pod 挤在同一台机器上
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: web-server
+          topologyKey: kubernetes.io/hostname
+```
+
+这三个参数各司其职：
+- **nodeAffinity**：Pod → Node 的规则。"我想去 SSD 节点"。
+- **podAffinity**：Pod → Pod 的规则。"我想和数据缓存 Pod 靠在一起"。
+- **podAntiAffinity**：Pod → Pod 的反规则。"别和我同类挤在同一台机器上"。
+
+### 5.3 Taints & Tolerations（节点拒绝策略）
+
+Node 可以设置"污点（Taint）"来拒绝不匹配的 Pod，Pod 必须声明自己"能忍（Toleration）"才被允许调度上去：
+
+```bash
+# 给 Node 打污点（只有 GPU 节点有特殊硬件）
+kubectl taint node gpu-node-1 hardware=gpu:NoSchedule
+```
+
+```yaml
+# Pod 表达自己能接受这个污点
+spec:
+  tolerations:
+  - key: "hardware"
+    operator: "Equal"
+    value: "gpu"
+    effect: "NoSchedule"
+```
+
+> 这种机制在真正的生产集群中很重要：GPU 节点只跑 AI 推理任务，SSD 节点只跑数据库，普通节点跑无状态服务——通过 Taint + Toleration 实现"物理上的多租户"。
+
+---
+
+## 六、Pod 生命周期与常见排错
+
+一个 Pod 的生命只需记住这组状态转换：
+
+```
+Pending → Running → Succeeded（正常退出）
+                  → Failed（异常退出）
+       → Unknown（Node 失联）
+
+Running 状态下可能还有：
+  CrashLoopBackOff → 反复崩溃
+  Terminating → 正在被删除
+  Init:0/1 → Init 容器未完成
+  PodInitializing → 正在加载
+```
+
+排错三板斧：
+
+```bash
+# 1. 看状态
+kubectl describe pod <pod-name>    # 翻到最后的 Events 部分
+
+# 2. 看日志
+kubectl logs <pod-name>            # 当前 Pod
+kubectl logs <pod-name> --previous # 上个崩溃的实例（CrashLoopBackOff 时用）
+
+# 3. 进去看
+kubectl exec -it <pod-name> -- /bin/sh
+```
+
+常见问题的诊断思路：
+
+```
+Pod 状态             可能原因                    排查方向
+──────────────────────────────────────────────────────────
+Pending 一直不消失    资源不足、镜像拉不下来        kubectl describe pod 看 Events
+                      Node 有 Taint，Pod 没设 Tolerations
+CrashLoopBackOff    应用启动失败                   kubectl logs --previous
+                     健康检查探针配置错误           检查 liveness 的端口和路径
+ImagePullBackOff    镜像名/标签写错了              确认 image: xxx 是否正确
+                     私有镜像仓库未配置认证         检查 imagePullSecrets
+Terminating 卡住     有 finalizer 未删除            kubectl get pod -o yaml 查 finalizers
+                     进程忽略了 SIGTERM 信号        给应用添加 graceful shutdown 逻辑
+```
+
+下一章，我们看看怎么用 Deployment 来管理 Pod——不用手动一个个创建，一条声明就能管理成百上千个 Pod 的滚动升级和自动回滚。

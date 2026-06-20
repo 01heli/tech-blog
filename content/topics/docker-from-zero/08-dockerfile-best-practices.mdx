@@ -1,0 +1,320 @@
+---
+title: "Dockerfile 最佳实践：20 条让镜像小、快、安全的铁律"
+description: "镜像不是能跑就行——要小（减少攻击面和传输成本）、要快（利用构建缓存）、要安全（非 root 运行、最小基础镜像、固定版本）。这 20 条铁律来自 Docker 官方和社区的多年实践。"
+order: 8
+---
+
+## 一、原则：把 Dockerfile 当"资产"而不是"脚本"
+
+很多团队的 Dockerfile 是项目早期随便写的，能用就行。但 Dockerfile 是会随着项目一起演进的核心资产。一个精心编写的 Dockerfile 和一份精心编写的代码一样重要——它直接影响构建速度、镜像大小、安全性和部署效率。
+
+这 20 条规则分四个维度：**体积、速度、安全、可维护性。**
+
+---
+
+## 二、体积篇：把镜像做小
+
+### 规则1：选对基础镜像
+
+```dockerfile
+# 差：用最大的
+FROM python:3.12                    # ~900MB
+
+# 好：用 slim（精简版，去掉编译器和开发头文件）
+FROM python:3.12-slim               # ~130MB
+
+# 更好：用 alpine（基于 musl libc 的超精简版）
+FROM python:3.12-alpine             # ~50MB
+# 注意：alpine 用 musl 而不是 glibc，某些 Python 包可能不兼容（需要编译）
+
+# 特定场景：用 distroless（Google 的"无发行版"镜像，连 Shell 都没有）
+FROM gcr.io/distroless/python3      # ~50MB，超安全但无法调试
+```
+
+| 基础镜像 | 大小 | 包管理器 | 适用场景 |
+|---------|------|---------|---------|
+| `python:3.12` | ~900MB | apt | 无所谓镜像大小的场景 |
+| `python:3.12-slim` | ~130MB | apt | **推荐：平衡了兼容性和大小** |
+| `python:3.12-alpine` | ~50MB | apk | 追求最小体积 |
+| `distroless` | ~50MB | 无 | 极致安全（无 Shell 无法调试） |
+
+### 规则2：多阶段构建
+
+```dockerfile
+# 差：在同一个镜像里构建和运行
+FROM golang:1.22
+COPY . .
+RUN go build -o /app ./cmd/app
+CMD ["/app"]
+# 最终镜像 ~950MB（包含整个 Go SDK）
+
+# 好：多阶段构建
+FROM golang:1.22 AS builder
+WORKDIR /build
+COPY . .
+RUN go build -o /app ./cmd/app
+
+FROM alpine:3.19
+COPY --from=builder /app /app
+CMD ["/app"]
+# 最终镜像 ~15MB（只有二进制 + Alpine）
+```
+
+### 规则3：合并 RUN、清理临时文件
+
+```dockerfile
+# 差：每条 RUN 一层，临时文件留在中间层
+RUN apt-get update
+RUN apt-get install -y gcc curl vim
+RUN apt-get clean
+
+# 好：合并为一层，结束前清理
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+```
+
+### 规则4：.dockerignore
+
+```dockerfile
+# .dockerignore
+.git
+.gitignore
+node_modules
+*.md
+.env
+.env.*
+Dockerfile
+docker-compose*.yml
+.gitlab-ci.yml
+.github
+.vscode
+.idea
+__pycache__
+*.pyc
+dist
+*.log
+```
+
+没有 `.dockerignore`，`COPY . .` 会把整个项目（包括 `.git/` 几 GB 的 git 历史）拷贝进镜像——这不仅让镜像变大，还可能把 `node_modules` 这类垃圾带进去覆盖了镜像里正确安装的依赖。
+
+### 规则5：不要装调试工具
+
+```dockerfile
+# 差：生产镜像里装了 vim、curl、netcat、telnet
+FROM nginx:alpine
+RUN apk add vim curl netcat-openbsd
+
+# 好：生产镜像保持最小
+FROM nginx:alpine
+# 什么都不加——用 docker exec 配合 nginx 自带工具调试
+```
+
+> 调试工具增加了攻击面（攻击者入侵后有更多工具可用）。需要临时调试时，用 `docker run --rm -it --network container:target-container alpine sh` 的方式——启动一个和 target 共享网络的临时调试容器。
+
+---
+
+## 三、速度篇：把构建做快
+
+### 规则6：把不常变的东西放前面
+
+```dockerfile
+# 差：改了代码 → 依赖也重新安装（因为 COPY . . 缓存失效了）
+FROM python:3.12-slim
+COPY . .
+RUN pip install -r requirements.txt
+
+# 好：先拷依赖文件 → 安装 → 再拷代码
+FROM python:3.12-slim
+COPY requirements.txt .
+RUN pip install -r requirements.txt    # 只要 requirements.txt 没变，这层就用缓存
+COPY . .                                # 代码经常变，放最后
+```
+
+### 规则7：构建缓存挂载（BuildKit）
+
+```dockerfile
+# Docker BuildKit（DOCKER_BUILDKIT=1）支持 --mount=type=cache
+# 让包管理器的缓存跨构建复用，大幅加速重复构建
+
+FROM python:3.12-slim
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+# pip 的下载缓存会保留在宿主机上，下次构建直接从缓存读
+```
+
+```bash
+# 启用 BuildKit
+DOCKER_BUILDKIT=1 docker build -t my-app .
+# 或永久启用：
+# /etc/docker/daemon.json: { "features": { "buildkit": true } }
+```
+
+### 规则8：并行拉取和构建
+
+```bash
+# 利用 BuildKit 的并行能力（FROM 的多个阶段可并行拉取）
+# BuildKit 自动分析 Dockerfile，把不互相依赖的阶段并行执行
+DOCKER_BUILDKIT=1 docker build -t my-app .
+```
+
+---
+
+## 四、安全篇：把镜像做安全
+
+### 规则9：不要以 root 运行
+
+```dockerfile
+# 差：默认以 root 运行
+FROM python:3.12-slim
+COPY . /app
+CMD ["python", "/app/server.py"]
+# 容器内的进程以 root 运行——如果存在漏洞，攻击者获得容器内 root 权限
+
+# 好：创建专门用户
+FROM python:3.12-slim
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+COPY --chown=appuser:appuser . /app
+USER appuser
+CMD ["python", "/app/server.py"]
+```
+
+### 规则10：固定版本，不要用 latest
+
+```dockerfile
+# 差：latest 不受控制——不同时间构建可能拉取到不同版本
+FROM python:latest
+
+# 好：精确指定版本
+FROM python:3.12.4-slim
+
+# 基础镜像的包也固定版本
+RUN pip install flask==3.0.3 gunicorn==22.0.0
+```
+
+### 规则11：使用 Docker 内容信任（签名验证）
+
+```bash
+# 启用 Docker Content Trust，只拉取签过名的镜像
+export DOCKER_CONTENT_TRUST=1
+docker pull python:3.12-slim
+# Docker 会验证镜像的数字签名，确保没有被篡改
+```
+
+### 规则12：用 COPY 而不是 ADD
+
+```dockerfile
+# 差：ADD 行为太"智能"（自动解压 tar），产生意外副作用
+ADD myapp.tar.gz /app/
+
+# 好：COPY 行为单一、透明
+COPY myapp.tar.gz /app/
+RUN tar xzf /app/myapp.tar.gz -C /app && rm /app/myapp.tar.gz
+```
+
+### 规则13：丢弃不需要的 Linux Capabilities
+
+```dockerfile
+# Dockerfile 中默认不丢 Capabilities，运行时用 --cap-drop
+docker run --cap-drop ALL --cap-add NET_BIND_SERVICE my-app:v1
+# 丢弃所有 capability，只保留绑定低位端口（<1024）的能力
+```
+
+### 规则14：用非特权端口
+
+```dockerfile
+# 如果应用不需要绑定 < 1024 的端口：
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]
+# 端口 8080 不需要 root 权限就能监听
+```
+
+---
+
+## 五、可维护性篇：把 Dockerfile 写清楚
+
+### 规则15：EXPOSE 声明端口
+
+```dockerfile
+EXPOSE 8080
+# 声明容器会监听哪些端口——文档性质，帮助理解和使用这个镜像
+```
+
+### 规则16：使用 LABEL 添加元数据
+
+```dockerfile
+LABEL org.opencontainers.image.title="My Application"
+LABEL org.opencontainers.image.version="2.1.0"
+LABEL org.opencontainers.image.description="API server for MyApp"
+LABEL org.opencontainers.image.authors="team@example.com"
+LABEL org.opencontainers.image.source="https://github.com/team/myapp"
+```
+
+这些标签遵守 OCI（Open Container Initiative）规范，GitHub Container Registry、Docker Hub 等平台会自动在镜像详情页展示。
+
+### 规则17：HEALTHCHECK 放在 Dockerfile 里
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+```
+
+写在 Dockerfile 里的健康检查让所有使用这个镜像的人自动获得健康监测能力——不需要每个人都在 `docker run` 或 Compose 里重复配置。
+
+### 规则18：用 ARG 管理可变的构建参数
+
+```dockerfile
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim
+ARG APP_VERSION=0.0.0
+ENV APP_VERSION=${APP_VERSION}
+LABEL org.opencontainers.image.version=${APP_VERSION}
+```
+
+```bash
+docker build --build-arg PYTHON_VERSION=3.11 --build-arg APP_VERSION=2.1.0 -t my-app:v2.1.0 .
+```
+
+### 规则19：优先用 Exec 形式（而不是 Shell 形式）
+
+```dockerfile
+# Shell 形式（通过 /bin/sh -c 执行）
+CMD python app.py
+# 问题 1：PID 1 是 /bin/sh，不是 python app.py（信号传递中间又多一层）
+# 问题 2：Shell 会把环境变量中的空格给吃了
+
+# Exec 形式（直接执行，推荐）
+CMD ["python", "app.py"]
+# PID 1 直接是 python app.py，信号正确传递，无 Shell 副作用
+```
+
+### 规则20：分层测试
+
+```bash
+# 构建到某一阶段停下，检查：
+docker build --target builder -t my-app:debug .
+docker run --rm -it my-app:debug sh
+
+# 查看层的大小分布：
+docker history my-app:v1
+# IMAGE          CREATED        SIZE
+# abc123         2 min ago     10MB    ← CMD
+# def456         2 min ago     50MB    ← COPY . .
+# ghi789         3 min ago     130MB   ← RUN pip install
+# jkl012         1 week ago    100MB   ← FROM python:slim
+```
+
+---
+
+## 六、优先级总结
+
+如果只能记住 5 条，选这些：
+
+1. **用合适的基础镜像（slim 或 alpine）**——从 900MB 变 100MB 是最轻松的胜利
+2. **多阶段构建**——编译环境和运行环境分离
+3. **不常变的内容放前面，常变的放最后**——构建快 10 倍
+4. **不要以 root 运行**——一条 `USER` 指令能堵住一大类安全问题
+5. **固定版本号，不用 latest**——构建可重现
+
+下一章，Docker 安全——SBOM、镜像扫描、只读根文件系统、seccomp/AppArmor 策略。

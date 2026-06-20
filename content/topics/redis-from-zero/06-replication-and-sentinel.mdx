@@ -1,0 +1,235 @@
+---
+title: "主从复制与哨兵：让 Redis 在挂掉时自动切换，业务不感知"
+description: "单机 Redis 跑得再好，一台挂了全部歇菜。主从复制让数据有了冗余副本，Sentinel 哨兵在 Master 挂掉时自动选出新 Master——理解这套高可用体系如何实现故障转移。"
+order: 6
+---
+
+## 一、单机的问题：挂了怎么办
+
+前面五章，我们一直在用一台 Redis 玩。单机能撑住 10 万 QPS 没错——但单机有一个所有工程师都睡不踏实的根子：**它只有一个。**
+
+```
+早上三点，你被电话叫醒：
+"首页打不开了"
+你一看监控——Redis 进程挂了。
+所有请求穿透到 MySQL，MySQL CPU 100%，整个系统瘫痪。
+
+如果有另一台 Redis 能立刻顶上来，你就不会在凌晨三点被叫醒了。
+```
+
+这就是高可用（HA, High Availability）要解决的问题：**当一台 Redis 挂了，另一台能无缝接替，整个过程对业务方透明。**
+
+---
+
+## 二、主从复制：数据的热备份
+
+### 2.1 基本原理
+
+主从复制让一台 Redis（Slave/Replica）持续地从另一台（Master）同步数据。Slave 上有一份和 Master 几乎一模一样的数据副本。
+
+```
+┌─────────────────┐      同步      ┌─────────────────┐
+│     Master      │ ◄──────────► │     Slave       │
+│  可读可写        │   异步复制    │  只读（默认）     │
+│  10.0.1.1:6379 │              │  10.0.1.2:6379 │
+└─────────────────┘              └─────────────────┘
+        │                                │
+        │ 写操作                           │ 读操作
+        │                                │
+   应用写请求                           应用读请求
+```
+
+Master 照常处理所有请求。每次有写操作 Master 生成复制数据流发送给 Slave Slave 重放这些操作后自己的数据就和 Master 保持一致了。
+
+### 2.2 配置主从复制
+
+```bash
+# 方式 1：在 Slave 的 redis.conf 中配置
+replicaof 10.0.1.1 6379        # 指向 Master 的 IP:Port
+masterauth mypassword          # 如果 Master 有密码
+
+# 方式 2：运行时动态修改
+redis-cli -p 6380 REPLICAOF 10.0.1.1 6379
+
+# 查看复制状态
+redis-cli INFO replication
+# role:master 或 role:slave
+# master_link_status:up 或 down
+# master_repl_offset:xxxx  (复制偏移量)
+```
+
+### 2.3 复制过程详解
+
+```
+Master                          Slave
+  │                               │
+  │ ◄──── 1. REPLICAOF 命令 ────  │  Slave 发起连接
+  │                               │
+  │ ──── 2. 返回 Run ID + offset ─►  Master 告知身份和当前数据位置
+  │                               │
+  │ ──── 3. 发送 RDB 快照 ──────►  Slave 清空自己，加载 RDB（全量同步）
+  │                               │
+  │ ──── 4. 持续发送增量命令 ────►  Slave 追赶到当前（增量同步）
+  │                               │
+  │ ◄──── 5. 心跳维持 ──────────  │  每 10 秒 REPLCONF ACK
+```
+
+**全量同步（首次连接或复制偏移量差距太大）：** Master fork 子进程生成 RDB 发送给 Slave。Slave 丢弃自己的所有数据，加载这个 RDB，然后追增量。
+
+**增量同步（短暂断连后重连）：** Master 维护了一个复制积压缓冲区（replication backlog），记录了最近的写命令。Slave 重连时带上上次的偏移量，如果偏移量还在 backlog 范围内——直接补增量。如果不在了一一重新走全量同步。
+
+```bash
+# 增大复制积压缓冲区（减少全量同步概率）
+repl-backlog-size 256mb
+repl-backlog-ttl 3600           # Slave 断开后，backlog 保留 1 小时
+```
+
+### 2.4 主从延迟问题
+
+复制是异步的——Master 写完数据后立即返回客户端，不等 Slave 确认。这意味着 Slave 上的数据比 Master 滞后几毫秒到几百毫秒。
+
+如果你的应用"写完之后立刻读"：你写入 Master 的某个 Key 然后立即去 Slave 上读这个 Key——可能读不到。解决方案：**关键业务强制读 Master，非关键业务读 Slave。** 这和数据库读写分离面临的问题完全一样。
+
+---
+
+## 三、哨兵（Sentinel）：自动故障转移
+
+### 3.1 主从复制解决不了的问题
+
+主从复制让数据有了副本，但多了一个新问题：**Master 挂了之后，谁来把 Slave 提升为新的 Master？谁来告诉应用端"新 Master 地址是什么"？**
+
+如果没有哨兵，Master 挂了之后你需要手动操作：
+
+```bash
+# 手动故障转移（没有人想做这个）：
+1. 发现 Master 挂了（凌晨三点，被电话叫醒）
+2. 登录 Slave，执行 REPLICAOF NO ONE（让它成为独立节点）
+3. 修改所有应用的 Redis 连接地址，指向新 Master
+4. 把其他 Slave 重新指向新 Master
+5. 写事故报告
+```
+
+哨兵就是把这个流程自动化的组件。
+
+### 3.2 Sentinel 的架构
+
+```
+┌─────────────────────────────────────────────┐
+│              哨兵集群（至少 3 个实例）            │
+│                                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │Sentinel-1 │  │Sentinel-2 │  │Sentinel-3 │   │
+│  │10.0.1.10 │  │10.0.1.11 │  │10.0.1.12 │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘    │
+│       └──────────────┼──────────────┘         │
+│                      │ 持续监控                │
+└──────────────────────┼───────────────────────┘
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+    ┌──────────┐ ┌──────────┐ ┌──────────┐
+    │  Master  │ │  Slave-1 │ │  Slave-2 │
+    │ :6379   │ │ :6380    │ │ :6381    │
+    └──────────┘ └──────────┘ └──────────┘
+```
+
+哨兵集群本身也是分布式的（至少 3 个实例，才能形成多数派投票）。它们持续监控 Master 和 Slave 的健康状态。
+
+### 3.3 故障转移过程
+
+```
+1. 主观下线（SDOWN, Subjective Down）
+   Sentinel-1 ping Master → 超时 → Sentinel-1 认为 Master "可能挂了"
+
+2. 客观下线（ODOWN, Objective Down）
+   Sentinel-1 问 Sentinel-2 和 Sentinel-3："你们也觉得 Master 挂了吗？"
+   如果多数（quorum ≥ 2）都同意 → 确认 Master 真的挂了
+
+3. 选举 Leader Sentinel
+   哨兵们投票选出谁来主持故障转移
+
+4. 选出新 Master
+   Leader Sentinel 从所有 Slave 中选一个：
+     · 排除掉线的
+     · 排除和已死 Master 断开太久的
+     · 在剩下的里挑复制偏移量最大的（数据最新）
+   → 向它发送 REPLICAOF NO ONE，提升为 Master
+
+5. 重新配置其他 Slave
+   其他 Slave 重新指向新 Master
+
+6. 通知客户端
+   哨兵通过 Pub/Sub 通知订阅者："Master 地址已变更"
+```
+
+**整个过程通常在 10-30 秒内完成。** 这段时间内 Redis 无法写入——这是 CAP 定理中选择了"一致性优先于可用性"的必然代价。
+
+### 3.4 Sentinel 配置
+
+```bash
+# sentinel.conf（每个 Sentinel 实例一个配置文件）
+port 26379
+
+# 监控 Master（quorum = 至少几个哨兵同意才算客观下线）
+sentinel monitor mymaster 10.0.1.1 6379 2
+
+# 如果 30 秒内没收到 Master 的响应，标记为主观下线
+sentinel down-after-milliseconds mymaster 30000
+
+# 故障转移超时（超过这个时间没完成就认为失败）
+sentinel failover-timeout mymaster 180000
+
+# 同时最多允许几个 Slave 进行同步（防止网络压力过大）
+sentinel parallel-syncs mymaster 1
+
+# Master 密码（如有）
+sentinel auth-pass mymaster mypassword
+
+# 启动哨兵
+redis-sentinel /path/to/sentinel.conf
+# 或
+redis-server /path/to/sentinel.conf --sentinel
+```
+
+### 3.5 客户端怎么知道新 Master 的地址？
+
+哨兵提供了一种叫 **哨兵发现** 的机制。客户端不直接写死 Redis 地址，而是连接到哨兵，问它们"Master 在哪"：
+
+```
+客户端 → Sentinel → "Master IP 是 10.0.1.1:6379"
+客户端 → 连接 10.0.1.1:6379
+
+（Master 挂了，故障转移后）
+
+客户端 → Sentinel → "新 Master IP 是 10.0.1.2:6380"
+客户端 → 断开旧连接，连 10.0.1.2:6380
+```
+
+主流 Redis 客户端库都内置了对 Sentinel 的支持：
+
+```python
+# Python (redis-py)
+from redis.sentinel import Sentinel
+sentinel = Sentinel([('10.0.1.10', 26379), ('10.0.1.11', 26379)], socket_timeout=0.5)
+master = sentinel.master_for('mymaster', socket_timeout=0.5)
+master.set('key', 'value')      # 自动连接到当前 Master
+```
+
+```java
+// Java (Jedis)
+Set<String> sentinels = new HashSet<>(Arrays.asList("10.0.1.10:26379", "10.0.1.11:26379"));
+JedisSentinelPool pool = new JedisSentinelPool("mymaster", sentinels);
+Jedis jedis = pool.getResource();    // 自动获取当前 Master 连接
+```
+
+---
+
+## 四、主从 + 哨兵的局限性
+
+这套架构有两个需要注意的约束：
+
+**1. 所有数据都在一台 Master 上。** 哨兵解决的是高可用，不是数据分片。总数据量不能超过单机内存。
+
+**2. 故障转移期间不可写。** 从 Master 挂掉到新 Master 选出，中间有几十秒的写入空窗。如果你的业务对写入连续性要求极高（交易系统），需要考虑客户端重试 + 缓冲机制。
+
+如果你想突破单机内存上限，需要把数据分散到多台机器上——这就是下一章要讲的 Redis Cluster。

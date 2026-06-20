@@ -1,0 +1,310 @@
+---
+title: "Ingress：域名路由、HTTPS 终止与网关模式"
+description: "NodePort 太原始，LoadBalancer 太贵。Ingress 用一套规则把多个 Service 聚到一个入口，支持域名路由、HTTPS 终止、路径重写和限流——这才是生产级的对外暴露方式。"
+order: 8
+---
+
+## 一、NodePort 和 LoadBalancer 的局限性
+
+回顾一下我们前面几种对外暴露服务的方式：
+
+| 方式 | 问题 |
+|------|------|
+| `kubectl port-forward` | 只能本地调试，不能用于生产 |
+| NodePort | 每个服务占一个 30000+ 端口，没有域名路由，没有 HTTPS |
+| LoadBalancer | 云上每个 Service 创建一个 LB——贵。5 个 Service = 5 个 LB = 每月几十到几百美元 |
+
+**而且以上方式都没有解决应用层路由的问题：**
+
+```
+用户访问 app.example.com → 想去前端 Pod
+用户访问 api.example.com → 想去后端 API Pod
+用户访问 app.example.com/admin → 想去管理后台
+
+只靠 Service（L4 负载均衡）做不到——它只看 IP:Port，不关心域名和路径。
+需要 L7（HTTP/HTTPS 层）的负载均衡能力 —— Ingress。
+```
+
+---
+
+## 二、Ingress 是什么
+
+Ingress 不是一个具体的软件，而是一套 K8s 的 API 规范（`networking.k8s.io/v1`）。它在 K8s 层面定义了一套**路由规则**，然后由一个实际的 Ingress Controller（如 Nginx、Traefik、HAProxy、Istio Gateway）来实现这些规则。
+
+```
+                     Internet
+                        │
+                        ▼
+              ┌──────────────────┐
+              │  Ingress Controller│ ← 实际运行的软件（Nginx/Traefik）
+              │  (Pod + Service)   │
+              └────────┬──────────┘
+                       │  根据 Ingress 规则路由
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+  app.example.com  api.example.com  app.example.com/admin
+        │              │              │
+        ▼              ▼              ▼
+   frontend-svc    backend-svc     admin-svc
+   (ClusterIP)     (ClusterIP)     (ClusterIP)
+```
+
+### 2.1 一个最简 Ingress 规则
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /   # Nginx 重写目标
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+  - host: api.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: backend-svc
+            port:
+              number: 8080
+```
+
+这条规则告诉 Ingress Controller：
+- `app.example.com` 的请求 → 转发到 `frontend-svc:80`
+- `api.example.com` 的 `/api` 开头的请求 → 转发到 `backend-svc:8080`
+
+### 2.2 安装 Ingress-Nginx（minikube 环境）
+
+```bash
+# minikube 自带 ingress 插件，一行启用
+minikube addons enable ingress
+
+# 验证
+kubectl get pods -n ingress-nginx
+# NAME                                        READY   STATUS
+# ingress-nginx-controller-xxx                1/1     Running
+
+# 在其他环境（如 kubeadm 集群）手动安装
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/cloud/deploy.yaml
+```
+
+---
+
+## 三、HTTPS：TLS 证书配置
+
+任何面向公网的服务都必须走 HTTPS。Ingress 原生支持 TLS 终止——在入口层解密 HTTPS，内部仍然走 HTTP（K8s 集群内部通信是安全的，不需要加密）：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-ingress
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - app.example.com
+    - api.example.com
+    secretName: example-tls       # 提前创建的 TLS Secret
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+```
+
+创建 TLS Secret：
+
+```bash
+# 方式 1：用已有的证书文件
+kubectl create secret tls example-tls \
+  --cert=fullchain.pem \
+  --key=privkey.pem
+
+# 方式 2：使用 cert-manager 自动申请和续期 Let's Encrypt 证书（推荐）
+# cert-manager 是 K8s 生态中最流行的证书管理工具，自动从 Let's Encrypt 签发免费证书
+```
+
+### 3.1 使用 cert-manager 自动管理证书
+
+```bash
+# 安装 cert-manager
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+
+# 创建 ClusterIssuer（集群级别的证书签发者）
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+EOF
+
+# 在 Ingress 中添加注解，cert-manager 自动申请证书
+# annotations:
+#   cert-manager.io/cluster-issuer: "letsencrypt-prod"
+```
+
+之后证书的自动续期完全由 cert-manager 处理——你不再需要手动管理证书了。
+
+---
+
+## 四、实用 Ingress 注解速查
+
+Ingress-Nginx 支持大量注解来控制行为：
+
+```yaml
+metadata:
+  annotations:
+    # HTTPS 强制跳转
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # 上传文件大小限制（默认 1m）
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+
+    # 连接超时
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+
+    # 限流
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+
+    # 自定义错误页面
+    nginx.ingress.kubernetes.io/custom-http-errors: "404,500,502,503,504"
+    nginx.ingress.kubernetes.io/default-backend: default-backend-svc
+
+    # CORS（跨域）
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://example.com"
+
+    # WebSocket 支持
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+    # 白名单 IP
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12"
+```
+
+---
+
+## 五、路径路由详解
+
+```yaml
+spec:
+  rules:
+  - host: shop.example.com
+    http:
+      paths:
+      # pathType 的三种模式：
+      - path: /static          # Prefix: 匹配 /static, /static/, /static/js/app.js
+        pathType: Prefix
+        backend: ...
+      - path: /admin           # Exact: 只匹配 /admin，不匹配 /admin/
+        pathType: Exact
+        backend: ...
+      - path: /health          # ImplementationSpecific: 由 Ingress Controller 自定义
+        pathType: ImplementationSpecific
+        backend: ...
+```
+
+**路由匹配优先级：** 最长前缀匹配（Longest Prefix Match）。请求 `GET /admin/users` 会优先匹配 `/admin` 而非 `/`。
+
+---
+
+## 六、金丝雀发布：用 Ingress 做灰度
+
+一个很实用的功能——通过 Ingress 注解实现金丝雀发布：
+
+```yaml
+# 现有：主版本 Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+spec:
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app-stable-svc       # 稳定版本
+            port:
+              number: 80
+---
+# 新建：金丝雀 Ingress（额外的）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-canary-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"    # 10% 流量走金丝雀
+    # 或者按 header 分流：
+    # nginx.ingress.kubernetes.io/canary-by-header: "x-canary"
+    # nginx.ingress.kubernetes.io/canary-by-header-value: "true"
+spec:
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app-canary-svc       # 新版本
+            port:
+              number: 80
+```
+
+这样 90% 的用户继续访问老版本，10% 的用户（随机）被路由到新版本。观察监控指标，没问题再逐步把 `canary-weight` 从 10 调到 50 调到 100，最后把金丝雀 Ingress 删掉，把主 Ingress 指向新版本即可。
+
+---
+
+## 七、Ingress vs Gateway API
+
+Gateway API 是 K8s 社区推进的下一代流量管理 API（`gateway.networking.k8s.io`），定位是 Ingress 的后继者。它的设计更模块化——把角色拆成基础设施提供商（GatewayClass）、集群管理员（Gateway）、应用开发者（HTTPRoute），各管各的。
+
+| 特性 | Ingress | Gateway API |
+|------|---------|-------------|
+| 成熟度 | GA，生态完善 | Beta（但已在生产可用） |
+| 多团队管理 | 困难（单个 Ingress 注解冲突） | 天然支持（多 Route 绑定到 Gateway） |
+| 流量分割 | 靠注解（各有各的写法） | 原生 `weight` 字段 |
+| 跨 namespace | 不支持 | 支持（Route 可以和 Service 不在同 namespace） |
+| 适用场景 | 简单路由 + 一个团队 | 多团队共享网关 + 复杂路由策略 |
+
+> 对于学习和中小规模项目，从 Ingress 起步完全没问题。如果你的组织有多个团队、需要复杂的流量管理和权限隔离，可以关注 Gateway API。
+
+下一章，我们看看怎么用 Helm 管理 K8s 应用的打包、安装和升级——告别手写 YAML，切换到声明式的应用管理方式。

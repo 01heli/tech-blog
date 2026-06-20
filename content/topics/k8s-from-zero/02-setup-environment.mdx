@@ -1,0 +1,254 @@
+---
+title: "环境搭建：从 minikube 到 k3s，选对工具事半功倍"
+description: "对比 minikube、kind、k3s、Docker Desktop 和 kubeadm 五种方案的适用场景，手把手搭建一个能跑起来的 K8s 集群，并理解 kubectl 的基本用法。"
+order: 2
+---
+
+## 一、选工具之前，先看清楚你站在哪
+
+在学习 K8s 的路上，第一个拦路虎往往不是概念，而是——"我连集群都没搭起来"。市面上的方案五花八门，新手很容易在纠结中浪费一整个下午。
+
+关键是先回答一个问题：**你搭这个集群是为了什么？**
+
+| 场景 | 推荐工具 | 为什么 |
+|------|---------|--------|
+| 本地开发、快速验证 | **minikube** | 一条命令启动，预装 dashboard，社区最成熟 |
+| CI/CD 环境、轻量测试 | **kind** (Kubernetes IN Docker) | 用 Docker 容器模拟 Node，启动飞快，资源占用小 |
+| 树莓派、边缘设备、低配 VPS | **k3s** | 去掉云厂商插件，二进制不到 100MB，内存占用极低 |
+| Mac/Windows 开发（已装 Docker Desktop） | **Docker Desktop 内建 K8s** | 勾选即启用，和 Docker 共享资源 |
+| 生产级集群、多节点、想从零理解每个组件 | **kubeadm** | 官方推荐的"标准"部署方式，组件可定制 |
+
+**对初学者来说，minikube 是综合体验最好的起点。** 它用虚拟机模拟一个完整的 K8s 节点，一条命令就启动了，不需要在宿主机上装任何 K8s 组件，删掉重来也很干净。
+
+> 本系列后续所有命令和配置，在以上任一环境中都可以运行，结果一致。如果你还没有选，跟着我用 minikube。
+
+---
+
+## 二、minikube 安装与启动
+
+### 2.1 前置条件
+
+- **kubectl**：K8s 的命令行客户端，用来和集群交互
+- **minikube**：在本地启动 K8s 集群的工具
+- **虚拟机驱动**（Windows/Mac 推荐 Docker Desktop，Linux 推荐 Docker 或 VirtualBox）
+
+### 2.2 安装步骤
+
+**Linux：**
+
+```bash
+# 1. 安装 kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# 2. 安装 minikube
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+```
+
+**Mac：**
+
+```bash
+brew install kubectl minikube
+```
+
+**Windows（推荐用 WSL2 或 PowerShell 管理员模式）：**
+
+```powershell
+# 用 winget
+winget install Kubernetes.kubectl
+winget install minikube
+```
+
+### 2.3 启动集群
+
+```bash
+# 用 Docker 驱动启动（前提：已安装 Docker）
+minikube start --driver=docker
+
+# 预期输出：
+# 😄  minikube v1.35.x on Ubuntu 24.04
+# ✨  Using the docker driver based on existing profile
+# 📌  Using Docker driver
+# 🏃  Starting control plane node...
+# 🔗  Configuring bridge CNI (Container Network Interface)...
+# 🔎  Verifying Kubernetes components...
+# 💡  Enabled addons: storage-provisioner, default-storageclass
+# 🏄  Done! kubectl is now configured to use "minikube" cluster.
+```
+
+启动成功后，验证：
+
+```bash
+# 查看集群状态
+kubectl cluster-info
+
+# 查看节点（此时应该能看到一个叫 minikube 的 node）
+kubectl get nodes
+
+# 查看命名空间（K8s 的逻辑隔离单元）
+kubectl get namespaces
+```
+
+---
+
+## 三、kubectl 初体验：你的 K8s 遥控器
+
+kubectl 是你和 K8s 集群之间的唯一交互界面——无论你想查看什么、创建什么、删除什么，都通过这个命令。
+
+### 3.1 kubectl 的统一语法
+
+```
+kubectl <verb> <resource-type> [<resource-name>] [flags]
+        │         │
+        │         └── 资源类型：pod, service, deployment, node, namespace...
+        └── 操作：get, describe, create, apply, delete, logs, exec...
+```
+
+日常最常用的几个命令：
+
+```bash
+# 查看
+kubectl get pods                           # 列出 default 命名空间的所有 Pod
+kubectl get pods -A                        # 列出所有命名空间的所有 Pod
+kubectl get pods -n kube-system            # 看系统组件的 Pod
+kubectl describe pod <pod-name>            # 查看一个 Pod 的详细信息
+kubectl logs <pod-name>                    # 查看 Pod 的日志
+kubectl logs -f <pod-name>                 # 实时追踪日志
+
+# 进入容器
+kubectl exec -it <pod-name> -- /bin/sh     # 进入 Pod 内部执行 shell
+
+# 创建和删除
+kubectl apply -f deployment.yaml           # 用 YAML 文件创建/更新资源
+kubectl delete pod <pod-name>              # 删除一个 Pod
+kubectl delete -f deployment.yaml          # 用 YAML 文件删除资源
+```
+
+### 3.2 跑你的第一个 Pod
+
+别急写 YAML，先用命令行快速跑一个 Nginx 看看效果：
+
+```bash
+# 创建并运行一个 Pod
+kubectl run my-first-nginx --image=nginx:latest --port=80
+
+# 查看 Pod 状态
+kubectl get pods -w   # -w 持续监听变化
+
+# 临时暴露端口（适合本地调试，生产用 Service）
+kubectl port-forward pod/my-first-nginx 8080:80
+
+# 现在访问 http://localhost:8080，你应该看到 Nginx 的欢迎页面！
+# Ctrl+C 停止端口转发
+
+# 删除
+kubectl delete pod my-first-nginx
+```
+
+这个流程虽然简单，但背后发生的事情很多：
+1. kubectl 把创建 Pod 的请求发给 API Server
+2. Scheduler 选定一个合适的 Node（目前只有一个 minikube）
+3. kubelet 收到指令，调用 Docker 拉取 `nginx:latest` 镜像并启动容器
+4. kubelet 持续向 API Server 报告 Pod 的状态
+
+---
+
+## 四、其他方案速览
+
+### 4.1 kind (Kubernetes IN Docker)
+
+```bash
+# 安装（Homebrew 或直接下二进制）
+brew install kind
+
+# 创建集群（一个命令）
+kind create cluster --name my-cluster
+
+# 多节点配置（一个 YAML 文件）
+cat <<EOF | kind create cluster --name multi-node --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+- role: worker
+EOF
+
+# 删除
+kind delete cluster --name my-cluster
+```
+
+kind 的核心思路是用 Docker 容器来模拟 K8s 节点。启动快（30 秒内），资源占用低，非常适合在 CI pipeline 中做集成测试。
+
+### 4.2 k3s —— 给边缘设备用的轻量 K8s
+
+```bash
+# 一条命令安装 Server + Agent（自动配置 kubectl）
+curl -sfL https://get.k3s.io | sh -
+
+# kubectl 配置自动写入 /etc/rancher/k3s/k3s.yaml
+sudo kubectl get nodes
+
+# 卸载也是干净的
+/usr/local/bin/k3s-uninstall.sh
+```
+
+k3s 的精髓在于"做减法"——它去掉了云厂商相关代码、Alpha 特性、不再维护的驱动、内置存储后端（默认用 SQLite 代替 etcd），把二进制压缩到 100MB 以内。在树莓派或 1GB 内存的云服务器上都能跑。
+
+### 4.3 Docker Desktop 内建 K8s
+
+如果你在 Mac 或 Windows 上已经装了 Docker Desktop：
+
+1. 打开 Docker Desktop → Settings → Kubernetes → 勾选 "Enable Kubernetes" → Apply & Restart
+2. 等待左下角 Kubernetes 图标变绿
+3. 完成——kubectl 已经自动配置好了
+
+这是最省心的方案，不需要额外安装任何东西，但缺点是你没法控制 K8s 的版本，也没有多节点。
+
+### 4.4 kubeadm —— 生产级标准方案
+
+如果你有闲置的云服务器，想搭一个真正的多节点集群，用 kubeadm：
+
+```bash
+# 在所有节点上：
+# 1. 安装 containerd（容器运行时）
+sudo apt install containerd -y
+
+# 2. 安装 kubeadm, kubelet, kubectl
+sudo apt install -y apt-transport-https ca-certificates curl
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt update
+sudo apt install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+# 在 Control Plane 节点上：
+sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+mkdir -p $HOME/.kube && sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# 安装网络插件（Flannel）
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+# 在 Worker 节点上（执行 Control Plane 输出的 join 命令）：
+sudo kubeadm join <control-plane-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
+```
+
+> kubeadm 是官方推荐的"标准"部署方式，也是考 CKA（Certified Kubernetes Administrator）认证的标准环境。但学习阶段不必折腾——minikube 就够了。
+
+---
+
+## 五、环境检查清单
+
+在进入下一章之前，确认你能跑通：
+
+```
+□ kubectl cluster-info              → 能看到 API Server 地址
+□ kubectl get nodes                 → 至少显示一个 Ready 状态的 Node
+□ kubectl get pods -A               → 看到 kube-system 下的系统 Pod 都在 Running
+□ kubectl run test --image=nginx    → 能成功运行一个临时 Pod
+□ kubectl delete pod test           → 能成功删除
+```
+
+如果上面的命令都正常，你的 K8s 学习环境已经就绪。下一章我们正式深入 K8s 最小的调度单元：Pod。

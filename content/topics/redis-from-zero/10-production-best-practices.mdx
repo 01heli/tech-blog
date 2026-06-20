@@ -1,0 +1,377 @@
+---
+title: "生产最佳实践：内存优化、慢查询、安全与监控"
+description: "把 Redis 从'能用'升级到'生产可用'的完整清单。涵盖内存优化（小对象编码、过期策略）、安全（ACL、rename-command）、慢查询排查、Prometheus 监控和运维 tips——这是一份你上线前必须逐条核对的检查清单。"
+order: 10
+---
+
+## 一、"能跑"和"能用到生产"之间的差距
+
+前九章学到的知识足够你在 Redis 里存取数据、搭建集群、应对缓存问题。但如果就这样推到生产环境，几个星期后你就会发现：
+
+- 内存不知怎么就满了
+- 偶尔会卡一下，却不知道卡在哪里
+- 某天发现被人注入了数据（因为没设密码）
+- 出问题时只能靠感觉排查
+
+这一章把这些坑提前踩平。
+
+---
+
+## 二、内存优化：Redis 最大的成本
+
+### 2.1 内存都去哪了？
+
+用 `INFO memory` 看内存全景：
+
+```bash
+redis-cli INFO memory
+
+# used_memory: 2147483648       # 总共用了 2GB
+# used_memory_rss: 2469609472    # 操作系统角度看 Redis 占用（含内存碎片）
+# mem_fragmentation_ratio: 1.15  # 碎片率 = rss / used。大于 1 表示有碎片
+# maxmemory: 4294967296          # 配置的最大内存上限
+```
+
+**碎片率（mem_fragmentation_ratio）** 是内存优化的核心指标。大于 1.5 说明碎片严重——Redis 分配和释放内存的方式导致了空洞。
+
+```bash
+# 碎片率 > 1.5 时，重启或启用自动碎片整理
+CONFIG SET activedefrag yes
+CONFIG SET active-defrag-threshold-lower 10   # 碎片超过 10% 开始整理
+```
+
+### 2.2 小对象编码：Redis 帮你省内存
+
+Redis 对小数据量自动使用紧凑编码。知道哪些编码被启用了，能帮你理解内存占用：
+
+```bash
+# 查看每种数据类型的内部编码
+OBJECT ENCODING mykey
+
+# 可能的编码：
+# String:  int（整数直接存，不用字符串）、embstr（短字符串，连续内存）、raw（长字符串）
+# Hash:    listpack（字段少且短）、hashtable（字段多或长）
+# List:    quicklist（链表+压缩列表混合）
+# Set:     listpack（成员少且短）、hashtable（成员多）
+# ZSet:    listpack（成员少且短）、skiplist+hashtable（成员多）
+```
+
+```bash
+# 查看各编码的统计信息
+redis-cli INFO memory | grep mem_
+# mem_clients_normal: 客户端缓冲区
+# mem_clients_slaves: 主从复制缓冲区
+# mem_replication_backlog: 复制积压缓冲区
+# 这些'非数据内存'加起来可能比你实际数据还多
+```
+
+### 2.3 大 Key 排查——每个 Redis 用户早晚要面对
+
+大 Key 是 Redis 的头号杀手——一个 Key 里有几百万元素的 List，几百万字段的 Hash。
+
+```bash
+# 扫描大 Key（生产环境慎用，可能拖慢 Redis）
+redis-cli --bigkeys
+
+# 输出示例：
+# Biggest string found: "user:1001:sessions" has 573218 bytes
+# Biggest list   found: "queue:processed" has 2819312 items
+```
+
+大 Key 的危害：
+- **删除时阻塞**：`DEL` 一个大 Key 需要回收大量内存，Redis 单线程卡住
+- **迁移时超时**：Cluster 做 Resharding 时，迁移一个大 Key 可能导致集群超时
+- **带宽打满**：频繁读写大 Key，网络带宽成为瓶颈
+
+```bash
+# 删除大 Key 的正确方式：用 UNLINK（异步删除，Redis 4.0+）
+UNLINK big_list_key              # 不会阻塞
+
+# 或者分批删除（适用于 List/Set/ZSet）
+# 对于 List：用 LTRIM 逐步缩减
+redis-cli LTRIM big_list 0 -100  # 只保留最后 100 个元素
+```
+
+### 2.4 内存优化 checklist
+
+```
+□ 设置 maxmemory（不要无限增长）
+□ maxmemory-policy 设为 allkeys-lru（纯缓存）或 volatile-lru（混合场景）
+□ 监控 mem_fragmentation_ratio，大于 1.5 开启自动碎片整理
+□ 定期排查大 Key（--bigkeys 或 MEMORY USAGE <key>）
+□ 短 Key 名（user:1:n 而不是 user:10001:full-name-display）
+□ 过期时间合理（不要所有 Key 同一时间过期）
+□ 用 Hash 代替多个 String 存对象字段（减少 Key 数量）
+□ 用 UNLINK 代替 DEL 删除大 Key
+```
+
+---
+
+## 三、慢查询排查
+
+### 3.1 配置慢查询日志
+
+```bash
+# redis.conf 或运行时设置
+CONFIG SET slowlog-log-slower-than 10000    # 超过 10000 微秒（10ms）就记录
+CONFIG SET slowlog-max-len 128              # 最多保留 128 条
+
+# 查看慢查询日志
+SLOWLOG GET 10                              # 最近 10 条
+
+# 输出示例：
+# 1) (integer) 42                  ← 慢查询 ID
+# 2) (integer) 1687276800          ← 发生时间戳
+# 3) (integer) 28123               ← 执行耗时（微秒，即 28ms）
+# 4) 1) "KEYS"                     ← 命令和参数
+#    2) "user:*"
+```
+
+### 3.2 常见慢操作及解决方案
+
+| 慢操作 | 为什么慢 | 替代方案 |
+|--------|---------|---------|
+| `KEYS *` | 遍历整个 Key 空间 | `SCAN` 游标迭代 |
+| `SMEMBERS` 大 Set | 返回所有成员 | `SSCAN` 分批拉取 |
+| `HGETALL` 大 Hash | 返回所有字段 | `HSCAN` 分批拉取 |
+| `DEL` 大 Key | 回收大块内存 | `UNLINK` 异步删除 |
+| `SORT` 大 List | 全量排序 | 用 ZSet 替代 |
+| Lua 脚本过长 | 执行期间阻塞 | 拆分脚本，控制执行时间 |
+
+### 3.3 延迟监控
+
+```bash
+# Redis 内置延迟监控（适合排查偶发性卡顿）
+CONFIG SET latency-monitor-threshold 100    # 超过 100ms 的延迟事件都记录
+
+# 查看延迟事件
+LATENCY LATEST                              # 最新事件
+LATENCY HISTORY command                     # 命令延迟历史
+LATENCY GRAPH command                       # 文本图表展示
+LATENCY DOCTOR                              # 自动诊断报告
+```
+
+---
+
+## 四、安全：Redis 不是内网玩具
+
+### 4.1 密码认证
+
+```bash
+# redis.conf
+requirepass "your-long-random-password"
+
+# 运行时设置
+CONFIG SET requirepass "your-long-random-password"
+
+# 客户端连接
+redis-cli -a "your-long-random-password"
+```
+
+> **密码不要写在命令行里。** `redis-cli -a password` 会在 `ps aux` 里暴露密码。用 `-a` 时 Redis 会打印一条警告——这就是原因。
+
+### 4.2 ACL（Redis 6.0+）：细粒度权限控制
+
+```bash
+# 创建用户：只读权限，只能访问 user: 前缀的 Key
+ACL SETUSER readonly_user on >mypassword ~user:* +@read
+
+# 创建用户：只能执行 GET 和 SET，只能访问 cache:* 开头的 Key
+ACL SETUSER cache_user on >cachepass ~cache:* +get +set
+
+# 禁用危险命令（对所有用户生效）
+ACL SETUSER default -@dangerous
+
+# 查看所有用户
+ACL LIST
+
+# 查看当前用户的权限
+ACL WHOAMI
+```
+
+```bash
+# 生产环境推荐 ACL 配置
+ACL SETUSER default off                     # 关闭 default 用户
+ACL SETUSER app on >strong_password_here \
+  ~cache:* ~session:* ~counter:*           # 只允许特定 Key 前缀
+  +@read +@write +@string +@hash +@list    # 只允许需要的命令类别
+  -@dangerous                               # 禁止危险命令组
+```
+
+### 4.3 禁用危险命令
+
+```bash
+# redis.conf
+rename-command FLUSHDB ""                   # 禁用
+rename-command FLUSHALL ""
+rename-command CONFIG "CONFIG_abc123"       # 重命名为只有你知道的名字
+rename-command DEBUG ""
+rename-command SHUTDOWN ""
+rename-command KEYS ""
+```
+
+### 4.4 网络安全
+
+```bash
+# redis.conf
+bind 10.0.0.0/8 172.16.0.0/12             # 绑定内网 IP，不暴露公网
+protected-mode yes                           # 无密码时拒绝非本地连接
+```
+
+**不要指望密码保护暴露在公网上的 Redis。** 最安全的做法是 Redis 根本不绑定公网 IP——把 Redis 放在 VPC 子网里，只有应用服务器能访问。
+
+---
+
+## 五、监控：Prometheus + Grafana
+
+### 5.1 关键指标
+
+```bash
+# 连接数
+redis-cli INFO stats | grep instantaneous_ops_per_sec
+# instantaneous_ops_per_sec:85321
+
+# 命中率
+redis-cli INFO stats | grep keyspace
+# keyspace_hits:12800000
+# keyspace_misses:320000
+# 命中率 = hits / (hits + misses) = 97.5%
+
+# 内存使用
+redis-cli INFO memory | grep used_memory_human
+
+# 连接客户端数
+redis-cli INFO clients | grep connected_clients
+
+# 复制状态
+redis-cli INFO replication | grep master_link_status
+```
+
+### 5.2 部署 Redis Exporter
+
+```bash
+# 部署 redis_exporter（Prometheus 的 Redis 插件）
+docker run -d --name redis-exporter -p 9121:9121 \
+  oliver006/redis_exporter \
+  --redis.addr=redis://10.0.1.1:6379 \
+  --redis.password=mypassword
+
+# Grafana 导入 Redis 面板（ID: 763）
+# 即可看到完整监控面板
+```
+
+### 5.3 需要设置告警的关键指标
+
+| 指标 | 告警阈值 | 说明 |
+|------|---------|------|
+| 内存使用率 | > 80% | 内存即将满，可能触发驱逐 |
+| 连接数 | > 80% maxclients | 可能客户端泄露 |
+| 命中率 | < 90% | 缓存策略可能需要调整 |
+| 复制延迟 | > 10 秒 | Slave 数据严重滞后 |
+| 慢查询数量 | > 10 条/分钟 | 有慢操作需要优化 |
+| 碎片率 | > 1.5 | 内存碎片严重 |
+| Master 挂了 | 不可达 | 立即告警 |
+
+---
+
+## 六、运维 Tips
+
+```bash
+# 1. 热修改配置（不需要重启）
+CONFIG SET maxmemory 4gb
+CONFIG SET maxmemory-policy allkeys-lru
+CONFIG REWRITE                  # 把运行时改的配置持久化到 redis.conf
+
+# 2. 在线备份（在 Slave 上做，不要在 Master 上）
+redis-cli -h slave-host BGSAVE
+
+# 3. 优雅停机
+redis-cli SHUTDOWN NOSAVE       # 不保存直接关
+redis-cli SHUTDOWN SAVE          # 保存后关
+
+# 4. 查看当前连接都在做什么
+redis-cli CLIENT LIST
+
+# 5. 杀掉指定连接
+redis-cli CLIENT KILL 10.0.1.5:54321
+
+# 6. 查看某个 Key 用了多少内存
+redis-cli MEMORY USAGE user:1001:profile
+
+# 7. 模拟 RDB 保存（不实际写文件），看需要多久
+redis-cli --rdb /dev/null       # 可以提前发现 save 操作的耗时
+```
+
+---
+
+## 七、上线前检查清单
+
+```
+连接与安全
+□ requirepass 或 ACL 已配置
+□ bind 在内网 IP，protected-mode yes
+□ 禁用危险命令（FLUSHDB、FLUSHALL、CONFIG、KEYS 等）
+□ ACL 使用最小权限原则
+□ 客户端连接池参数合理（最大连接数、超时、重试）
+
+内存
+□ maxmemory 已设置
+□ maxmemory-policy 根据场景正确配置
+□ 监控内存碎片率
+□ 已排查大 Key
+
+持久化
+□ RDB save 已配置（多时间窗口）
+□ AOF appendonly yes, appendfsync everysec
+□ aof-use-rdb-preamble yes（混合持久化）
+□ 持久化文件定期备份到离线存储
+
+高可用
+□ 如果是主从模式：至少 1 个 Slave + Sentinel ≥ 3 个
+□ 如果是 Cluster 模式：至少 3 Master + 3 Slave
+□ 已测试故障转移流程
+□ 连接配置指向 Sentinel 或 Cluster 节点
+
+监控
+□ redis_exporter 已部署
+□ Grafana 面板已配置
+□ 内存/命中率/慢查询/连接数告警已设置
+□ 慢查询日志阈值已调为 10ms
+
+业务
+□ Key 命名规范统一（业务:实体:属性）
+□ 缓存过期时间加随机偏移（防雪崩）
+□ 热 Key 有互斥锁或逻辑过期保护（防击穿）
+□ 缓存更新策略明确（先更库后删缓存 / Canal + binlog）
+□ 关键操作使用 Lua 脚本保证原子性
+```
+
+---
+
+## 八、学完这套专题后，下一步学什么？
+
+这 10 章带你从 Redis 是什么走到了生产级运维，覆盖了后端开发者 80% 的 Redis 日常使用场景。但 Redis 的生态还在不断演进：
+
+- **Redis Stack**：官方打包的"Redis + 常用模块"，包含 JSON、Search、TimeSeries、Bloom、Graph 等模块。如果你需要文档搜索、时序数据存储，不用引入 ES 和 InfluxDB——Redis Stack 内置了这些能力。
+- **Redisson**：Java 的 Redis 高级客户端——把 Redis 封装成了 Java 的分布式集合（RMap、RList、RQueue、RLock），大部分 API 和 JUC 对齐。如果你是 Java 栈，Redisson 值得深入学。
+- **Valkey**：Redis 7.4 变更许可证后，Linux 基金会 fork 的社区版本——保持 BSD 许可证，由原 Redis 核心维护者主导。如果你对新版 Redis 的许可证有顾虑，Valkey 是值得关注的替代方案。
+- **Garnet**：微软研究院用 C# 实现的 Redis 兼容缓存——它的独特卖点是通过存储分层（内存 + SSD）以更便宜的成本缓存更大数据量。
+
+但对于大多数开发者来说，**先把本专题的 10 章内容消化透彻，你已经是团队里 Redis 最熟的那个人了。**
+
+---
+
+## 参考资料
+
+- [Redis 官方文档](https://redis.io/docs/latest/)（权威参考，每个命令、每个配置项的完整说明）
+- [Redis 设计与实现 (黄健宏)](https://book.douban.com/subject/25900156/)（基于 Redis 3.0 源码的系统分析，理解底层实现的必读书）
+- [Redis 开发与运维 (付磊 / 张益军)](https://book.douban.com/subject/26971561/)（偏实战的 Redis 书籍，内容涵盖生产环境运维的常见问题）
+- [Redis 持久化官方文档](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)（RDB、AOF、混合持久化的官方说明）
+- [Redis Sentinel 官方文档](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/)（哨兵模式的完整配置指南）
+- [Redis Cluster 官方教程](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/)（集群搭建、槽位分配、扩缩容的官方操作手册）
+- [Redis ACL 官方文档](https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/)（Redis 6.0+ 访问控制列表的详细语法和示例）
+- [Canal (阿里巴巴开源)](https://github.com/alibaba/canal)（MySQL binlog 订阅工具，缓存与数据库一致性的核心组件）
+- [缓存穿透/击穿/雪崩 (Redis 官方博客)](https://redis.io/blog/caching-strategies/)（Redis 官方对缓存常见问题及应对方案的总结）
+- [Redis Stack 官方文档](https://redis.io/docs/latest/operate/oss_and_stack/stack-with-enterprise/)（JSON、Search、TimeSeries、Bloom 等扩展模块的完整文档）
+- [布隆过滤器原理 (Wikipedia)](https://en.wikipedia.org/wiki/Bloom_filter)（理解布隆过滤器的数学原理，面试高频知识点）
+- [redis-py 官方文档](https://redis-py.readthedocs.io/en/stable/)（Python Redis 客户端，覆盖基本操作、Pipeline、Lua、Sentinel、Cluster）

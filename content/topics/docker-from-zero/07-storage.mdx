@@ -1,0 +1,202 @@
+---
+title: "Docker 存储：卷、绑定挂载与 tmpfs——数据不该随容器一起销毁"
+description: "容器是无状态的（重启后本地修改消失），但有状态的数据（数据库、日志、用户上传的文件）必须持久化。掌握 Volume、Bind Mount、tmpfs 三种存储方式的区别、使用场景和最佳实践。"
+order: 7
+---
+
+## 一、容器文件系统的本质：可写层是临时的
+
+回顾第 3 章讲过的镜像分层：
+
+```
+┌──────────────────────┐
+│  可写层 (Read-Write)  │  ← 只有这层可以写。容器删了，这层就没了
+├──────────────────────┤
+│  镜像层 5: CMD        │
+├──────────────────────┤
+│  镜像层 4: RUN pip... │  ← 这些都是只读的
+├──────────────────────┤
+│  镜像层 3: COPY app   │
+├──────────────────────┤
+│  镜像层 2: FROM python│
+└──────────────────────┘
+```
+
+你在容器里 `apt install` 一个包、写一个文件——这些都在可写层。容器删除时，可写层随之删除，所有修改丢失。
+
+**如果你要存数据库的数据、用户上传的图片、应用日志——这些必须放在容器之外。**
+
+---
+
+## 二、三种存储方式
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      Docker 存储方式                          │
+│                                                              │
+│  Volume (卷)           Bind Mount (绑定挂载)    tmpfs (内存盘) │
+│  ┌──────────────┐     ┌──────────────┐        ┌───────────┐  │
+│  │ Docker 管理   │     │ 宿主机指定路径  │        │  纯内存    │  │
+│  │ /var/lib/    │     │ /home/user/  │        │  重启消失  │  │
+│  │ docker/      │     │ data:/data   │        │  极快      │  │
+│  │ volumes/     │     │              │        │           │  │
+│  └──────────────┘     └──────────────┘        └───────────┘  │
+│       ▲                    ▲                       ▲         │
+│       │                    │                       │         │
+│  推荐：生产环境数据库    开发环境热重载          临时敏感数据    │
+│  应用数据持久化         配置文件注入             密钥凭证      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 2.1 Volume（卷）——Docker 托管，推荐
+
+卷是 Docker 创建和管理的存储区域，位于宿主机文件系统的 `/var/lib/docker/volumes/` 下。你不需要关心具体路径——Docker 帮你管。
+
+```bash
+# 创建卷
+docker volume create pgdata
+
+# 挂载卷到容器
+docker run -d --name db \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16-alpine
+
+# 卷的名称为 pgdata，容器里的路径为 /var/lib/postgresql/data
+# Docker 自动把 pgdata 卷挂载到容器的那个路径
+
+# 查看卷
+docker volume ls
+docker volume inspect pgdata       # 查卷在宿主机上的实际路径
+
+# 删除卷
+docker volume rm pgdata
+
+# 清理所有未被使用的卷
+docker volume prune
+```
+
+**为什么用卷而不是直接挂宿主机路径？**
+
+1. 跨平台——Docker Desktop Mac 上卷也能正常工作（宿主机路径在 VM 里处理了）
+2. 权限管理——Docker 自动处理卷的文件权限，减少宿主机用户 ID 和容器内用户 ID 不一致的问题
+3. 可移植——卷可以备份、恢复、迁移到其他 Docker 宿主机
+
+### 2.2 Bind Mount（绑定挂载）——宿主机直接映射
+
+```bash
+# 把宿主机的一个目录直接挂进容器
+docker run -d --name web \
+  -v /home/user/project/html:/usr/share/nginx/html \
+  nginx:alpine
+
+# 你改了宿主机上的 /home/user/project/html/index.html
+# → 容器里的 /usr/share/nginx/html/index.html 立刻同步变化
+```
+
+**Bind Mount 的最佳场景：**
+- **开发环境代码热重载**——改代码立刻生效，不需要重新构建镜像
+- **配置文件注入**——把宿主机上的 nginx.conf 挂进去
+
+**Bind Mount 不适合：**
+- 需要 Docker 跨平台兼容——Windows 宿主机的路径格式不同
+- 需要权限隔离——容器内的 root 用户可能会修改宿主机文件
+- 生产数据库——使用卷更安全、更易管理
+
+### 2.3 tmpfs——纯内存，绝对不落盘
+
+```bash
+# tmpfs 挂载：数据只在内存中，容器停止就没了
+docker run -d --name secure-app \
+  --mount type=tmpfs,destination=/tmp/keys,tmpfs-size=64m \
+  my-app:v1
+```
+
+适合需要临时存储但绝对不能落盘的场景——密钥、临时凭证、加密素材。写入极快（内存），但重启全丢。
+
+---
+
+## 三、三种方式的对比
+
+| | Volume | Bind Mount | tmpfs |
+|------|--------|------------|-------|
+| 存储位置 | Docker 管理的目录 | 宿主机指定目录 | 内存 |
+| 由谁管理 | Docker | 用户 | Docker |
+| 跨容器共享 | 是 | 是 | 否 |
+| 持久化 | 是（容器删了卷还在） | 是（宿主机删了就没了） | 否 |
+| 性能 | 好（原生文件系统） | 好（原生文件系统） | 极高 |
+| 推荐场景 | 生产数据库、应用数据 | 开发代码挂载、配置文件 | 密钥、临时数据 |
+
+---
+
+## 四、容器间共享数据
+
+```bash
+# 场景：一个容器生成数据，另一个容器消费数据
+
+# 创建共享卷
+docker volume create shared-data
+
+# 生产者：写入数据
+docker run -d --name producer \
+  -v shared-data:/output \
+  alpine sh -c "echo 'Hello from producer' > /output/data.txt && sleep infinity"
+
+# 消费者：读取数据
+docker run --rm \
+  -v shared-data:/input \
+  alpine cat /input/data.txt
+# → Hello from producer
+```
+
+这在更复杂的数据处理流水线中很有用——上一个容器生成报告/图片/日志文件，下一个容器处理或上传它们。
+
+---
+
+## 五、备份和恢复卷
+
+```bash
+# 备份卷
+docker run --rm \
+  -v pgdata:/source \
+  -v $(pwd):/backup \
+  alpine tar czf /backup/pgdata-backup.tar.gz -C /source .
+
+# 恢复卷
+docker volume create pgdata-restored
+docker run --rm \
+  -v pgdata-restored:/target \
+  -v $(pwd):/backup \
+  alpine tar xzf /backup/pgdata-backup.tar.gz -C /target
+```
+
+---
+
+## 六、Compose 中的存储
+
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    volumes:
+      # Volume（推荐）
+      - pgdata:/var/lib/postgresql/data
+
+      # Bind Mount（开发环境）
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+      # tmpfs
+      - type: tmpfs
+        target: /tmp/pg
+
+  api:
+    volumes:
+      - ./api:/app           # 代码热重载
+      - /app/node_modules    # 匿名卷：排除 node_modules（优先于 Bind Mount）
+
+volumes:
+  pgdata:                    # 声明卷
+```
+
+> `/app/node_modules` 匿名卷的技巧：开发时挂载了整个项目目录，但 `node_modules` 在宿主机上可能没有（或不希望用它）。这个匿名卷声明让 Docker 在卷里保留镜像里的 `node_modules`，优先于外面的 Bind Mount。这样既实现了代码热重载，又保留了镜像中的依赖。
+
+下一章，Dockerfile 最佳实践——把镜像做小、做安全、做快的 20 条铁律。

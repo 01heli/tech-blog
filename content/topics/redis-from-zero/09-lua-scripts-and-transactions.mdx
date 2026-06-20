@@ -1,0 +1,235 @@
+---
+title: "Lua 脚本与事务：Redis 里的原子操作"
+description: "缓存和计数器看似简单，但要保证原子性——要么全执行要么全不执行——就不简单。Lua 脚本把多条 Redis 命令打包成一个原子块，Pipeline 让批量操作快 10 倍。理解 Redis 事务的局限性，以及 Lua 为什么是更好的方案。"
+order: 9
+---
+
+## 一、问题：你的"检查库存并下单"不是原子的
+
+```python
+# 看起来没问题的代码：
+stock = redis.get("product:2025:stock")    # 1. 读库存
+if int(stock) > 0:
+    redis.decr("product:2025:stock")        # 2. 扣库存
+    create_order()                          # 3. 创建订单
+else:
+    return "库存不足"
+```
+
+**这段代码在高并发下有竞态条件。** 两个请求同时读到 `stock=1`，都通过了第 1 步检查，都执行了第 2 步扣减——库存变成 -1，超卖了。
+
+你需要的不是"分别执行多条命令"，而是"一组命令当作一个不可分割的整体来执行"——即原子性。
+
+---
+
+## 二、Redis 的事务：MULTI/EXEC
+
+### 2.1 基本用法
+
+```bash
+MULTI                    # 开始事务
+SET user:1001:name "张三"
+INCR counter:likes
+LPUSH queue:tasks "task1"
+EXEC                     # 执行所有命令
+```
+
+`MULTI` 和 `EXEC` 之间的命令不会立即执行，而是被放入一个队列。`EXEC` 时，队列里的所有命令一次发送、顺序执行。**Redis 在执行 EXEC 时不会插入处理其他客户端的命令**——保证了这些命令在 Redis 层面是串行的。
+
+### 2.2 Redis 事务的"原子性"不是你想的那样
+
+**Redis 的事务没有回滚。** 如果事务中某条命令执行失败了（如对一个 String 类型的 Key 执行了 LPUSH），已经执行的命令不会回滚——错误发生在命令层面，事务继续执行后面的命令。
+
+```bash
+MULTI
+SET counter "hello"       # 第 1 条：成功，counter 的值变成 "hello"
+INCR counter               # 第 2 条：失败！"hello" 不能自增
+SET backup "done"          # 第 3 条：成功（不会因为第 2 条失败而跳过）
+EXEC
+# 结果：第 1、3 条执行了，第 2 条报错。没有回滚。
+```
+
+Redis 的事务满足的是"**隔离性**"（事务执行期间，其他客户端的命令不插入），但不满足传统数据库 ACID 中的"**原子性**"（失败后回滚）——因为 Redis 追求的是简单和快，回滚需要记录 undo log，这违背了它的设计哲学。
+
+### 2.3 WATCH：乐观锁
+
+`WATCH` 提供了一种"监视 Key，如果别人改了就不执行"的乐观锁机制：
+
+```bash
+WATCH product:2025:stock              # 监视库存
+stock = GET product:2025:stock        # 读库存
+# ... 如果在此之间，别的客户端修改了 product:2025:stock ...
+MULTI
+DECRBY product:2025:stock 1           # 扣库存
+EXEC                                   # 如果 stock 被改过，EXEC 返回 nil，不执行
+```
+
+如果 `EXEC` 返回 `nil`，说明数据被其他客户端修改了——你需要重试整个流程。这和 Git 的合并冲突很像——你先 pull，有冲突就解决后重新 push。
+
+```python
+# WATCH 实现库存扣减（带重试）
+while True:
+    redis.watch("product:2025:stock")
+    stock = int(redis.get("product:2025:stock"))
+    if stock <= 0:
+        redis.unwatch()
+        return "库存不足"
+
+    pipe = redis.pipeline()
+    pipe.multi()
+    pipe.decr("product:2025:stock")
+    try:
+        pipe.execute()
+        break    # 执行成功，跳出循环
+    except WatchError:
+        continue # 并发冲突，重试
+```
+
+---
+
+## 三、Lua 脚本：Redis 原子操作的终极方案
+
+### 3.1 为什么 Lua 比事务更好
+
+Redis 事务（WATCH + MULTI + EXEC）可以实现原子性，但有三个痛点：
+
+1. **逻辑分散在客户端和服务端之间**——`GET` 在客户端跑，`DECR` 在服务端跑，中间 WATCH 状态还要维护
+2. **需要客户端处理重试**——并发冲突时 `WatchError`，需要重试循环
+3. **逻辑和数据不在同一侧**——条件判断在客户端，数据在服务端，来回网络消耗
+
+Lua 脚本解决了这三件事：**把逻辑和数据放在一起——脚本在 Redis 服务端执行，整个脚本的执行过程是原子的，不会被其他命令打断。**
+
+```
+客户端告诉 Redis："执行这段 Lua 脚本"
+Redis 收到脚本 → 加载 → 执行完毕 → 返回结果
+期间不会处理任何其他客户端的命令。
+```
+
+### 3.2 写 Lua 脚本
+
+```lua
+-- stock_deduct.lua
+-- 参数：KEYS[1]=库存Key, ARGV[1]=扣减数量
+local stock = redis.call('GET', KEYS[1])
+if not stock then
+    return -1    -- Key 不存在
+end
+stock = tonumber(stock)
+if stock < tonumber(ARGV[1]) then
+    return 0     -- 库存不足
+end
+redis.call('DECRBY', KEYS[1], ARGV[1])
+return 1         -- 扣减成功
+```
+
+```bash
+# 执行 Lua 脚本
+redis-cli --eval stock_deduct.lua product:2025:stock , 1
+# EVAL <脚本> <Key数量> <Key...> <Arg...>
+redis-cli EVAL "return redis.call('GET', KEYS[1])" 1 product:2025:name
+```
+
+### 3.3 Python 中使用 Lua
+
+```python
+# 加载脚本（返回 SHA 哈希，后续用 EVALSHA 调用，节省带宽）
+stock_deduct_script = """
+local stock = redis.call('GET', KEYS[1])
+if not stock then return -1 end
+stock = tonumber(stock)
+local amount = tonumber(ARGV[1])
+if stock < amount then return 0 end
+redis.call('DECRBY', KEYS[1], amount)
+return 1
+"""
+
+# 执行
+sha = redis.script_load(stock_deduct_script)   # 预加载
+result = redis.evalsha(sha, 1, "product:2025:stock", 1)
+# result: 1=成功, 0=库存不足, -1=Key不存在
+```
+
+### 3.4 Lua 脚本实战：分布式限流器
+
+```lua
+-- rate_limiter.lua
+-- 滑动窗口限流：限制一个 IP 在窗口内最多访问 N 次
+-- KEYS[1]: 限流 Key（如 rate:ip:192.168.1.1）
+-- ARGV[1]: 窗口大小（秒）
+-- ARGV[2]: 窗口内最大允许次数
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local now = redis.call('TIME')  -- [秒, 微秒]
+local current = now[1]          -- 当前秒级时间戳
+
+-- 删除窗口外的旧记录
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, current - window)
+
+-- 统计窗口内已有请求数
+local count = redis.call('ZCARD', KEYS[1])
+if count >= limit then
+    return 0    -- 被限流了
+end
+
+-- 记录本次请求，用微秒做 score 避免同一秒内的重复被覆盖
+redis.call('ZADD', KEYS[1], current + now[2] / 1000000, current .. '-' .. now[2])
+redis.call('EXPIRE', KEYS[1], window + 1)
+return 1        -- 通过
+```
+
+### 3.5 Lua 脚本的注意事项
+
+1. **不要写耗时操作。** Redis 在跑你的 Lua 脚本时，其他所有客户端都被阻塞。脚本不该有循环遍历大量数据、不该有复杂的计算。量级是"毫秒级完成"。
+
+2. **不要有随机性。** 不要在脚本里用 `math.random()`——AOF 和主从复制需要脚本结果是确定性的。
+
+3. **用 EVALSHA 而不是 EVAL。** `EVAL` 每次把完整脚本传给 Redis，浪费带宽。`SCRIPT LOAD` 预加载后，用 `EVALSHA <sha>` 调用只需传 40 字节的 SHA 值。
+
+4. **脚本不要写得太长。** 如果逻辑很复杂，分成多个小脚本，或者把复杂逻辑放在应用层，只用 Lua 做原子性的关键操作。
+
+---
+
+## 四、Pipeline：一次发一批命令
+
+Pipeline 本身不提供原子性，但它能大幅减少网络往返次数——在高延迟网络环境下尤其有效。
+
+```
+没有 Pipeline：                    有 Pipeline：
+Client ──SET k1 v1──► Redis        Client ──┐
+      ◄──OK─────────              │ SET k1 v1 │
+      ──SET k2 v2──►              ├ SET k2 v2 ├──► Redis
+      ◄──OK─────────              ├ SET k3 v3 │
+      ──SET k3 v3──►              └ ........┘    （一次网络往返）
+      ◄──OK─────────                            ◄── OK
+      3 次网络往返                                OK
+                                                OK
+```
+
+```python
+# Python 中使用 Pipeline
+pipe = redis.pipeline()
+pipe.set('k1', 'v1')
+pipe.set('k2', 'v2')
+pipe.set('k3', 'v3')
+pipe.incr('counter')
+results = pipe.execute()     # 一次发送所有命令，一次返回所有结果
+# → [True, True, True, 1]
+```
+
+**和事务的区别：** Pipeline 里的命令不是原子的——在批量命令执行期间，可能插入其他客户端命令。它纯粹是为了减少网络往返次数，不保证隔离性。
+
+---
+
+## 五、三者对比
+
+| | MULTI/EXEC | WATCH | Lua | Pipeline |
+|------|-----------|------|-----|---------|
+| 原子性 | 有（但不回滚） | 有（乐观锁） | 有（完整原子） | 无 |
+| 逻辑在服务端执行 | 否 | 否 | **是** | 否 |
+| 减少网络往返 | 是 | 否 | 是 | **是** |
+| 需要客户端处理冲突 | 否 | **是** | 否 | 否 |
+| 适用场景 | 简单原子命令组 | 需要条件判断的原子操作 | **复杂条件 + 多条命令** | 批量读写 |
+
+> **最佳实践：用 Lua 脚本替代 WATCH + MULTI/EXEC。** Lua 让条件和动作都在服务端执行，结果更可预测，代码更清晰。只有在你需要跨越多个 Redis 节点操作时（Cluster 模式），才退回到 WATCH 模式。
+
+下一章，我们把前面学的所有东西串起来——生产环境怎么配、怎么监控、怎么排查问题。

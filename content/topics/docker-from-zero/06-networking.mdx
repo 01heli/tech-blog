@@ -1,0 +1,238 @@
+---
+title: "Docker 网络：容器之间怎么通信——Bridge、Overlay、Host 与自定义网络"
+description: "容器默认是网络隔离的，但现实中的服务需要互相通信。理解 Docker 的四种网络模式、DNS 服务发现、自定义网络的安全隔离，以及如何在多容器环境中构建安全的网络拓扑。"
+order: 6
+---
+
+## 一、容器的默认网络：谁都不认识谁
+
+启动两个容器，它们默认不在同一个网络上——互相 ping 不通。
+
+```bash
+docker run -d --name container-a nginx:alpine
+docker run -d --name container-b nginx:alpine
+
+# container-a 不知道 container-b 在哪
+docker exec container-a ping container-b
+# ping: bad address 'container-b'
+```
+
+这不是 bug——这是设计。**容器默认网络隔离，你需要显式地让它们可以通信。**
+
+---
+
+## 二、Docker 的四种网络模式
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Docker 网络模式                       │
+│                                                     │
+│  Bridge (默认)    自定义 Bridge      Host            │
+│  ┌────────┐      ┌────────┐      ┌────────┐        │
+│  │容器A 容器B│    │容器C 容器D│    │容器E     │        │
+│  │ 互相隔离  │    │ 互相通信  │    │直接用宿   │        │
+│  │docker0  │    │my-net   │    │主机网络栈│        │
+│  └────────┘      └────────┘      └────────┘        │
+│                                                     │
+│  None             Overlay            IPvlan/Macvlan │
+│  ┌────────┐      ┌────────┐      ┌────────┐        │
+│  │容器F     │    │跨宿主机  │      │ 容器直接 │        │
+│  │无网络    │    │容器通信  │      │接物理网络│        │
+│  └────────┘      └────────┘      └────────┘        │
+└─────────────────────────────────────────────────────┘
+```
+
+### 2.1 Bridge（桥接网络，默认）
+
+Docker 在宿主机上创建了一个虚拟网桥 `docker0`（相当于一个虚拟交换机）。每个容器都连接到这个网桥上，有自己的虚拟网卡和 IP 地址。**默认 Bridge 网络的容器可以通过 IP 互通，但不能通过容器名互通。**
+
+```
+宿主机 (192.168.1.10)
+  │
+  ├── docker0 (172.17.0.1，虚拟网桥，相当于交换机)
+  │     │
+  │     ├── veth001 ─── container-a (172.17.0.2)
+  │     └── veth002 ─── container-b (172.17.0.3)
+  │
+  └── eth0 (192.168.1.10，宿主机物理网卡)
+         ▲
+         │ NAT 转换
+         │ 容器访问外网通过 SNAT
+         │ 外网访问容器需要端口映射 -p
+```
+
+**默认 Bridge 的缺点：容器之间只能通过 IP 通信，不能用容器名。而容器的 IP 每次重启可能变化。**
+
+### 2.2 自定义 Bridge（推荐）
+
+```bash
+# 创建自定义网络
+docker network create my-net
+
+# 启动容器连接到自定义网络
+docker run -d --name web --network my-net nginx:alpine
+docker run -d --name api --network my-net my-api:v1
+
+# 关键区别：自定义网络内置了 DNS 解析
+docker exec web ping api
+# PING api (172.18.0.3) 56(84) bytes of data.
+# 可以通过容器名直接通信！
+```
+
+**自定义 Bridge 网络 = 默认 Bridge 的功能 + DNS 服务发现。** 容器可以用容器名互相访问，不需要记住 IP。这是单机多容器通信的标准方案。
+
+### 2.3 Host 模式
+
+```bash
+docker run -d --network host --name web nginx:alpine
+# 容器直接使用宿主机的网络栈——没有独立的 IP，不经过 NAT
+# 容器监听的 80 端口就是宿主机的 80 端口（不需要 -p 映射）
+```
+
+Host 模式性能最高（没有网络转发开销），但**端口直接暴露在宿主机上，安全性和隔离性最差**，且不同容器可能端口冲突。适合对网络性能要求极高的场景（如实时音视频、高频交易）。
+
+### 2.4 None 模式
+
+```bash
+docker run -d --network none --name isolated alpine sleep infinity
+# 容器只有 lo 回环网卡，完全无网络
+docker exec isolated ifconfig
+# lo        Link encap:Local Loopback    ← 只有这一个
+```
+
+适合不需要网络的任务（数据处理、批量计算），或者你需要自己手动配置网络的时候。
+
+### 2.5 Overlay 网络（多主机）
+
+单台 Docker 宿主机用 Bridge 就够了。当你的容器分布在多台机器上时，需要 Overlay 网络让不同宿主机上的容器能直接通信——这是 Docker Swarm 和 Kubernetes 使用的网络模式。
+
+```
+宿主机 1 (10.0.1.1)                  宿主机 2 (10.0.1.2)
+┌─────────────────┐                  ┌─────────────────┐
+│  container-a    │                  │  container-b    │
+│  10.0.10.2      │                  │  10.0.10.3      │
+└────────┬────────┘                  └────────┬────────┘
+         │                                    │
+    ┌────▼────┐                          ┌────▼────┐
+    │VXLAN 隧道│◄────── Overlay ────────►│VXLAN 隧道│
+    └────┬────┘                          └────┬────┘
+         │                                    │
+    宿主机物理网络 (eth0)  ← 真实的包在这里传输 →
+```
+
+---
+
+## 三、自定义网络的实战用法
+
+### 3.1 为不同服务创建隔离的网络
+
+```bash
+# 创建两个独立的网络
+docker network create frontend
+docker network create backend
+
+# 数据库：只连 backend（前端和外部都访问不到）
+docker run -d --name db --network backend \
+  -e MYSQL_ROOT_PASSWORD=secret mysql:8
+
+# API：同时连 frontend 和 backend（接收前端请求，访问数据库）
+docker run -d --name api --network backend my-api:v1
+docker network connect frontend api     # 一个容器可以连接到多个网络！
+
+# Nginx：只连 frontend（只负责转发前端请求到 API）
+docker run -d --name nginx --network frontend -p 80:80 nginx:alpine
+```
+
+```
+网络拓扑：
+
+Internet
+    │
+    ▼
+┌──────────┐     frontend 网络      ┌──────────┐     backend 网络     ┌──────────┐
+│  Nginx   │ ◄──────────────────► │   API    │ ◄──────────────────► │    DB    │
+│ (frontend)│                      │(frontend │                      │ (backend)│
+│          │                      │ backend) │                      │          │
+└──────────┘                      └──────────┘                      └──────────┘
+       ▲                                ▲                                ▲
+       │  公网可访问                    │  仅内部                        │  深度隔离
+       │  (port 80)                    │  Nginx 和 API 能通            │  只有 API 能通
+```
+
+**关键安全原则：DB 绝不暴露在 frontend 网络中。** 即使 Nginx 被攻破，攻击者也直接访问不到数据库——因为 Nginx 根本没有接 backend 网络。
+
+### 3.2 网络管理命令
+
+```bash
+# 查看所有网络
+docker network ls
+
+# 查看网络详细信息（连着哪些容器、各自的 IP）
+docker network inspect my-net
+
+# 查看容器的网络配置
+docker inspect web --format '{{json .NetworkSettings.Networks}}'
+
+# 动态连接/断开网络
+docker network connect my-net container-name
+docker network disconnect my-net container-name
+
+# 删除网络（不能有容器连着）
+docker network rm my-net
+
+# 清理未使用的网络
+docker network prune
+```
+
+---
+
+## 四、容器 DNS 解析机制
+
+```bash
+# 查看容器的 DNS 配置
+docker exec web cat /etc/resolv.conf
+# nameserver 127.0.0.11        ← Docker 内置的 DNS 服务器
+# options ndots:0
+
+# Docker DNS 解析规则：
+# 1. 先查容器名 → 找到同网络中该容器的 IP
+# 2. 再查服务名（Compose 中）→ 找到对应服务的虚拟 IP
+# 3. 最后查外部 DNS
+
+# 测试 DNS
+docker exec web nslookup api
+# Server:    127.0.0.11
+# Address 1: 127.0.0.11
+# Name:      api
+# Address 1: 172.18.0.3        ← 自定义网络的 DNS 自动注册了容器名
+```
+
+> Docker 的 DNS 只在自定义网络中生效。默认 Bridge 网络没有 DNS 服务器——这就是为什么默认 Bridge 中只能用 IP 通信。
+
+---
+
+## 五、网络排错手册
+
+```bash
+# 1. 检查网络是否通了
+docker exec container-a ping container-b
+
+# 2. 检查 DNS 是否生效
+docker exec container-a nslookup container-b
+
+# 3. 检查是否在同一网络
+docker network inspect my-net | grep -A 5 "Containers"
+
+# 4. 检查容器监听的端口
+docker exec api netstat -tlnp
+
+# 5. 查看 iptables 规则（Docker 自动管理的 NAT 规则）
+iptables -t nat -L DOCKER
+
+# 6. 常见问题：
+#    "No route to host"      → 不在同一网络
+#    "Connection refused"    → 网络通了但端口没监听
+#    "Name or service not known" → DNS 没生效，检查是否在自定义网络
+```
+
+下一章，看 Docker 存储——卷（Volume）、绑定挂载（Bind Mount）和 tmpfs 的区别，以及数据怎么在容器间共享。

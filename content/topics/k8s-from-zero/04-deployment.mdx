@@ -1,0 +1,261 @@
+---
+title: "Deployment：声明式部署、滚动更新与自动回滚"
+description: "从 YAML 的最简配置讲起，逐步拆解 Deployment 的滚动更新策略、版本记录、自动回滚机制和金丝雀发布，搭配实战演示。"
+order: 4
+---
+
+## 一、为什么需要 Deployment？
+
+上一章我们手动创建了 Pod。你可以用 `kubectl run` 或 YAML 直接创建一个 Pod，让它跑起来。但这和直接 `docker run` 没什么本质区别——Pod 挂了就是挂了，不会自动补一个。
+
+**Deployment 的价值在于"管理 Pod 的变化"——不是创建 Pod，而是持续确保 Pod 的数量和版本符合你的期望。**
+
+它解决了三个核心问题：
+1. **多副本管理**：任何时候你指定的副本数都在运行
+2. **滚动更新**：换新版本镜像时，逐个替换 Pod，服务不中断
+3. **回滚**：新版本有问题？一条命令回到上一个稳定版本
+
+---
+
+## 二、一个最简 Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deploy
+  labels:
+    app: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web            # 必须和 Pod 模板的 labels 匹配
+  template:                # Pod 模板
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+```
+
+```bash
+# 部署
+kubectl apply -f deployment.yaml
+
+# 观察变化
+kubectl get deploy -w       # 看 deployment 状态
+kubectl get pods -w          # 看 Pod 逐个出现
+kubectl get rs -w            # 看 ReplicaSet 自动创建
+```
+
+**关系链条：Deployment → ReplicaSet → Pod。**
+
+当你创建一个 Deployment 时，K8s 自动创建一个 ReplicaSet，ReplicaSet 再创建 Pod。你日常操作的是 Deployment，不用直接管 ReplicaSet——但理解这个链条对于后续的更新和回滚很重要。
+
+---
+
+## 三、滚动更新的完整过程
+
+假设你正在运行 3 个 v1 版本的 Pod，现在要把它们升级到 v2：
+
+```bash
+# 修改镜像版本
+kubectl set image deploy/web-deploy nginx=nginx:1.26
+
+# 或者编辑 YAML 重新 apply
+kubectl edit deploy web-deploy
+```
+
+Deployment Controller 会执行以下步骤：
+
+```
+Step 0: 3 个 v1 Pod 在运行
+  [v1] [v1] [v1]
+
+Step 1: 创建 1 个 v2 Pod，等它 Ready
+  [v1] [v1] [v1] [v2]          ← 4 个了
+
+Step 2: 干掉 1 个 v1 Pod
+  [v1] [v1]      [v2]
+
+Step 3: 创建第 2 个 v2 Pod（重复上面过程）
+  [v1] [v1]      [v2] [v2]
+
+Step 4: 再杀 1 个 v1
+  [v1]           [v2] [v2]
+
+...持续到所有 v1 被替换为 v2
+  [v2] [v2] [v2]
+```
+
+控制更新节奏的参数（`spec.strategy`）：
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1    # 最多允许几个 Pod 不可用（可以是数字或百分比）
+      maxSurge: 1           # 最多允许超出期望数几个 Pod（让总数暂时变多）
+```
+
+- `maxSurge: 1`：升级过程中，集群允许最多出现 3+1=4 个 Pod（新老混在一起）
+- `maxUnavailable: 1`：最少保持 3-1=2 个 Pod 在线
+
+> **激进 vs 保守：** 如果设 `maxUnavailable: 2, maxSurge: 2`，升级更快但服务容量可能瞬间只剩余 1 个。如果设 `maxUnavailable: 0` 和 `maxSurge: 1`，升级期间服务容量不低于 100%（因为先启新的再杀旧的），但需要额外的资源。生产环境常见配置是 `maxUnavailable: 25%` 和 `maxSurge: 25%`——在速度和稳定性之间取中。
+
+---
+
+## 四、回滚：新版本有问题？别慌，一条命令回去
+
+Deployment 自动记录每一次变更（`--record` 在旧版需要，新版默认记录）：
+
+```bash
+# 查看变更历史
+kubectl rollout history deploy/web-deploy
+
+# 查看某次变更的具体内容
+kubectl rollout history deploy/web-deploy --revision=3
+
+# 回滚到上一个版本
+kubectl rollout undo deploy/web-deploy
+
+# 回滚到指定的历史版本
+kubectl rollout undo deploy/web-deploy --to-revision=2
+
+# 查看回滚状态
+kubectl rollout status deploy/web-deploy
+```
+
+回滚的原理很简单：Deployment 保留了旧的 ReplicaSet（缩容到 0，但不删除），回滚时把旧 RS 扩回来、新 RS 缩到 0。
+
+```bash
+# 你可以看到所有历史 ReplicaSet
+kubectl get rs -l app=web
+# 输出类似：
+# NAME                    DESIRED   CURRENT   READY   AGE
+# web-deploy-7d4f8b9c7    3         3         3       1h   ← 当前版本
+# web-deploy-6c3e5a8d2    0         0         0       2d   ← 上一个版本，备用
+# web-deploy-5b2d9f6a1    0         0         0       5d   ← 更早的版本
+```
+
+---
+
+## 五、滚动升级的保护措施
+
+### 5.1 progressDeadlineSeconds
+
+如果升级过程卡住了，Deployment 不会无限等下去：
+
+```yaml
+spec:
+  progressDeadlineSeconds: 600   # 10 分钟内必须完成升级，否则标记为 Failed
+```
+
+超过这个时间还没完成（比如新 Pod 一直没 Ready，或者镜像拉不下来），Deployment 的状态会变成 `Progressing: False`，事件日志里会有说明。
+
+### 5.2 minReadySeconds
+
+Pod Ready 后，不要立刻把下一个老 Pod 杀掉。多等几秒，确认这个 Pod 真的没问题：
+
+```yaml
+spec:
+  minReadySeconds: 10   # Pod 变为 Ready 后再等 10 秒才算"真 Ready"
+```
+
+这个参数很有用：某些应用的 `/health` 端点返回 200，但实际业务逻辑的初始化需要更多时间。不留这个缓冲，就可能出现所有 Pod 都滚完了才发现新版本有问题。
+
+### 5.3 revisionHistoryLimit
+
+历史 ReplicaSet 没必要无限保留：
+
+```yaml
+spec:
+  revisionHistoryLimit: 5    # 只保留最近 5 个版本（默认是 10）
+```
+
+---
+
+## 六、实际演练：从部署到回滚的完整流程
+
+```bash
+# 1. 部署 v1
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 2
+          periodSeconds: 2
+EOF
+
+# 2. 等待部署完成
+kubectl rollout status deploy/demo-app
+
+# 3. 查看当前状态
+kubectl get pods -l app=demo
+
+# 4. 升级到 v2，同时实时观察
+kubectl set image deploy/demo-app app=nginx:1.26
+kubectl rollout status deploy/demo-app
+
+# 5. 部署过程中（另一个终端）持续请求，感受零宕机
+while true; do curl -s http://<service-ip>/; sleep 0.5; done
+
+# 6. 假设新版本有问题，立即回滚
+kubectl rollout undo deploy/demo-app
+kubectl rollout status deploy/demo-app
+
+# 7. 验证回滚成功——所有 Pod 又变回了 nginx:1.25
+kubectl get pods -l app=demo -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}'
+
+# 8. 清理
+kubectl delete deploy demo-app
+```
+
+---
+
+## 七、蓝绿部署 vs 金丝雀发布 vs 滚动更新
+
+Deployment 原生支持的是滚动更新。但在实际生产中，你还会遇到另外两种发布策略，这里一并说明它们的区别：
+
+| 策略 | 怎么做 | 优点 | 缺点 | K8s 怎么实现 |
+|------|-------|------|------|------------|
+| **滚动更新** | 逐个替换旧 Pod | 平滑，不中断 | 回滚慢，新老版本短暂共存 | Deployment 原生支持 |
+| **蓝绿部署** | 启动完整的新环境，然后一次性切流量 | 回滚秒级，没有中间状态 | 双倍资源消耗 | 创建两个 Deployment + 切换 Service selector |
+| **金丝雀发布** | 先放少量新版本 Pod，跑一段时间，没问题再全量 | 风险最低 | 操作复杂，需要流量分配 | Ingress + 两个 Service（或 Istio/Argo Rollouts） |
+
+对于大多数中小规模项目，**滚动更新就够了**。当你的服务有严格的 SLA 且用户量大到一个小故障就会上热搜时，再考虑蓝绿或金丝雀。
+
+下一章，我们解决一个更现实的问题：Pod 的 IP 来来回回变，Service 是怎么让前端稳定找到后端的？

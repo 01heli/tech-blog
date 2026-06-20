@@ -1,0 +1,319 @@
+---
+title: "Helm：K8s 的包管理器——告别手写 YAML"
+description: "理解 Chart、Template、Release 的概念，用 Go Template 实现一次编写到处部署，掌握 Values 分层、Hook 机制和私有仓库搭建。"
+order: 9
+---
+
+## 一、问题：YAML 文件太难管了
+
+现在你已经写了不少 YAML 文件：Deployment、Service、ConfigMap、Secret、Ingress……一个微服务可能就有 5-6 个 YAML。10 个微服务就是 50-60 个文件，每个文件的镜像版本、环境变量、端口号还不一样。更糟糕的是——开发环境和生产环境大部分配置相同，只有一小部分不同（数据库地址、日志级别、副本数）。你不可能给每个环境各维护一份 YAML 拷贝。
+
+**Helm 就是 K8s 世界的包管理器**——就像 apt/yum 之于 Linux、npm 之于 Node.js。但它不仅仅是包管理器，它更是一个模板引擎：你把公共部分写成模板，差异部分通过 Values 注入。
+
+```
+手写 YAML 模式：                      Helm 模式：
+
+开发环境:                             模板（Chart/templates/）:
+  deployment-dev.yaml  ┐                 deployment.yaml  ← 用 {{ .Values.xxx }} 占位
+  service-dev.yaml     ├ 90% 重复       service.yaml
+  config-dev.yaml      ┘                config.yaml
+                                      Values:
+ 生产环境:                              dev-values.yaml   ← 只写差异部分
+  deployment-prod.yaml ┐                 prod-values.yaml
+  service-prod.yaml    ├ 90% 重复
+  config-prod.yaml     ┘
+```
+
+---
+
+## 二、Helm 核心概念
+
+| 概念 | 说明 | 类比 |
+|------|------|------|
+| **Chart** | 一个打包好的 K8s 应用模板集合 | npm package |
+| **Repository** | 存放 Chart 的地方 | npm registry |
+| **Release** | Chart 安装到集群后产生的一个实例 | 安装后的 node_modules |
+| **Revision** | Release 的每次升级生成一个新的版本号 | 版本历史 |
+
+一个 Chart 的目录结构：
+
+```
+mychart/
+├── Chart.yaml            # Chart 元信息（名称、版本、描述）
+├── values.yaml            # 默认配置值
+├── charts/                # 依赖的子 Chart
+├── templates/             # K8s 资源模板（Go Template）
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── _helpers.tpl       # 辅助模板函数（以 _ 开头不会被渲染）
+│   └── NOTES.txt          # 安装后显示的提示信息
+└── .helmignore
+```
+
+---
+
+## 三、快速上手
+
+### 3.1 安装 Helm
+
+```bash
+# Mac
+brew install helm
+
+# Linux
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Windows
+winget install Helm.Helm
+
+# 验证
+helm version
+```
+
+### 3.2 创建和安装第一个 Chart
+
+```bash
+# 创建一个新的 Chart 骨架
+helm create my-web-app
+
+# 查看会生成什么
+helm template my-web-app ./my-web-app
+
+# 安装到集群（生成一个 Release）
+helm install my-release ./my-web-app
+
+# 查看已安装的 Release
+helm list
+
+# 卸载
+helm uninstall my-release
+```
+
+### 3.3 使用别人的 Chart
+
+```bash
+# 添加仓库
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+
+# 更新仓库索引
+helm repo update
+
+# 搜索
+helm search repo nginx
+helm search repo wordpress
+
+# 安装（指定自定义配置）
+helm install my-nginx bitnami/nginx \
+  --set service.type=NodePort \
+  --set replicaCount=2
+
+# 查看当前 Release 的所有可配置值
+helm show values bitnami/nginx
+```
+
+---
+
+## 四、模板语法速成：Go Template
+
+Helm 模板使用 Go 的 `text/template` 引擎。以下是你在日常写 Chart 时会频繁用到的语法：
+
+```yaml
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-{{ .Chart.Name }}
+  labels:
+    app: {{ .Values.appName | default "myapp" }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "mychart.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "mychart.labels" . | nindent 8 }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        {{- if .Values.image.pullPolicy }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        {{- end }}
+        ports:
+        - containerPort: {{ .Values.containerPort }}
+        {{- with .Values.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        env:
+        {{- range .Values.env }}
+        - name: {{ .name }}
+          value: {{ .value | quote }}
+        {{- end }}
+```
+
+**常用内置对象：**
+- `{{ .Release.Name }}` — Release 名称
+- `{{ .Release.Namespace }}` — 安装到的命名空间
+- `{{ .Chart.Name }}` — Chart 名称
+- `{{ .Chart.Version }}` — Chart 版本
+- `{{ .Values.xxx }}` — values.yaml 中的配置
+
+**常用函数：**
+- `{{ .Values.key | default "fallback" }}` — 设置默认值
+- `{{ .Values.list | toYaml | nindent 8 }}` — 转 YAML 并缩进
+- `{{ .Values.str | quote }}` — 加引号
+- `{{ include "template-name" . }}` — 引用辅助模板
+- `{{- if .Values.cond }}...{{- end }}` — 条件判断（`-` 去掉前后空白）
+- `{{- range .Values.list }}...{{- end }}` — 遍历列表
+
+### 4.1 _helpers.tpl：定义可复用的模板片段
+
+```yaml
+# templates/_helpers.tpl
+{{- define "mychart.name" -}}
+{{- .Chart.Name | trunc 63 | trimSuffix "-" }}
+{{- end -}}
+
+{{- define "mychart.labels" -}}
+app.kubernetes.io/name: {{ include "mychart.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+```
+
+---
+
+## 五、Values 分层：多环境配置的正确姿势
+
+Helm 支持在安装时传入多个 Values 文件，后面的会覆盖前面的：
+
+```yaml
+# values.yaml（基础默认值）
+replicaCount: 1
+image:
+  repository: myapp
+  tag: latest
+service:
+  type: ClusterIP
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+```
+
+```yaml
+# values-dev.yaml（开发环境覆盖）
+replicaCount: 1
+image:
+  tag: dev-abc123
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+```
+
+```yaml
+# values-prod.yaml（生产环境覆盖）
+replicaCount: 5
+image:
+  tag: v2.1.0
+service:
+  type: LoadBalancer
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+```
+
+安装时按顺序覆盖：
+
+```bash
+# 开发环境安装
+helm install myapp ./mychart \
+  -f values.yaml \
+  -f values-dev.yaml
+
+# 生产环境安装
+helm install myapp ./mychart \
+  -f values.yaml \
+  -f values-prod.yaml \
+  --set image.tag=v2.1.1    # 命令行覆盖优先级最高
+```
+
+> 优先级从低到高：`Chart 默认值` → `-f 文件`（按顺序） → `--set`
+
+---
+
+## 六、升级与回滚
+
+```bash
+# 升级 Release
+helm upgrade my-release ./mychart -f values-prod.yaml
+
+# 查看版本历史
+helm history my-release
+
+# 回滚到上一个版本
+helm rollback my-release
+
+# 回滚到指定版本
+helm rollback my-release 2
+```
+
+---
+
+## 七、Hook：在安装生命周期中插入操作
+
+Helm 的 Hook 让你能在 Chart 安装/升级/删除的不同阶段执行特定操作——比如安装前创建数据库、删除前备份数据：
+
+```yaml
+# templates/db-migration-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-db-migrate
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-install       # 安装/升级前执行
+    "helm.sh/hook-weight": "5"                    # 执行顺序（数字越小越先执行）
+    "helm.sh/hook-delete-policy": hook-succeeded  # 成功后自动删除
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: myapp-migration:{{ .Values.image.tag }}
+        command: ['./run-migrations.sh']
+```
+
+常用 Hook 时机：`pre-install`、`post-install`、`pre-upgrade`、`post-upgrade`、`pre-rollback`、`post-rollback`、`pre-delete`（删除前备份）。
+
+---
+
+## 八、私有 Chart 仓库
+
+组织内部通常需要搭建私有的 Chart 仓库（而不是把 Helm Chart 公开在互联网上）：
+
+```bash
+# 方式 1：Git 仓库 + index 文件（最简单）
+helm package ./mychart
+helm repo index --url https://charts.example.com/ .
+# 把 mychart-0.1.0.tgz 和 index.yaml 上传到 Web 服务器或对象存储
+helm repo add myrepo https://charts.example.com
+
+# 方式 2：OCI 兼容的容器镜像仓库（推荐）
+helm package ./mychart
+helm push mychart-0.1.0.tgz oci://registry.example.com/charts
+helm install myapp oci://registry.example.com/charts/mychart --version 0.1.0
+
+# 方式 3：使用 Harbor / ChartMuseum 等专用工具
+```
+
+> OCI 模式是从 Helm 3.8.0 开始支持的，用一个标准的 Docker Registry 就能存 Helm Chart——不需要额外的索引服务，很多组织已经在用。
+
+下一章，我们把前面学到的一切揉在一起，看看怎么把应用搬到生产环境——资源限制怎么做、安全怎么保障、监控怎么配、架构怎么设计。

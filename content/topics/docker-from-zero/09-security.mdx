@@ -1,0 +1,230 @@
+---
+title: "Docker 安全：镜像扫描、只读文件系统、seccomp 与容器逃逸防线"
+description: "安全不是上线后的一次渗透测试——它从 Dockerfile 的第一行就开始了。镜像漏洞扫描、只读根文件系统、seccomp/AppArmor 系统调用限制、容器逃逸的防线——构建一个'就算被攻破了也做不了什么'的容器环境。"
+order: 9
+---
+
+## 一、容器安全的边界在哪
+
+容器的隔离性比虚拟机弱——共享一个内核意味着内核漏洞可能被利用来进行"容器逃逸"。但容器安全不是全有或全无——你可以在多个层面构建纵深防线：
+
+```
+                             攻击者难度
+
+应用层       安全代码、最小权限              →  低难度（常见漏洞）
+镜像层       漏洞扫描、最小基础镜像            →  中低难度
+容器运行时    非 root、只读文件系统             →  中等难度
+内核层       seccomp、AppArmor、Capability    →  高难度
+宿主机层     最小化宿主机、审计日志              →  最高难度
+```
+
+**每一层把门关好，攻击者即使突破了一层，下一层还能拦住他。**
+
+---
+
+## 二、镜像扫描：发现已知漏洞
+
+```bash
+# Docker Scout（Docker 内置扫描）
+docker scout quickview my-app:v1
+# 输出：
+# ✓ Provenance
+# ! 2 vulnerabilities    ← 发现 2 个已知漏洞
+#   ✗ HIGH    1
+#   ✗ CRITICAL 0
+
+docker scout recommendations my-app:v1
+# 给出修复建议：升级哪个包到哪个版本
+
+docker scout cves my-app:v1
+# 列出具体的 CVE 编号、严重级别、影响范围
+
+# Trivy（开源扫描器，更详细）
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image my-app:v1
+```
+
+> **扫描不是一次性的事。** 今天你的镜像没有已知漏洞，不代表三个月后没有。把镜像扫描集成到 CI 流水线中——每次构建都自动扫描，发现高危漏洞直接阻断。
+
+---
+
+## 三、运行时安全
+
+### 3.1 只读根文件系统
+
+```bash
+# --read-only：容器的根文件系统只读
+docker run -d --read-only \
+  --tmpfs /tmp --tmpfs /run \
+  --name secure-web nginx:alpine
+
+# Nginx 需要写 /tmp 和 /run 来存临时文件和 PID——用 tmpfs 专门给这些路径可写权限
+# 攻击者即使拿到了 Shell，除了 /tmp 和 /run，哪也写不进去
+```
+
+如果攻击者注入了恶意代码，他需要下载工具、写后门脚本——只读根文件系统让你的容器变成了一块"钢板"，攻击者即使有了 Shell 也无处下手。
+
+### 3.2 用非 root 用户运行——在 Dockerfile 中明确
+
+```dockerfile
+FROM node:20-alpine
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+WORKDIR /app
+COPY --chown=appuser:appgroup . .
+USER appuser
+CMD ["node", "server.js"]
+```
+
+验证你的容器正在以什么用户运行：
+
+```bash
+docker exec secure-web whoami
+# appuser    ← 不是 root
+docker exec secure-web id
+# uid=1000(appuser) gid=1000(appgroup) groups=1000(appgroup)
+```
+
+### 3.3 丢弃所有 Capabilities，只加必需的
+
+```bash
+# 默认容器有约 15 个 Linux Capability
+# 大部分应用只需要 NET_BIND_SERVICE（绑定低位端口）或不需要任何特权
+
+# Nginx 需要绑定 80 端口
+docker run -d --cap-drop ALL --cap-add NET_BIND_SERVICE nginx:alpine
+
+# 纯计算任务什么都不需要
+docker run -d --cap-drop ALL my-worker:v1
+```
+
+### 3.4 不允许提权
+
+```bash
+# --security-opt no-new-privileges：禁止容器内的进程获取更多权限
+docker run -d --security-opt no-new-privileges:true my-app:v1
+# 即使容器内有个 setuid 程序，它也无法提升权限
+```
+
+---
+
+## 四、Seccomp 与 AppArmor：限制系统调用
+
+### 4.1 Docker 默认的 Seccomp 配置
+
+Docker 默认启用了一个 seccomp 配置文件，禁用了约 44 个危险的系统调用（如 `reboot`、`kexec_load` 这种容器内根本不应该调用的）。对于大多数应用来说，这个默认配置已经够用了。
+
+```bash
+# 查看当前 seccomp 是否生效
+docker inspect my-app --format '{{.HostConfig.SecurityOpt}}'
+
+# 使用自定义的 seccomp 配置
+docker run -d --security-opt seccomp=/path/to/custom-seccomp.json my-app:v1
+
+# 注意：不要用 --security-opt seccomp=unconfined 除非有特别理由
+# 这会关闭 seccomp 保护，让容器可以调用所有系统调用
+```
+
+### 4.2 什么时候需要自定义 seccomp
+
+大部分情况下不需要。但如果你的应用使用了特殊功能（如 strace、perf、eBPF），可能需要允许额外系统调用。自定义 seccomp 的粒度是系统调用级别——你精确地允许/拒绝某个系统调用。
+
+### 4.3 AppArmor（Ubuntu/Debian）
+
+```bash
+# 查看已加载的 AppArmor 策略
+docker info | grep apparmor
+
+# 使用 Docker 预置的强化策略
+docker run -d --security-opt apparmor=docker-default nginx:alpine
+
+# 使用自定义 AppArmor 策略
+docker run -d --security-opt apparmor=my-custom-policy my-app:v1
+```
+
+---
+
+## 五、容器逃逸及其防线
+
+容器逃逸是指攻击者从一个容器内部获得了宿主机上的执行权限。这是容器安全里最严重的问题。
+
+**常见的逃逸路径和防线：**
+
+```
+逃逸路径 1：特权容器 + 挂载宿主机文件系统
+  docker run --privileged -v /:/host alpine
+  → 容器里可以直接修改宿主机的 /etc/passwd
+  防线：绝不用 --privileged，尽量不用 -v 挂载宿主机敏感目录
+
+逃逸路径 2：挂载 Docker Socket
+  docker run -v /var/run/docker.sock:/var/run/docker.sock alpine
+  → 容器内可以创建新的特权容器来逃逸
+  防线：除非必要，绝不暴露 docker.sock 给容器
+
+逃逸路径 3：内核漏洞
+  如 Dirty Cow (CVE-2016-5195) 允许普通用户修改只读内存
+  → 容器内的进程可以修改内核内存，提升到 root 权限
+  防线：及时升级宿主机内核、定期打安全补丁
+
+逃逸路径 4：环境变量泄露
+  宿主机上的 AWS_ACCESS_KEY_ID 环境变量可能泄露到容器内
+  → 攻击者获取云资源访问权限
+  防线：用 docker secrets 或专门的安全管理工具，不要直接把宿主机环境变量传给容器
+```
+
+> **最重要的防线：及时升级。** 宿主机内核、Docker Engine、基础镜像——这三者在有新安全补丁时尽快更新。容器逃逸漏洞通常利用的是已知的内核漏洞——保持内核更新是最有效的防范。
+
+---
+
+## 六、安全配置总和：一个"加固版"的容器启动
+
+```bash
+docker run -d \
+  --name secure-app \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /run:rw,noexec,nosuid,size=16m \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  --security-opt no-new-privileges:true \
+  --memory 512m \
+  --cpus 1 \
+  --restart on-failure:3 \
+  --health-cmd="curl -f http://localhost:8080/health || exit 1" \
+  --health-interval=10s \
+  --health-retries=3 \
+  my-secure-app:v2.1.0
+```
+
+```
+安全措施逐条说明：
+
+--read-only              → 根文件系统不可写
+--tmpfs /tmp ...         → 只有 /tmp 和 /run 可写（且禁止执行+禁止 setuid）
+--cap-drop ALL           → 丢弃所有 Linux Capability
+--cap-add NET_BIND_SERVICE → 只加回绑定端口的能力
+--security-opt ...      → 禁止进程提权
+--memory 512m            → 限制内存（防止内存炸弹攻击）
+--cpus 1                 → 限制 CPU（防止挖矿脚本吃光 CPU）
+--restart on-failure:3   → 崩溃最多重启 3 次（防止无限重启循环）
+--health-cmd ...         → 健康检查（不健康的容器由编排层处理）
+```
+
+---
+
+## 七、Secrets 管理：不要用环境变量传密码
+
+```bash
+# 差：密码在环境变量里（docker inspect 能直接看到）
+docker run -e DATABASE_PASSWORD=abc123 mysql:8
+
+# 好：用 Docker Secrets（Swarm 模式）
+echo "abc123" | docker secret create db_password -
+docker service create --secret db_password mysql:8
+# 密码以加密形式存在于 /run/secrets/db_password 文件中
+
+# 或者用 HashiCorp Vault、AWS Secrets Manager、Kubernetes Secrets
+```
+
+> 环境变量容易泄露——`docker inspect`、`/proc/<pid>/environ`、日志、错误堆栈都可能暴露它们。**敏感信息应该通过文件挂载（Secrets）注入，而不是环境变量。**
+
+下一章，把 Docker 接进 CI/CD——镜像怎么在流水线中自动构建、测试、扫描、部署。

@@ -1,0 +1,321 @@
+---
+title: "五种核心数据类型：从"能用"到"会用"的关键一跃"
+description: "深入拆解 List、Set、Hash、Sorted Set 的内部原理和适用场景。理解为什么 LinkedList 不是队列的最佳选择、Set 去重为什么 O(1)、Hash 和 String+JSON 有什么区别、Sorted Set 为什么能在百万数据中毫秒级排序。"
+order: 3
+---
+
+## 一、数据结构，不是数据格式
+
+很多人在学 Redis 时会犯一个错误：把 Redis 的数据类型当成"数据格式"来理解——"List 就是数组，Set 就是去重数组，Hash 就是字典"。这没有错，但漏掉了最重要的部分。
+
+**Redis 的数据类型之所以是它的核心武器，不是因为"怎么存"，而是因为"提供了什么操作"。** 同样是一组用户 ID，你用 Set 能直接算交集，用 List 就只能一个一个比——这就是选对数据结构的价值。
+
+这一章的目的不是罗列命令，而是让你理解：**什么场景该用什么类型，为什么。**
+
+---
+
+## 二、List：有序队列，但不要把它当消息队列
+
+List 是一个**有序的字符串链表**。有序的意思是：插入顺序就是存储顺序，先插入的在左边（头部），后插入的在右边（尾部）。
+
+### 2.1 基本操作
+
+```bash
+# 从左边插入（头部）
+LPUSH tasks "发邮件" "处理退款" "审核商品"
+# 插入后：["审核商品", "处理退款", "发邮件"]
+#          ← 左边/头部        右边/尾部 →
+
+# 从右边插入（尾部）
+RPUSH tasks "生成报表"
+
+# 查看 List 范围
+LRANGE tasks 0 -1           # 查看全部
+LRANGE tasks 0 2            # 查看前 3 个
+
+# 弹出元素（取出并删除）
+LPOP tasks                  # 从左边弹出 → "审核商品"
+RPOP tasks                  # 从右边弹出 → "生成报表"
+
+# 阻塞式弹出（等新元素进来，超时返回 nil）
+BLPOP tasks 10              # 左边阻塞等 10 秒
+BRPOP tasks 0               # 右边无限阻塞等待
+```
+
+### 2.2 List 的内部实现
+
+List 在底层不是数组——它是一个**快速链表（QuickList）**。从 Redis 3.2 开始，List 用 QuickList 代替了原来的 LinkedList + Ziplist 组合。
+
+```
+QuickList 的结构：
+
+┌──────┐     ┌──────┐     ┌──────┐
+│Ziplist│◄───►│Ziplist│◄───►│Ziplist│
+│节点1  │     │节点2  │     │节点3  │
+│最多8KB│     │最多8KB│     │最多8KB│
+└──────┘     └──────┘     └──────┘
+     ▲                          ▲
+   head                       tail
+```
+
+这是一个**双向链表**，但每个链表节点不是存一个元素，而是存一个压缩列表（Ziplist），里面装了一组连续的元素。这样既有链表的灵活插入，又有数组的高效访问。
+
+### 2.3 List 的适用场景
+
+```
+实际应用：消息队列简化版
+
+生产者 RPUSH queue:tasks "{...任务数据...}"
+消费者 LPOP  queue:tasks              → 处理任务
+
+或者用阻塞版——消费者等着，有任务立刻处理：
+消费者 BRPOP queue:tasks 0            → 没任务就阻塞，有任务立刻弹出
+```
+
+但 Redis List 做消息队列有两个重大缺陷：**没有确认机制**（弹出来就没了，处理失败找不回来）和**没有持久化投递保证**（服务重启，队列数据按持久化策略可能丢失）。
+
+> 轻量场景（内部异步通知、不重要的任务）用 List 没问题。但**正式的消息队列请用 Redis Stream（第 4 章）或 RabbitMQ/Kafka/RocketMQ。**
+
+---
+
+## 三、Set：自动去重的无序集合
+
+Set 是一个**无序且不重复**的字符串集合。它的核心能力是 O(1) 的增删查，以及集合间运算（交集、并集、差集）。
+
+### 3.1 基本操作
+
+```bash
+# 添加成员
+SADD tags:product:2025 "蓝牙" "降噪" "HiFi" "运动"
+
+# 查看所有成员（无序，顺序不保证）
+SMEMBERS tags:product:2025
+
+# 判断是否包含
+SISMEMBER tags:product:2025 "蓝牙"        # 返回 1（存在）
+SISMEMBER tags:product:2025 "防水"         # 返回 0（不存在）
+
+# 随机弹出一个成员
+SPOP tags:product:2025
+
+# 获取成员数量
+SCARD tags:product:2025
+```
+
+### 3.2 集合运算——Set 的真正杀手锏
+
+```bash
+# 两个用户的共同好友（交集）
+SADD user:1:friends "u2" "u3" "u4" "u5"
+SADD user:2:friends "u4" "u5" "u6" "u7"
+
+SINTER user:1:friends user:2:friends      # 返回 ["u4", "u5"] ← 共同好友
+
+# 你可能认识的人（差集：对方的好友中，不是你好友的那些）
+SDIFF user:2:friends user:1:friends       # 返回 ["u6", "u7"]
+
+# 合并去重（并集）
+SUNION user:1:friends user:2:friends      # 返回 ["u2","u3","u4","u5","u6","u7"]
+
+# 把运算结果存到新 Key（避免每次计算）
+SINTERSTORE common-friends user:1:friends user:2:friends
+```
+
+### 3.3 Set 的典型场景
+
+| 场景 | 操作 | 说明 |
+|------|------|------|
+| 标签系统 | `SADD` / `SMEMBERS` | 一个实体多个标签，查标签下有哪些实体 |
+| 点赞用户列表 | `SADD` / `SCARD` / `SISMEMBER` | 自动去重，一个用户只能点一次赞 |
+| 抽奖 | `SRANDMEMBER` / `SPOP` | 随机取不重复的参与用户 |
+| 共同关注 | `SINTER` | 两个用户关注了同一个 UP 主 |
+| 黑名单 | `SISMEMBER` | O(1) 查用户是否在黑名单里 |
+
+---
+
+## 四、Hash：存对象的正确姿势
+
+当你要在 Redis 里存一个"对象"（如用户信息），有两种选择：
+
+```bash
+# 方案 A：String + JSON
+SET user:1001 '{"name":"张三","age":28,"city":"上海","email":"zhangsan@example.com"}'
+
+# 方案 B：Hash
+HSET user:1001 name "张三" age 28 city "上海" email "zhangsan@example.com"
+```
+
+**方案 A 有什么问题？** 你要改用户的 city，必须先把整个 JSON 读出来，解析，修改，再序列化写回去。而且如果你存了一个 5KB 的用户对象，只想拿 `email` 字段——你必须把 5KB 全部读出来。
+
+**方案 B（Hash）的好处：**
+
+```bash
+# 设值
+HSET user:1001 name "张三" age 28 city "上海" email "zhangsan@example.com"
+
+# 只读一个字段（不需要读整个对象）
+HGET user:1001 email                                        # "zhangsan@example.com"
+
+# 只改一个字段（不需要序列化整个对象）
+HSET user:1001 city "北京"
+
+# 一次读多个字段
+HMGET user:1001 name email                                  # ["张三", "zhangsan@example.com"]
+
+# 获取所有字段名、所有值
+HKEYS user:1001                                             # ["name","age","city","email"]
+HVALS user:1001                                             # ["张三","28","北京","zhangsan@example.com"]
+
+# 字段存在才设值
+HSETNX user:1001 password "default123"                      # 仅在 password 不存在时设
+
+# 数值字段原子操作
+HINCRBY user:1001 login_count 1                             # 登录次数 +1
+HINCRBYFLOAT user:1001 balance 99.50                        # 余额 +99.50
+```
+
+### 4.1 Hash 的内部编码
+
+Hash 在底层有两种编码：
+
+- **Listpack（Redis 7.0+）/ Ziplist**：字段少且字段值短时使用，连续内存，极省空间
+- **HashTable**：字段多或值长时使用，真正的哈希表
+
+```
+Listpack 编码（小 Hash）：          HashTable 编码（大 Hash）：
+┌───────────────────┐           ┌─────────────────┐
+│ [name,张三,age,28, │           │  bucket0 → [k1,v1]│
+│  city,上海,email,  │           │  bucket1 → [k2,v2]│
+│  zhangsan@... ]   │           │  bucket2 → empty  │
+│ 连续存储，无指针开销  │           │  bucket3 → [k3,v3]│
+└───────────────────┘           └─────────────────┘
+```
+
+这个自动切换使得 Redis 无论面对小对象还是大对象，都能在内存效率和访问速度之间找到平衡。
+
+### 4.2 Hash vs String+JSON 决策表
+
+| 维度 | Hash | String + JSON |
+|------|------|---------------|
+| 读写单个字段 | 很快，只操作目标字段 | 需要全量读/写 |
+| 内存占用（字段少） | 省（Listpack 编码） | 费（JSON 解析开销） |
+| 内存占用（字段多） | 费（每个字段有开销） | 差不多 |
+| 过期时间 | 只能对整个 Hash 设，不能对单个字段设 | 对整个 JSON 设 |
+| 复杂嵌套（对象里套数组） | 不支持 | 支持（JSON 原生嵌套） |
+| 跨语言兼容 | 需要知道有哪些字段 | JSON 自描述，任何语言都能解析 |
+
+> **经验法则：当你需要独立操作对象的某个字段（更新邮箱、递增计数），用 Hash。当对象有复杂嵌套结构（JSON 数组套对象），用 String + JSON。**
+
+---
+
+## 五、Sorted Set：Redis 最强大的数据结构
+
+Sorted Set（有序集合，简称 ZSet）是 Redis 里最独特、最强大的数据结构。它是一个**每个成员带一个分数的集合，按分数自动排序。**
+
+```
+ZSet 的数据模型：
+
+  成员(member)    分数(score)     按 score 排序 →
+┌────────────┬─────────────┐
+│   张三     │    98500     │  第 1 名
+│   李四     │    87200     │  第 2 名
+│   王五     │    76100     │  第 3 名
+│   赵六     │    43800     │  第 4 名
+│   孙七     │    21900     │  第 5 名
+└────────────┴─────────────┘
+```
+
+### 5.1 基本操作
+
+```bash
+# 添加成员和分数
+ZADD leaderboard:weekly 98500 "player:张三"
+ZADD leaderboard:weekly 87200 "player:李四" 76100 "player:王五"
+
+# 查看排名（从小到大，默认按分数升序）
+ZRANK leaderboard:weekly "player:张三"                      # 0（最高分，排名从 0 开始）
+ZREVRANK leaderboard:weekly "player:王五"                    # 2（降序排名）
+
+# 查看分数
+ZSCORE leaderboard:weekly "player:张三"                     # 98500
+
+# 分数操作（更新分数）
+ZINCRBY leaderboard:weekly 5000 "player:李四"               # 李四 +5000 分
+
+# 排行榜 Top N（降序：分数从高到低）
+ZREVRANGE leaderboard:weekly 0 4 WITHSCORES                 # Top 5
+ZREVRANGEBYSCORE leaderboard:weekly 100000 50000 WITHSCORES # 分数在 10 万~5 万之间的所有玩家
+
+# 删除成员
+ZREM leaderboard:weekly "player:孙七"
+
+# 获取成员数量
+ZCARD leaderboard:weekly
+```
+
+### 5.2 Sorted Set 凭什么这么快？
+
+一个排序集合，增删改查都要维持有序——如果每次插入后都对所有成员排序，十万个成员就会很慢。Redis 的底层是怎么做到的？
+
+```
+Sorted Set 的双重编码：
+
+Listpack（元素少时）：                 Skiplist + HashTable（元素多时）：
+┌──────────────────────┐              ┌──────────────────────┐
+│ [张三,98500,李四,      │              │ ┌────────────────┐   │
+│  87200,王五,76100,...] │              │ │  跳跃表(Skiplist)│   │
+│ 元素少时直接排序存储    │              │ │  用于按分数排序    │   │
+└──────────────────────┘              │ └────────────────┘   │
+                                      │ ┌────────────────┐   │
+                                      │ │  哈希表(HashTable)│   │
+                                      │ │  用于按成员查分数   │   │
+                                      │ └────────────────┘   │
+                                      └──────────────────────┘
+```
+
+跳跃表（Skiplist）是一种"加了快速通道的链表"，查找时间复杂度 O(log N)。它的原理在后文深入解析。你现在只要知道：**跳表让你在 100 万成员的 ZSet 里查某个成员的排名，只需要几十次比较操作。**
+
+### 5.3 ZSet 的选型场景
+
+| 场景 | 操作 | 说明 |
+|------|------|------|
+| 排行榜 | `ZREVRANGE` | 游戏积分榜、销量榜、热度榜 |
+| 延迟队列 | `ZADD` + `ZRANGEBYSCORE` | 用时间戳做分数，按时间消费 |
+| 带权重的标签 | `ZADD` | 给每个标签一个相关度分数 |
+| 滑动窗口限流 | `ZADD` + `ZREMRANGEBYSCORE` | 时间戳做分数，清理窗口外数据 |
+
+---
+
+## 六、一张图总结：五大类型怎么选
+
+```
+输入 → 我需要...
+
+存储一个值（缓存/计数/锁）
+  → String
+    SET product:info '...'
+    INCR counter:likes
+    SETNX lock:order
+
+存储一组有序数据（队列/栈/最新列表）
+  → List
+    LPUSH + RPOP (队列)
+    LPUSH + LPOP (栈)
+
+存储一组不重复数据 + 集合运算
+  → Set
+    SADD tags:post:1 "redis" "cache"
+    SINTER user:a:friends user:b:friends
+
+存储一个对象的多个字段 + 需要单独操作字段
+  → Hash
+    HSET user:1 name "张三" age 28
+    HINCRBY user:1 login_count 1
+
+存储一组带排序/权重的数据
+  → Sorted Set
+    ZADD leaderboard 98500 "张三"
+    ZREVRANGE leaderboard 0 9
+```
+
+下一章，我们看 Redis 的"进阶数据结构"——Bitmap、HyperLogLog、Geo、Stream。这些不是每天都会用到，但一旦用到，你会发现它们优雅得惊人。

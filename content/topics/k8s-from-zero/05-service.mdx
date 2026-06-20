@@ -1,0 +1,268 @@
+---
+title: "Service：稳定的服务入口与负载均衡"
+description: "Pod IP 每次重启都会变，Service 用稳定的虚拟 IP 解决了这个难题。从 ClusterIP 到 NodePort 到 LoadBalancer，再到 Headless Service，彻底吃透 K8s 的服务发现机制。"
+order: 5
+---
+
+## 一、问题：前端怎么找后端？
+
+上一章我们用 Deployment 管理了 3 个 Nginx Pod。现在有个新问题：前端应用需要访问 Nginx，但 3 个 Pod 各有各的 IP，而且——每次 Pod 重启 IP 都会变。
+
+```
+前端需要调用后端 API
+
+昨天：                                   今天（Pod 重启后）：
+Pod A: 10.244.1.5 ← 前端用这个            Pod A: 10.244.3.12 ← 这个不能用了
+Pod B: 10.244.1.6                        Pod B: 10.244.1.7
+Pod C: 10.244.1.7                        Pod C: 10.244.5.3
+
+前端代码写死一个 IP？这个做法显然不可行。
+前端自己维护一个 IP 列表并检测可用性？这正是 K8s 应该做的事。
+```
+
+**Service 就是 K8s 给这个问题的答案：它提供一个稳定的虚拟 IP（Cluster IP），自动把请求负载均衡到后端的健康 Pod 上。**
+
+```
+                前端
+                 │
+                 ▼
+    ┌──────────────────────┐
+    │     Service          │
+    │  ClusterIP: 10.96.0.1│  ← 这个 IP 永远不变
+    │  Port: 80            │
+    └───┬──────┬──────┬────┘
+        │      │      │
+        ▼      ▼      ▼
+    ┌──────┐┌──────┐┌──────┐
+    │Pod A ││Pod B ││Pod C │  ← IP 可以随便变
+    │.1.5  ││.1.7  ││.5.3  │
+    └──────┘└──────┘└──────┘
+```
+
+---
+
+## 二、Service 的三种核心类型
+
+| 类型 | 访问范围 | 使用场景 |
+|------|---------|---------|
+| **ClusterIP**（默认） | 集群内部 | 前后端通信、微服务间调用 |
+| **NodePort** | 外部（Node IP + 30000-32767 端口） | 开发调试、简单的公网暴露 |
+| **LoadBalancer** | 外部（云厂商的 LB） | 生产环境、需要公网 IP 的对外服务 |
+
+### 2.1 ClusterIP —— 默认类型，内部通信用
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+spec:
+  type: ClusterIP
+  selector:
+    app: backend           # 流量只发给带有 app=backend 标签的 Pod
+  ports:
+  - name: http
+    port: 80               # Service 自己的端口
+    targetPort: 8080       # Pod 上容器的端口
+    protocol: TCP
+```
+
+```bash
+# 创建
+kubectl apply -f service.yaml
+
+# 查看
+kubectl get svc backend-svc
+# NAME          TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+# backend-svc   ClusterIP   10.96.123.45   <none>        80/TCP    1m
+
+# 集群内任何 Pod 都可以通过 Service 名访问
+kubectl run test --rm -it --image=busybox -- wget -q -O- http://backend-svc
+
+# 也可以用 ClusterIP 直接访问
+kubectl run test --rm -it --image=busybox -- wget -q -O- http://10.96.123.45
+```
+
+**Service 的名字本身就是一个 DNS 名称。** 在 K8s 集群内部，`backend-svc` 这个域名会被自动解析为 ClusterIP `10.96.123.45`。所以你的代码里只需要写 `backend-svc`，不用担心 IP 是什么。
+
+完整的 DNS 解析规则：`<service-name>.<namespace>.svc.cluster.local`。同一 namespace 下只用 `<service-name>` 也行。
+
+### 2.2 NodePort —— 在每台 Node 上开洞
+
+```yaml
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30080       # 指定端口号（不指定则自动分配 30000-32767）
+```
+
+效果：集群中**每一台** Node 的 30080 端口都会转发到这个 Service。访问任意一台 Node 的 `<NodeIP>:30080` 都能到达后端 Pod。
+
+```bash
+# minikube 特有命令：快速获取服务 URL
+minikube service backend-svc --url
+
+# 或者直接用 Node IP
+kubectl get nodes -o wide    # 拿到 Node IP
+curl http://<node-ip>:30080
+```
+
+NodePort 适合开发调试，但不适合直接暴露到公网——30000+ 的端口号并不友好，也没有 HTTPS 终止、限流、认证这些生产必需的网关能力。这些东西是 Ingress 的活（后面章节专门讲）。
+
+### 2.3 LoadBalancer —— 云环境的标准入口
+
+```yaml
+spec:
+  type: LoadBalancer
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+在云环境（AWS EKS、GCP GKE、Azure AKS）中，创建 LoadBalancer 类型的 Service 会触发云厂商自动创建一个云负载均衡器（AWS NLB、GCP Cloud LB 等），分配公网或内网 IP。
+
+```bash
+kubectl get svc
+# NAME         TYPE           CLUSTER-IP     EXTERNAL-IP      PORT(S)
+# backend-svc  LoadBalancer   10.96.123.45  34.120.xxx.xxx   80:30080/TCP
+```
+
+> 在本地的 minikube 里，`EXTERNAL-IP` 会一直显示 `<pending>`——因为本地没有真实的云负载均衡器。解决办法是用 `minikube tunnel` 命令模拟一个（以管理员权限运行）。
+
+---
+
+## 三、Service 底层是怎么工作的？
+
+### 3.1 kube-proxy 与 Endpoints
+
+Service 的负载均衡由每个 Node 上的 **kube-proxy** 组件实现。当 Service 被创建后：
+
+1. kube-proxy 监听 API Server
+2. 发现新 Service → 根据 `selector` 匹配 Pod → 收集所有匹配 Pod 的 IP+端口 → 这些叫 **Endpoints**
+3. 在 Node 上写入 iptables（或 IPVS）规则，实现从 ClusterIP 到 Pod IP 的负载均衡
+
+```bash
+# 查看 Service 对应的 Endpoints
+kubectl get endpoints backend-svc
+# NAME          ENDPOINTS                                   AGE
+# backend-svc   10.244.1.5:8080,10.244.1.7:8080,10.244.3.12:8080   1h
+
+# 每当 Pod 增减，Endpoints 自动更新
+```
+
+### 3.2 iptables 模式 vs IPVS 模式
+
+| 特性 | iptables | IPVS |
+|------|---------|------|
+| 规则特点 | 线性规则链，Pod 多了就慢 | 内核哈希表查询，O(1) 查找 |
+| 负载均衡算法 | 随机（等概率） | 轮询、最少连接等 8 种算法 |
+| 大规模集群 | 增加延迟 | 性能稳定 |
+| 默认 | ✅（大多数发行版） | 需手动启用 |
+
+```bash
+# 查看当前用的是什么模式
+kubectl logs -n kube-system $(kubectl get pods -n kube-system -l k8s-app=kube-proxy -o name | head -1) | grep -i "using"
+```
+
+如果你的集群有上千个 Service，建议换到 IPVS。在 kube-proxy 的 ConfigMap 里改一行配置就行。这里不展开，知道有这个选项就够了。
+
+---
+
+## 四、Headless Service：不需要 VIP 的场景
+
+有时你既不需要负载均衡，也不需要虚拟 IP——你直接想拿到所有 Pod 的 IP 列表。比如数据库集群（Cassandra、MongoDB 副本集），客户端自己负责数据分片和副本选择，K8s 的负载均衡反而是多余的。
+
+```yaml
+spec:
+  clusterIP: None           # Headless Service
+  selector:
+    app: cassandra
+  ports:
+  - port: 9042
+```
+
+创建 Headless Service 后，DNS 查询 `cassandra-svc.default.svc.cluster.local` 会返回**所有匹配 Pod 的 IP 列表**，而不是一个单一的 Cluster IP。你的应用可以拿到这个列表，按自己的逻辑做连接管理和负载均衡。
+
+```bash
+# 验证：在集群内执行 DNS 查询
+kubectl run test --rm -it --image=busybox -- nslookup cassandra-svc
+# 会返回多个 IP，每个对应的 Pod 都有一个
+```
+
+---
+
+## 五、ExternalName Service：指向集群外的地址
+
+K8s 不光能用 Service 代理集群内的 Pod，还能代理集群外的东西——比如托管在云上的数据库（RDS）：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-db
+spec:
+  type: ExternalName
+  externalName: my-database.rds.amazonaws.com    # 集群外部的域名
+```
+
+效果：你代码里访问 `external-db`，DNS 直接解析到 `my-database.rds.amazonaws.com`。对外部服务来说，你多了 K8s DNS 的一层间接引用——以后数据库迁移了，只需改 Service，不用改代码。
+
+---
+
+## 六、Service 实战：前端 + 后端 + 数据库
+
+```
+┌──────────────────────────────────────────────┐
+│  外部浏览器                                    │
+│      │                                        │
+│      ▼                                        │
+│  ┌──────────────┐                             │
+│  │  NodePort     │ port 30080                 │
+│  │  (front-svc)  │                             │
+│  └──────┬───────┘                             │
+│         │                                      │
+│         ▼                                      │
+│  ┌──────────────┐                             │
+│  │  Pod: Nginx   │  static files               │
+│  └──────────────┘                             │
+│         │ 前端通过 AJAX 调 /api/*               │
+│         ▼                                      │
+│  ┌──────────────┐                             │
+│  │  ClusterIP   │ port 80                     │
+│  │  (api-svc)   │                             │
+│  └──────┬───────┘                             │
+│         │                                      │
+│    ┌────┴────┬────────┐                      │
+│    ▼         ▼        ▼                       │
+│  Pod A     Pod B    Pod C  (Node.js API)       │
+│    │         │        │                       │
+│    └────┬────┴────────┘                      │
+│         │                                      │
+│         ▼                                      │
+│  ┌──────────────┐                             │
+│  │  ClusterIP   │ port 5432                   │
+│  │  (db-svc)    │                             │
+│  └──────┬───────┘                             │
+│         │                                      │
+│         ▼                                      │
+│  ┌──────────────┐                             │
+│  │  Pod:         │  StatefulSet                │
+│  │  PostgreSQL   │  (下一章讲存储的时候会深入)    │
+│  └──────────────┘                             │
+└──────────────────────────────────────────────┘
+```
+
+这是一个典型的 K8s 三层架构：
+- 前端 Nginx 暴露 NodePort 给公网
+- 后端 API 用 ClusterIP 集群内通信
+- 数据库用 ClusterIP + StatefulSet 持久化存储
+
+**关键经验：永远不要直接暴露数据库 Service 到公网。** 对外暴露的始终只有最外层的入口（前端 / API Gateway），内部服务用 ClusterIP 就够了。
+
+下一章我们解决配置管理的问题——你的数据库密码、API 密钥这些敏感信息是怎么在 K8s 里安全存储和注入的。
